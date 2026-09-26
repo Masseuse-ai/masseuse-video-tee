@@ -257,6 +257,16 @@ session record's `hello.json` so a row can be read back years later.
 the readings carry about a `face` view: the keypoint indices and thresholds
 it is computed from, the names of its channels, and that part of the
 bundle's version. Numbers and names, kept in `hello.json` the same way.
+From 2026.09.22-1 (`face/v4`) the reading's `face` object also carries the
+head's speed (`headSpeed`, `headSpeed5s`: the rigid landmarks' centroid's
+step between rows, in inter-ocular distances a second, over the last
+second and the last five), `regions` (per face region of the keypoint
+definition, the mean displacement of its landmarks in the baseline's pose
+from their baseline-minute positions, inter-ocular units, `dy` downward
+and `dx` outward), and a signed channel, `browOuterZ` (the outer brows'
+distance from the outer canthi against the baseline, in robust units); the
+`face` constants name the regions' landmarks and the speed's rule. The
+fields from before are computed as before.
 
 ### `post`, at the post cadence
 
