@@ -58,8 +58,9 @@ at every moment is in the attestation token itself:
   (`workload/tee/Dockerfile.tee`), attested with the rest of the workload
   environment. Images released before `v0.4.0` carry no stamp.
 - `submods.container.image_digest`: the digest that is running. The same
-  digest sits on the public registry its Release names (`ghcr.io/femled/masseuse-video-tee`
-  for images up to `v0.12.3`) with its SLSA provenance, which names the source commit; that commit must be the one
+  digest sits on the public registry its Release names (`ghcr.io/masseuse-ai/masseuse-video-tee`
+  from `v0.12.4` on, `ghcr.io/femled/masseuse-video-tee` for images up to `v0.12.3`)
+  with its SLSA provenance, which names the source commit; that commit must be the one
   the stamp names, and `slsa-verifier` checks the tag.
 
 The clients (the web app, the connector) pin the signing key and, once
@@ -199,11 +200,12 @@ release workflow at the project's previous GitHub home,
 `ghcr.io/femled/masseuse-video-tee-base`), where they stay; their
 provenance and certificates name that identity, and this repository
 carries each of their tags with the tree the image was built from. From
-the next release on, images are built and signed here and published to
+`v0.12.4` on, images are built and signed here and published to
 `ghcr.io/masseuse-ai/masseuse-video-tee`. Each Release's Image and Verify
 sections name the registry and identity that apply to it; `tee-verify`'s
-`-source-uri` and `-image-repo` default to the ones of the image running
-today and are set on the command line for the other. A tag, once created, cannot be moved or deleted by anyone: a
+`-source-uri` and `-image-repo` default to this repository and its
+registry and are set on the command line for an image up to `v0.12.3`.
+A tag, once created, cannot be moved or deleted by anyone: a
 repository ruleset ("Tags are immutable", on every tag, with no bypass
 actor) refuses updates, deletions and force pushes, so the tag a
 provenance names is still the commit it named when the image was built.
@@ -246,18 +248,18 @@ container generator, and then a separate job copies the digest, unchanged,
 into the registry the attestation names and signs it there with the KMS key
 below, so the launcher's signature check is what it was; a last job writes
 the GitHub Release. To check the digest a token names against its source
-(as written, for an image released up to `v0.12.3`, which is every image
-so far; for a later image read `ghcr.io/masseuse-ai/masseuse-video-tee` and
-`github.com/Masseuse-ai/masseuse-video-tee`, "Release history"):
+(as written, for an image released from `v0.12.4` on; for an image up to
+`v0.12.3` read `ghcr.io/femled/masseuse-video-tee` and
+`github.com/FemLed/masseuse-video-tee`, "Release history"):
 
 ```sh
 DIGEST=sha256:...   # submods.container.image_digest in the token (tee-verify prints it)
 TAG=vX.Y.Z          # submods.container.env.TEE_IMAGE_VERSION in the same token
-slsa-verifier verify-image ghcr.io/femled/masseuse-video-tee@$DIGEST \
-    --source-uri github.com/FemLed/masseuse-video-tee --source-tag $TAG --print-provenance
-cosign verify ghcr.io/femled/masseuse-video-tee@$DIGEST \
+slsa-verifier verify-image ghcr.io/masseuse-ai/masseuse-video-tee@$DIGEST \
+    --source-uri github.com/Masseuse-ai/masseuse-video-tee --source-tag $TAG --print-provenance
+cosign verify ghcr.io/masseuse-ai/masseuse-video-tee@$DIGEST \
     --certificate-oidc-issuer https://token.actions.githubusercontent.com \
-    --certificate-identity-regexp '^https://github.com/FemLed/masseuse-video-tee/.github/workflows/release.yml@refs/tags/v[0-9.]+$'
+    --certificate-identity-regexp '^https://github.com/Masseuse-ai/masseuse-video-tee/.github/workflows/release.yml@refs/tags/v[0-9.]+$'
 ```
 
 The printed provenance's source commit must be the token's

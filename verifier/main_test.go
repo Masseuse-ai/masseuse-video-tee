@@ -155,7 +155,7 @@ fi
 echo "Verified build using builder https://github.com/slsa-framework/slsa-github-generator/.github/workflows/generator_container_slsa3.yml@refs/tags/v2.1.0 at commit $STUB_COMMIT" >&2
 echo "PASSED: SLSA verification passed" >&2
 cat <<EOF
-{"_type":"https://in-toto.io/Statement/v1","predicateType":"https://slsa.dev/provenance/v1","subject":[{"name":"ghcr.io/femled/masseuse-video-tee","digest":{"sha256":"` + strings.Repeat("ab", 32) + `"}}],"predicate":{"buildDefinition":{"buildType":"https://slsa-framework.github.io/github-actions-buildtypes/workflow/v1","externalParameters":{"workflow":{"ref":"refs/tags/v0.4.0","repository":"https://github.com/FemLed/masseuse-video-tee","path":".github/workflows/release.yml"}},"resolvedDependencies":[{"uri":"git+https://github.com/FemLed/masseuse-video-tee@refs/tags/v0.4.0","digest":{"gitCommit":"$STUB_COMMIT"}}]},"runDetails":{"builder":{"id":"https://github.com/slsa-framework/slsa-github-generator/.github/workflows/generator_container_slsa3.yml@refs/tags/v2.1.0"}}}}
+{"_type":"https://in-toto.io/Statement/v1","predicateType":"https://slsa.dev/provenance/v1","subject":[{"name":"ghcr.io/masseuse-ai/masseuse-video-tee","digest":{"sha256":"` + strings.Repeat("ab", 32) + `"}}],"predicate":{"buildDefinition":{"buildType":"https://slsa-framework.github.io/github-actions-buildtypes/workflow/v1","externalParameters":{"workflow":{"ref":"refs/tags/v0.4.0","repository":"https://github.com/Masseuse-ai/masseuse-video-tee","path":".github/workflows/release.yml"}},"resolvedDependencies":[{"uri":"git+https://github.com/Masseuse-ai/masseuse-video-tee@refs/tags/v0.4.0","digest":{"gitCommit":"$STUB_COMMIT"}}]},"runDetails":{"builder":{"id":"https://github.com/slsa-framework/slsa-github-generator/.github/workflows/generator_container_slsa3.yml@refs/tags/v2.1.0"}}}}
 EOF
 `
 	if err := os.WriteFile(bin, []byte(script), 0o755); err != nil {
@@ -373,7 +373,7 @@ func TestVerifiesProvenanceAgainstTheStamp(t *testing.T) {
 
 	// slsa-verifier itself refuses.
 	t.Setenv("STUB_COMMIT", testCommit)
-	t.Setenv("STUB_FAIL", "expected source github.com/FemLed/masseuse-video-tee, got github.com/other/repo")
+	t.Setenv("STUB_FAIL", "expected source github.com/Masseuse-ai/masseuse-video-tee, got github.com/other/repo")
 	r = runReport(t, cfg)
 	if prov := checkNamed(t, r, "provenance.source"); prov.OK || !strings.Contains(prov.Detail, "FAILED") {
 		t.Fatalf("a slsa-verifier failure must fail: %+v", prov)
@@ -430,11 +430,11 @@ func TestCompareRelease(t *testing.T) {
 
 func TestProvenanceSourceReadsBothPredicateShapes(t *testing.T) {
 	v1 := `PASSED: noise on the same stream
-{"predicateType":"https://slsa.dev/provenance/v1","predicate":{"buildDefinition":{"resolvedDependencies":[{"uri":"git+https://github.com/FemLed/masseuse-video-tee@refs/tags/v0.4.0","digest":{"gitCommit":"` + testCommit + `"}}]}}}`
+{"predicateType":"https://slsa.dev/provenance/v1","predicate":{"buildDefinition":{"resolvedDependencies":[{"uri":"git+https://github.com/Masseuse-ai/masseuse-video-tee@refs/tags/v0.4.0","digest":{"gitCommit":"` + testCommit + `"}}]}}}`
 	if c, ref := provenanceSource([]byte(v1)); c != testCommit || ref != "v0.4.0" {
 		t.Fatalf("v1: commit %q ref %q", c, ref)
 	}
-	v02 := `{"predicateType":"https://slsa.dev/provenance/v0.2","predicate":{"invocation":{"configSource":{"uri":"git+https://github.com/FemLed/masseuse-video-tee@refs/tags/v0.3.1","digest":{"sha1":"` + testCommit + `"}}},"materials":[{"uri":"git+https://github.com/FemLed/masseuse-video-tee@refs/tags/v0.3.1","digest":{"sha1":"` + testCommit + `"}}]}}`
+	v02 := `{"predicateType":"https://slsa.dev/provenance/v0.2","predicate":{"invocation":{"configSource":{"uri":"git+https://github.com/Masseuse-ai/masseuse-video-tee@refs/tags/v0.3.1","digest":{"sha1":"` + testCommit + `"}}},"materials":[{"uri":"git+https://github.com/Masseuse-ai/masseuse-video-tee@refs/tags/v0.3.1","digest":{"sha1":"` + testCommit + `"}}]}}`
 	if c, ref := provenanceSource([]byte(v02)); c != testCommit || ref != "v0.3.1" {
 		t.Fatalf("v0.2: commit %q ref %q", c, ref)
 	}
