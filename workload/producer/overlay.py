@@ -88,10 +88,16 @@ COLOR_BAD = (60, 60, 255)
 FAINT_SCORE = 0.15
 # Two detections further apart than this are not bridged; the frames
 # between them show the earlier one as stale. Matches the assembler's
-# order of magnitude (1.3 x the pose interval at 6 fps is 0.22 s; a drop
-# or two widens it) without ever bridging a whole lost second.
+# order of magnitude (the pose interval at 9 fps is 0.11 s, its bridge
+# floor 0.35 s; a drop or two widens it) without ever bridging a whole
+# lost second.
 BRIDGE_S = 1.0
 SIZE_RE = re.compile(r"^(\d{2,5})x(\d{2,5})$")
+# The view's cadence and bit rate when the args name none
+# (producer --overlay-fps / --overlay-bitrate): every frame of the 30 fps
+# decode grid, at the 200 kbit a frame that 3M at 15 fps was.
+DEFAULT_FPS = 30.0
+DEFAULT_BITRATE = "6M"
 
 # The face inset: the phone's view drawn over the fixed camera's, in the
 # top-right corner, portrait 3:4 at this fraction of the canvas height,
@@ -562,17 +568,21 @@ def probe_nvenc(run=subprocess.run) -> bool:
 class OverlayPublisher:
     """Frames in over a pipe, H.264 out to the relay over RTSP.
 
-    x264 ultrafast/zerolatency at 720p15 is well under one core and needs
-    nothing from the driver; NVENC is opt-in behind `probe_nvenc`. A
-    publisher that dies (relay restart, encoder crash) is respawned with
-    backoff on the next write; frames offered while it is down are dropped
-    and counted. `close` sends EOF and waits so a recording finalises.
+    x264 ultrafast/zerolatency at 720p30 is about one core (720p15 was
+    well under one) and needs nothing from the driver; NVENC is opt-in
+    behind `probe_nvenc`. The bit rate is CBR with a one-second buffer:
+    DEFAULT_BITRATE at DEFAULT_FPS is 200 kbit a frame, what 3M was at 15
+    fps, so a frame is coded as well as it was when the view showed half
+    as many. A publisher that dies (relay restart, encoder crash) is
+    respawned with backoff on the next write; frames offered while it is
+    down are dropped and counted. `close` sends EOF and waits so a
+    recording finalises.
     """
 
     BACKOFF_S = (1.0, 2.0, 4.0, 8.0, 10.0)
 
     def __init__(self, url: str, size: tuple[int, int], fps: float,
-                 encoder: str = "x264", bitrate: str = "3M",
+                 encoder: str = "x264", bitrate: str = DEFAULT_BITRATE,
                  record_path: str | Path | None = None, telemetry=None,
                  popen=subprocess.Popen, clock=time.monotonic):
         self.url = url
@@ -723,7 +733,7 @@ class OverlayRenderer(threading.Thread):
     """
 
     def __init__(self, publisher: OverlayPublisher, telemetry,
-                 size: tuple[int, int] = (1280, 720), fps: float = 15.0,
+                 size: tuple[int, int] = (1280, 720), fps: float = DEFAULT_FPS,
                  delay_s: float = 1.0, source_fps: float = 30.0,
                  clock=time.monotonic, capacity: int | None = None,
                  mirror: bool = False, sync=None, face_mirror: bool = False):
@@ -767,10 +777,12 @@ class OverlayRenderer(threading.Thread):
     # -- inputs, from other threads ---------------------------------------------
 
     def offer_frame(self, index: int, at_s: float, yuv: np.ndarray) -> None:
-        # Eviction is steady state (the store is a window, and at 15 out
-        # of 30 fps half the frames are skipped by design); what would be
-        # a fault is the window not holding the frame the view wants, and
-        # tick() counts that as overlayTargetMissed.
+        # Eviction is steady state: the store is a window over the decode,
+        # and at 30 fps out of 30 every frame is shown once (at 15 every
+        # other one was skipped by design). What would be a fault is the
+        # window not holding the frame the view wants, and tick() counts
+        # that as overlayTargetMissed; a `duplicate` tick at 30 fps means
+        # the decode stalled, not that the cadences differ.
         frame = Frame(index, at_s, yuv, self.clock())
         with self._lock:
             self.frames.offer(frame)
@@ -1076,14 +1088,14 @@ def build_renderer(args, telemetry, source_fps: float = 30.0,
     if not url:
         return None
     size = parse_size(getattr(args, "overlay_size", "1280x720") or "1280x720")
-    fps = float(getattr(args, "overlay_fps", 15.0) or 15.0)
+    fps = float(getattr(args, "overlay_fps", DEFAULT_FPS) or DEFAULT_FPS)
     encoder = getattr(args, "overlay_encoder", "x264") or "x264"
     if encoder == "auto":
         encoder = "nvenc" if probe() else "x264"
         print(f"overlay: encoder auto -> {encoder}", flush=True)
     publisher = OverlayPublisher(
         url, size, fps, encoder=encoder,
-        bitrate=getattr(args, "overlay_bitrate", "3M") or "3M",
+        bitrate=getattr(args, "overlay_bitrate", DEFAULT_BITRATE) or DEFAULT_BITRATE,
         record_path=record_path, telemetry=telemetry)
     return OverlayRenderer(
         publisher, telemetry, size=size, fps=fps,

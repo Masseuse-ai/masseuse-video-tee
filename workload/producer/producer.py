@@ -3,22 +3,23 @@
 This process is the only one in the enclave that holds a decoded frame or
 an audio sample. One ffmpeg decode at 30fps yuv420p feeds everything
 visual: the Y plane is what the regional motion descriptors are measured
-on, and every fifth frame is converted to RGB for the pose worker
-(RT-DETRv4 person detection, then Sapiens2-1B keypoints). Pose runs at 6fps
-in its own thread behind a bounded queue; a stalled or slow pose drops
-frames - counted, clock still advanced with keypoint-less rows, released to
-the assembler in slot order - rather than ever blocking the decode. Rows
-come out of the online interpolator at frame cadence, the descriptors out
-of the pair arithmetic at both cadences (workload/pixel/motion.py), and
-both are handed over a local socket to the analysis process
-(analysis/protocol.md), whose readings come back to be posted to the
-trainer. With --audio a second ffmpeg reads the same stream's audio track
-as 16 kHz mono PCM for the audio stage (workload/audio/audio_stage.py),
-which classifies it into non-speech vocalization labels with level and
-pitch and sends those numbers over the same socket. Frames go no further
-than this file and the overlay renderer, which draws the annotated view
-returned to the same user's phone; samples go no further than the audio
-stage.
+on, and the frames on the pose cadence (--pose-fps, 9 by default: the grid
+slot nearest each ninth of a second, CadencePicker) are converted to RGB
+for the pose worker (RT-DETRv4 person detection, then Sapiens2-1B
+keypoints). Pose runs in its own thread behind a bounded queue; a stalled
+or slow pose drops frames - counted, clock still advanced with
+keypoint-less rows, released to the assembler in slot order - rather than
+ever blocking the decode. Rows come out of the online interpolator at
+frame cadence, the descriptors out of the pair arithmetic at both cadences
+(workload/pixel/motion.py), and both are handed over a local socket to the
+analysis process (analysis/protocol.md), whose readings come back to be
+posted to the trainer. With --audio a second ffmpeg reads the same
+stream's audio track as 16 kHz mono PCM for the audio stage
+(workload/audio/audio_stage.py), which classifies it into non-speech
+vocalization labels with level and pitch and sends those numbers over the
+same socket. Frames go no further than this file and the overlay renderer,
+which draws the annotated view returned to the same user's phone; samples
+go no further than the audio stage.
 
 Two run shapes, one binary:
 
@@ -69,6 +70,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from analysis_link import open_link  # noqa: E402
 from audio_stage import AudioSource, AudioStage  # noqa: E402
+from cadence import CadencePicker  # noqa: E402
 from camlink_gateway import (CamlinkGateway, GatewayError,  # noqa: E402
                              parse_expectation)
 from external_source import ExternalSource, SourceError  # noqa: E402
@@ -108,10 +110,12 @@ TRACK_ABSENT_MAX_S = 15.0
 # secondary waits as it waits for a track).
 STARVED_RETRY_S = 1.0
 STARVED_TRACK_MAX_S = 30.0
-# The face view's pose cadence. A face in a hand-held or propped phone
-# moves little; three keypoint passes a second draw it and leave the GPU
-# to the body view's six.
-FACE_POSE_FPS = 3.0
+# The pose cadence, both views: --pose-fps, and --face-pose-fps for the
+# phone's view when it differs (tee/entrypoint.sh sets the body's; the face
+# follows it unless told otherwise). Which grid frames a cadence takes is
+# cadence.CadencePicker's: 9 fps is slots 0, 3, 7, 10, ... of the 30 fps
+# grid.
+DEFAULT_POSE_FPS = 9.0
 # stream-reader (workload/reader): reads a live stream's video track with
 # the time its sender gave each frame and hands the frames over as records
 # (workload/reader/record). Without the binary a live stream is decoded
@@ -148,6 +152,8 @@ def mounted_path(candidate: str) -> str | None:
     if normalized.startswith(root):
         return normalized
     return None
+
+
 PENDING_CAP = 256
 # Decided frames waiting for the descriptors thread; ~8 MB of 4K luma each.
 DESCRIPTORS_QUEUE_DEPTH = 128
@@ -598,7 +604,7 @@ class Decoder:
 
 
 class PoseWorker(threading.Thread):
-    """Pose at the 6fps cadence, never allowed to block the decode.
+    """Pose at its view's cadence, never allowed to block the decode.
 
     `view` names the stream this worker poses (`GpuPose.step`'s view; None
     is the body's) and `stage` the telemetry stage its steps time. A worker
@@ -631,7 +637,8 @@ class PoseWorker(threading.Thread):
         # Depth 2 shipped on the L4. On Blackwell the measured drops at
         # depth 2 were burst- and lock-wait-driven with the average cycle
         # under budget, so a deeper queue absorbs them; the price is
-        # staleness, bounded at depth x the pose cadence.
+        # staleness, bounded at depth x the pose interval (4 x 111 ms at
+        # 9 fps).
         depth = (queue_depth if queue_depth is not None
                  else int(os.environ.get("POSE_QUEUE_DEPTH", "0") or "0"))
         self.queue: queue.Queue = queue.Queue(
@@ -845,12 +852,13 @@ class Session:
     the phone's own camera as the face stream) the session reads both: the
     body view is everything a session was - pose, descriptors, the analysis
     messages, the annotated view - and the face view is decoded beside it,
-    posed at FACE_POSE_FPS through the same model, drawn as an inset over
-    the view (overlay.py) and sent to the analysis as `facePose` rows; the
-    two are lined up on one clock (sync.py). `args.audio_stream` names the
-    stream whose audio track --audio reads: the phone's, when both are
-    present, since it is the one near the user's face. Two views need the
-    GPU pose; a sideload session reads the body alone.
+    posed at the face cadence (the body's, or --face-pose-fps) through the
+    same model, drawn as an inset over the view (overlay.py) and sent to
+    the analysis as `facePose` rows; the two are lined up on one clock
+    (sync.py). `args.audio_stream` names the stream whose audio track
+    --audio reads: the phone's, when both are present, since it is the one
+    near the user's face. Two views need the GPU pose; a sideload session
+    reads the body alone.
     """
 
     def __init__(self, args, telemetry: Telemetry):
@@ -877,12 +885,18 @@ class Session:
         # decoders' sender-time epochs are on (sync.py).
         self.sync = ViewSync(clock=time.time) if face_stream else None
 
-        # Pose cadence and the interpolation bridge it needs: the bridge
-        # scales with the pose interval (1.3x of it, at least 0.35 s).
-        pose_fps = float(getattr(args, "pose_fps", 6.0) or 6.0)
-        self.pose_fps = pose_fps
-        self.pose_stride = max(1, int(round(FPS / pose_fps)))
-        bridge_s = max(0.35, 1.3 * self.pose_stride / FPS)
+        # Pose cadence, per view, and the interpolation bridge the body's
+        # needs: the bridge scales with the pose interval (1.3x of it, at
+        # least 0.35 s). The face view follows the body's cadence unless
+        # --face-pose-fps says otherwise.
+        pose_fps = float(getattr(args, "pose_fps", None)
+                         or DEFAULT_POSE_FPS)
+        self.picker = CadencePicker(FPS, pose_fps)
+        self.pose_fps = self.picker.pose_fps
+        self.face_pose_fps = CadencePicker(
+            FPS, float(getattr(args, "face_pose_fps", None)
+                       or self.pose_fps)).pose_fps
+        bridge_s = max(0.35, 1.3 * self.picker.interval_s)
         self.assembler = RowAssembler(FPS, bridge_s=bridge_s)
         self.assembler_lock = threading.Lock()
         self.descriptors = DescriptorWorker()
@@ -925,13 +939,14 @@ class Session:
         self.analysis = open_link(
             getattr(args, "analysis_socket", "") or "",
             self._on_analysis, self._on_analysis_error,
-            fps=FPS, poseFps=pose_fps, postIntervalS=self.post_interval_s,
+            fps=FPS, poseFps=self.pose_fps,
+            postIntervalS=self.post_interval_s,
             run=self.run_name or None,
             audio=self.audio_classifier is not None,
             audioModel=(self.audio_classifier.version
                         if self.audio_classifier is not None else None),
             views=(["body", "face"] if self.face_stream else ["body"]),
-            facePoseFps=(FACE_POSE_FPS if self.face_stream else None))
+            facePoseFps=(self.face_pose_fps if self.face_stream else None))
         if self.analysis.connected:
             ready = self.analysis.ready or {}
             print(f"analysis: {ready.get('version', '?')} "
@@ -1050,10 +1065,10 @@ class Session:
         clock.note(at_s)
 
     def _face_loop(self, decoder: "Decoder", worker: "PoseWorker") -> None:
-        """The face view's decode: frames to the overlay, every
-        FACE_POSE_FPS-th to its pose worker, its clock kept. On its own
-        thread; ends with the session or the stream."""
-        stride = max(1, int(round(FPS / FACE_POSE_FPS)))
+        """The face view's decode: frames to the overlay, the face
+        cadence's to its pose worker, its clock kept. On its own thread;
+        ends with the session or the stream."""
+        picker = CadencePicker(FPS, self.face_pose_fps)
         width = None
         try:
             for index, at_s, yuv in decoder.frames():
@@ -1065,7 +1080,7 @@ class Session:
                     width = yuv.shape[1]
                 if self.overlay is not None:
                     self.overlay.offer_face_frame(index, at_s, yuv)
-                if index % stride == 0:
+                if picker.take(index):
                     with self.telemetry.time_stage("faceRgb"):
                         rgb = cv2.cvtColor(
                             yuv.reshape(-1, width), cv2.COLOR_YUV2RGB_I420)
@@ -1217,7 +1232,7 @@ class Session:
                 if len(pending) > PENDING_CAP:
                     pending.pop(min(pending))
                     self.telemetry.count("pendingEvicted")
-                if index % self.pose_stride == 0:
+                if self.picker.take(index):
                     with self.telemetry.time_stage("rgb"):
                         rgb = cv2.cvtColor(
                             yuv.reshape(-1, width), cv2.COLOR_YUV2RGB_I420)
@@ -2348,7 +2363,12 @@ def build_server(args, telemetry: Telemetry,
                         return
                     session_args.track = mounted
                 session_args.pose_fps = float(params.get(
-                    "pose_fps", [getattr(args, "pose_fps", 6.0)])[0])
+                    "pose_fps", [getattr(args, "pose_fps", None)
+                                 or DEFAULT_POSE_FPS])[0])
+                face_pose_fps = params.get(
+                    "face_pose_fps", [getattr(args, "face_pose_fps", None)])[0]
+                session_args.face_pose_fps = (
+                    float(face_pose_fps) if face_pose_fps else None)
                 # A named run lands its capture in gs://<bucket>/runs/<run>/
                 # when the session ends; the name is a path segment there.
                 session_args.run = params.get("run", [""])[0]
@@ -2456,8 +2476,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--stream", default="")
     parser.add_argument("--pose", choices=("gpu", "sideload"),
                         default="gpu")
-    parser.add_argument("--pose-fps", type=float, default=6.0,
-                        help="pose cadence; the bridge widens with it")
+    parser.add_argument("--pose-fps", type=float, default=DEFAULT_POSE_FPS,
+                        help="pose cadence of the body view, any rate up to "
+                             "the 30 fps grid's (CadencePicker: 9 is slots "
+                             "0, 3, 7, 10, ...); the bridge widens with it")
+    parser.add_argument("--face-pose-fps", type=float, default=None,
+                        help="pose cadence of the face view (--face-stream); "
+                             "default the body's")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--track", default="",
                         help="for --pose sideload: a fetched production "
@@ -2514,9 +2539,11 @@ def build_parser() -> argparse.ArgumentParser:
                              "rtsp://127.0.0.1:8554/overlay); empty = off")
     parser.add_argument("--overlay-size", default="1280x720",
                         help="annotated view size, WxH, even")
-    parser.add_argument("--overlay-fps", type=float, default=15.0,
+    parser.add_argument("--overlay-fps", type=float, default=30.0,
                         help="annotated view cadence; frames are duplicated "
-                             "or skipped to hold it")
+                             "or skipped to hold it. 30 shows every frame "
+                             "of the 30 fps grid; 15 every other one; a "
+                             "rate that does not divide 30 steps unevenly")
     parser.add_argument("--overlay-delay-s", type=float, default=1.0,
                         help="how far behind the decode the view runs, so "
                              "each frame is drawn with the pose detected on "
@@ -2531,7 +2558,11 @@ def build_parser() -> argparse.ArgumentParser:
                         help="H.264 encoder: x264 ultrafast (default, needs "
                              "nothing from the driver), nvenc, or auto "
                              "(nvenc if a probe succeeds)")
-    parser.add_argument("--overlay-bitrate", default="3M")
+    parser.add_argument("--overlay-bitrate", default="6M",
+                        help="the annotated view's H.264 bit rate (CBR, a "
+                             "one-second buffer): 6M at 30 fps is the same "
+                             "200 kbit per frame 3M was at 15 fps, so a "
+                             "frame's quality holds as the cadence doubles")
     parser.add_argument("--overlay-record", action="store_true",
                         help="also write the annotated view to overlay.mp4 "
                              "in the capture directory (uploaded with the "

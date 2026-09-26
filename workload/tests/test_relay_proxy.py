@@ -401,7 +401,7 @@ def test_status_says_not_yet_without_a_session_and_reports_with_one():
 
 
 def server_args(**overrides) -> argparse.Namespace:
-    base = dict(stream="", pose="sideload", pose_fps=6.0, device="cpu",
+    base = dict(stream="", pose="sideload", pose_fps=9.0, device="cpu",
                 track="", analysis_socket="", sink_dir="/tmp/x", run="",
                 capture_bucket="", post_url="", post_interval_s=1.0,
                 duration=0.0, serve=True, port=0, teardown_drain_s=1.0,

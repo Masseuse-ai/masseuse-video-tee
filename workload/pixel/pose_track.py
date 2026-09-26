@@ -16,9 +16,9 @@ so they can be tested and reused without a GPU.
 
 Numerics: Sapiens2 loads in bf16 by default (the production dtype; fp32
 weights plus autocast recast the 1B model on every forward and missed the
-6 fps budget), the detector keeps fp32 master weights under CUDA autocast,
-and flip TTA is off in production - the file-mode equivalence gate
-adjudicates the keypoint delta.
+pose budget already at 6 fps), the detector keeps fp32 master weights
+under CUDA autocast, and flip TTA is off in production - the file-mode
+equivalence gate adjudicates the keypoint delta.
 
 Per frame, the tracker touches the host twice. The frame arrives as one CHW
 uint8 tensor on the device; the detector's resize and the pose crop happen

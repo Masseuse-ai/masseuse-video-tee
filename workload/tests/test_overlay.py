@@ -465,6 +465,25 @@ def test_publisher_argv_publishes_rtsp_and_tees_a_recording_when_asked():
     assert "h264_nvenc" in nvenc.argv()
 
 
+def test_publisher_defaults_to_every_grid_frame_at_the_same_bits_per_frame():
+    """The production view (tee/entrypoint.sh): 30 fps, every frame of the
+    decode grid, at 6M - the 200 kbit a frame that 3M at 15 fps was - with
+    a keyframe every two seconds and a one-second rate buffer."""
+    assert overlay.DEFAULT_FPS == 30.0 and overlay.DEFAULT_BITRATE == "6M"
+    publisher = OverlayPublisher("rtsp://r/overlay", (720, 1280), overlay.DEFAULT_FPS)
+    argv = publisher.argv()
+    after = lambda flag: argv[argv.index(flag) + 1]  # noqa: E731
+    assert after("-framerate") == "30"
+    assert after("-g") == "60"
+    assert "keyint=60:min-keyint=60" in after("-x264-params")
+    assert after("-b:v") == "6M" and after("-maxrate") == "6M" and after("-bufsize") == "6M"
+    # 3M at 15 fps and 6M at 30 fps are the same budget per frame.
+    assert 3e6 / 15 == 6e6 / 30 == 200_000
+    # A publisher told 15 fps keeps the two-second keyframe interval.
+    slower = OverlayPublisher("rtsp://r/overlay", (1280, 720), 15.0).argv()
+    assert slower[slower.index("-g") + 1] == "30"
+
+
 def test_publisher_respawns_a_dead_encoder_with_backoff_and_a_fresh_file():
     clock, telemetry = Clock(), Telemetry()
     procs: list[FakeProc] = []
@@ -503,8 +522,14 @@ def test_build_renderer_is_off_without_a_publish_url_and_probes_for_auto():
     view = overlay.build_renderer(args, Telemetry(), probe=lambda: False)
     assert view.publisher.encoder == "x264"
     assert view.size == (640, 360) and view.fps == 10.0 and view.delay_s == 0.5
+    assert view.publisher.bitrate == overlay.DEFAULT_BITRATE  # none named
     view = overlay.build_renderer(args, Telemetry(), probe=lambda: True)
     assert view.publisher.encoder == "nvenc"
+    # Args that name neither cadence nor bit rate get the production view's.
+    bare = overlay.build_renderer(
+        argparse.Namespace(overlay_publish="rtsp://r/overlay"), Telemetry())
+    assert bare.fps == overlay.DEFAULT_FPS == 30.0
+    assert bare.publisher.fps == 30.0 and bare.publisher.bitrate == "6M"
 
 
 # -- the tap in live_pose --------------------------------------------------------

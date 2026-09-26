@@ -1,4 +1,4 @@
-"""Online pose at the 6fps cadence: the Tracker, streamed.
+"""Online pose at the producer's cadence: the Tracker, streamed.
 
 `pose_track.Tracker` is already an online machine - identity anchored to the
 last accepted box, scenery boxes discarded - and this wrapper adds only what
@@ -407,9 +407,14 @@ class GpuPose:
     autocast (the detector keeps fp32 master weights; autocast picks its
     kernels). fp32 weights plus autocast recast the 1B model on every
     forward, and on the RTX PRO 6000 that overhead was the difference
-    between missing and making the 167ms 6fps budget, so there is no other
-    dtype. The remaining knobs default to the production configuration; an
-    unset revision boots exactly what service.yaml describes:
+    between missing and making the then 167ms 6fps budget, so there is no
+    other dtype. The budget today is the two views' together: the body and
+    the face view each at 9 fps (producer --pose-fps) share this one
+    model through `_lock`, 18 steps a second, 55ms each, of which the
+    Sapiens2-1B graph replay is 46ms on the slot's H100 (pose_bench,
+    2026-09-10); `pose_load` measures whether a slot holds that. The
+    remaining knobs default to the production configuration; an unset
+    revision boots exactly what service.yaml describes:
 
       POSE_PREFETCH=1   copy the model store (hub cache + detector
                         checkpoints) from the FUSE mount to local disk
@@ -420,14 +425,15 @@ class GpuPose:
                         compose loop has no mount).
       POSE_DETECT_STRIDE  run the person detector on every Nth pose frame
                         and pose the cached box in between. The fixed camera
-                        and braced prone body move the box slowly; detect at
-                        33ms per frame (measured, Blackwell) is a fifth of
-                        the 6fps budget spent re-finding a box that has not
+                        and braced prone body move the box slowly; a detect
+                        (33ms on Blackwell, 8ms on the H100) on every pose
+                        frame is budget spent re-finding a box that has not
                         moved. A lost person always re-detects on the next
-                        frame. Default 3.
+                        frame. Default 3: at 9 fps, three detects a second
+                        per view.
       POSE_FLIP_TTA=1   the flip-TTA pair instead of a single forward. With
-                        TTA the Blackwell worker ran at ~93% of the 6fps
-                        budget and queue bursts dropped ~11% of poses -
+                        TTA the Blackwell worker ran at ~93% of the then
+                        6fps budget and queue bursts dropped ~11% of poses -
                         enough clustering to blank the readings the analysis
                         derives in the exact windows the consumer votes on.
                         Default 0: half
@@ -443,6 +449,13 @@ class GpuPose:
                         policy admits it, nothing in production sets it,
                         and the graphs it captures are gone before the
                         slot serves.
+      POSE_LOAD_BENCH=9,9,120  after the batch bench, run the two views'
+                        pose load - body and face cadences, seconds - the
+                        way a session submits it, and print one `poseLoad`
+                        line with drops, step and wait times and the GPU
+                        busy fraction, reported as gauges too (pose_load).
+                        The same kind of knob: admitted, never set in
+                        production, nothing of it survives the boot.
 
     Each frame is uploaded once as a CHW uint8 tensor; the detector's
     resize, the pose crop, both forwards and their post-processing run on
@@ -573,6 +586,7 @@ class GpuPose:
         self.tracker.capture(self.telemetry)
         self.check_parity()
         self.bench_batches(os.environ.get("POSE_GRAPH_BENCH"))
+        self.bench_load(os.environ.get("POSE_LOAD_BENCH"))
         if self.telemetry:
             self.telemetry.boot_phase("firstInference", started)
         self._log_gpu()
@@ -596,6 +610,68 @@ class GpuPose:
             if self.telemetry:
                 self.telemetry.count("poseBenchFailed")
             return None
+
+    def bench_load(self, spec: str | None) -> dict | None:
+        """The boot-time load bench when `POSE_LOAD_BENCH` names a load
+        (see `pose_load`); nothing otherwise. As with the batch bench a
+        failure is printed and counted (`poseLoadFailed`), never a lost
+        boot, and whatever the bench's detections left on the tracker is
+        cleared before the slot serves."""
+        import pose_load
+
+        plan = pose_load.parse_spec(spec)
+        if plan is None:
+            return None
+        try:
+            return pose_load.run(self.load_stepper(), plan, lock=self._lock,
+                                 telemetry=self.telemetry)
+        except Exception as error:  # noqa: BLE001 - a bench, not the service
+            print(f"poseLoad: failed: {error!r}", flush=True)
+            if self.telemetry:
+                self.telemetry.count("poseLoadFailed")
+            return None
+        finally:
+            self.reset_session_state()
+
+    def load_stepper(self, size: tuple[int, int] = (720, 1280)):
+        """The load bench's step: a session's device work for one pose
+        frame of `view`, its k-th. The frame is uploaded as the decoder's
+        HWC uint8 array is (`Tracker.frame_tensor`), the detector runs on
+        every POSE_DETECT_STRIDE-th step as `_step` runs it, and the pose
+        crop and graph replay run over a fixed box (`pose_bench.slot_boxes`)
+        with the copy back, since the synthetic frame shows nobody to
+        detect. `size` is rows x columns: a 1280x720 stream's frame."""
+        import pose_bench
+
+        tracker = self.tracker
+        rgb = self.load_frame(size)
+        height, width = size
+        box = pose_bench.slot_boxes(1, float(width), float(height))[0]
+        stride = self._detect_stride
+        device = self.device
+
+        def step(view: str, k: int) -> None:
+            frame = tracker.frame_tensor(rgb, device)
+            if k % stride == 0:
+                tracker.detect(frame)
+            tracker.pose_keypoints(frame, box)
+
+        return step
+
+    @staticmethod
+    def load_frame(size: tuple[int, int] = (720, 1280)) -> np.ndarray:
+        """A synthetic HWC uint8 RGB frame on the host with some structure
+        (the parity frame's gradient and block, at a stream's size), for
+        the load bench to upload as a decoded frame is uploaded."""
+        height, width = size
+        rows = np.linspace(0, 255, height, dtype=np.float32)[:, None]
+        cols = np.linspace(0, 255, width, dtype=np.float32)[None, :]
+        rows = np.broadcast_to(rows, (height, width))
+        cols = np.broadcast_to(cols, (height, width))
+        frame = np.stack([rows, cols, (rows + cols) / 2], axis=-1)
+        frame = np.round(frame).astype(np.uint8)
+        frame[height // 4: 3 * height // 4, width // 3: 2 * width // 3] = 200
+        return np.ascontiguousarray(frame)
 
     @staticmethod
     def parity_frame(device: str, size: tuple[int, int] = (360, 640)):
@@ -829,6 +905,10 @@ class SideloadPose:
                 row = json.loads(line)
                 self.rows[int(row["frame"])] = row
         frames = sorted(self.rows)
+        # The capture's pose interval in frames: the smallest gap between
+        # its rows. A cadence that divides the 30 fps grid has one gap (5
+        # at 6 fps); 9 fps has a 3-4-3 pattern, so 3, and a lookup at any
+        # picked slot resolves within half of it below.
         self.stride = min(
             (b - a for a, b in zip(frames, frames[1:]) if b > a), default=1)
         self.span = (frames[-1] + self.stride) if frames else 1

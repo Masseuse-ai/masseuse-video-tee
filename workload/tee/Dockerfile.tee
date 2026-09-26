@@ -219,10 +219,11 @@ LABEL org.opencontainers.image.version="${TEE_IMAGE_VERSION}" \
 
 LABEL "tee.launch_policy.log_redirect"="debugonly"
 LABEL "tee.launch_policy.allow_cmd_override"="false"
-# POSE_GRAPH_BENCH is a debug-slot measurement knob (pixel/pose_bench.py):
-# no ENV default here, so it is inert unless set as tee-env metadata by hand;
-# the Terraform for either mode never sets it.
-LABEL "tee.launch_policy.allow_env_override"="TEE_PUBLIC_HOST,TEE_PUBLIC_IP,SLOT_NAME,TRAINER_URL,TRAINER_INVOKER_SERVICE_ACCOUNT,TEE_ALLOWED_ORIGINS,MODELS_BUCKET,WIF_AUDIENCE,GOOGLE_CLOUD_PROJECT,ACME_DIRECTORY_URL,ACME_CONTACT_EMAIL,ACME_EAB_IMPERSONATE,TEE_IDLE_EXIT_S,TEE_BOOT_IDLE_S,POSE_GRAPH_BENCH"
+# POSE_GRAPH_BENCH and POSE_LOAD_BENCH are debug-slot measurement knobs
+# (pixel/pose_bench.py, pixel/pose_load.py): no ENV default here, so they
+# are inert unless set as tee-env metadata by hand; the Terraform for either
+# mode never sets them.
+LABEL "tee.launch_policy.allow_env_override"="TEE_PUBLIC_HOST,TEE_PUBLIC_IP,SLOT_NAME,TRAINER_URL,TRAINER_INVOKER_SERVICE_ACCOUNT,TEE_ALLOWED_ORIGINS,MODELS_BUCKET,WIF_AUDIENCE,GOOGLE_CLOUD_PROJECT,ACME_DIRECTORY_URL,ACME_CONTACT_EMAIL,ACME_EAB_IMPERSONATE,TEE_IDLE_EXIT_S,TEE_BOOT_IDLE_S,POSE_GRAPH_BENCH,POSE_LOAD_BENCH"
 LABEL "tee.launch_policy.allow_mount_destinations"="/models:/run/tee"
 LABEL "tee.launch_policy.hardened_monitoring"="none"
 LABEL "tee.launch_policy.debug_monitoring"="memoryonly"

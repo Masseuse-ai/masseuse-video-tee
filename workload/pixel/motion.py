@@ -27,7 +27,9 @@ Three pieces:
                      are reduced to per-window statistics. Two cadences,
                      30 fps pairs and 6 fps pairs, because a statistic over a
                      0.033 s pair and one over a 0.167 s pair are different
-                     measurements and the analysis wants both.
+                     measurements and the analysis wants both. The slow
+                     pair's cadence is its own (FRAMES_PER_POSE), not the
+                     keypoint model's.
 
 Units: lengths are in hip widths (the distance between the hip keypoints,
 so the descriptors are independent of camera distance), flow in canonical
@@ -46,7 +48,11 @@ import numpy as np
 # Pose rows at frame cadence
 # ---------------------------------------------------------------------------
 
-# 30 fps frames per 6 fps pose interval.
+# 30 fps frames per slow-descriptor pair: 0.167 s, the 6 fps interval the
+# slow statistics were defined over. The keypoint model's own cadence
+# (producer --pose-fps, 9 by default) is independent of it: the slow pair
+# is a measurement the analysis expects at this spacing, whatever the pose
+# runs at.
 FRAMES_PER_POSE = 5
 
 # A pose gap wider than this is not bridged by interpolation: the frames in
@@ -54,8 +60,9 @@ FRAMES_PER_POSE = 5
 MAX_POSE_BRIDGE_S = 0.35
 
 # A streamed frame this close to a pose row's own timestamp reuses that pose
-# outright. Half a 30 fps step, so the 6 fps grid points, which land exactly
-# on every fifth 30 fps frame, reproduce their pose bit for bit.
+# outright. Half a 30 fps step: every pose row is a 30 fps grid frame
+# (producer.CadencePicker), so the frame it was detected on reproduces its
+# pose bit for bit and no other frame does.
 POSE_SNAP_S = 1.0 / 60.0
 
 
@@ -93,8 +100,10 @@ class RowAssembler:
     descriptors reset, exactly as an offline pass does across a dropped
     frame.
 
-    `bridge_s` widens `MAX_POSE_BRIDGE_S` for pose cadences below 6 fps; a
-    braced, mostly still body's registration tolerates second-scale gaps.
+    `bridge_s` widens `MAX_POSE_BRIDGE_S` for pose cadences below about
+    3.7 fps, where 1.3 x the pose interval exceeds it; a braced, mostly
+    still body's registration tolerates second-scale gaps. At the 9 fps
+    default the interval is 0.111 s and the floor stands.
     """
 
     def __init__(self, fps: float = 30.0, bridge_s: float | None = None):

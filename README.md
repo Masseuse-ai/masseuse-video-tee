@@ -32,8 +32,8 @@ Inside the enclave, in code that is in this repository:
   or named directly (the trust boundary below) - the phone's own camera
   stays live too. The fixed camera's picture is the session's: the body
   view, which everything above runs on. The phone's picture is decoded
-  beside it, its person and keypoints found by the same detectors at a
-  lower cadence, and drawn as an inset in the top-right corner of the
+  beside it, its person and keypoints found by the same detectors at the
+  same cadence, and drawn as an inset in the top-right corner of the
   annotated view with those keypoints, cropped to follow the face and
   mirrored the way the phone's own preview was when its camera faces the
   user (the phone says which, `PUT /ingest/view`). The two pictures are

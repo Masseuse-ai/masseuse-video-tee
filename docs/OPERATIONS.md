@@ -374,6 +374,40 @@ posture.
   has no default in the image and no Terraform sets it; the metadata
   entry is dropped by the next `terraform apply` (and the flip replaces
   the instance), so it never follows the slot into production.
+- The pose load bench (`workload/pixel/pose_load.py`): the same kind of
+  knob, `tee-env-POSE_LOAD_BENCH=9,9,120` (body cadence, face cadence,
+  seconds; `9,0,60` is the body alone), run after the batch bench. It
+  drives the booted models the way a two-camera session does - both views'
+  frames arriving on a wall-clock 30 fps grid, the pose frames picked by
+  the producer's own picker (3-4-3 at 9 fps), one bounded queue and worker
+  per view as the producer has, the detector on every
+  `POSE_DETECT_STRIDE`-th step, one frame at a time through the graphs -
+  and prints one line: `poseLoad views=body@9,face@9 seconds=120.0
+  depth=4 steps=2160 drops=0/0 stepMs=p50/p95 lockWaitMs=p50/p95
+  queueWaitMs=p50/p95 busy=0.85 stepsPerS=18.0 gpu=[clock/power/temp/
+  util/throttle reasons before] -> [after]`. The same numbers are gauges on
+  `/statz` (`poseLoadBodyDrops`, `poseLoadFaceDrops`, `poseLoadStepP95Ms`,
+  `poseLoadQueueWaitP95Ms`, `poseLoadBusy`, `poseLoadStepsPerS`,
+  `poseLoadSeconds`, `poseLoadErrors`), which is how a production-posture
+  slot, whose stdout goes nowhere, reports it. A slot holds the 9 + 9 fps
+  load when, over 120 s, `drops` is `0/0`, `stepMs` p95 is at or under
+  52 ms (the H100's 46 ms replay plus the upload and a share of the
+  detects), `queueWaitMs` p95 is at or under 60 ms (a step behind the
+  other view's), `busy` is at or under 0.90 and the throttle reasons stay
+  at zero (`0x0000000000000000`; `0x4` is the software power cap, and the
+  slot runs near its 700 W under this load). Run it twice, one of them a
+  cold boot: the first minute after a
+  cold start has shown a pose step at 105 ms once. A bench of 120 s
+  lengthens the boot by that much; a hand-booted slot with no lease exits
+  after `TEE_BOOT_IDLE_S` (300 s), so raise that in the same metadata for
+  a longer run. Nothing of it survives the boot: the workers are joined
+  and the tracker's session state cleared before the slot serves. A step
+  that raises is counted (`errors=`, `poseLoadErrors`), a bench that fails
+  to run is a `poseLoad: failed:` line and a `poseLoadFailed` count, never
+  a lost boot. If the gate fails, the ladder is: `POSE_DETECT_STRIDE` 3 to
+  5 (six detects a second fewer), then the face view to 6 fps
+  (`--face-pose-fps 6` in `tee/entrypoint.sh`, the phone's face moves
+  little), then the body to 7.5; each step is a new image roll.
 
 ## Image signing (`terraform/signing.tf`)
 

@@ -220,6 +220,41 @@ def test_sideload_replays_the_body_only(tmp_path):
     assert len(face_taps) == 1 and face_taps[0][2] is None
 
 
+def test_sideload_serves_a_nine_fps_session_from_a_six_fps_capture(tmp_path):
+    """A capture posed at 6 fps (rows every fifth frame) replayed by a
+    session picking 9 fps slots (0, 3, 7, 10, ...): a slot within half the
+    capture's interval of a row gets that row; one exactly between two rows
+    is not guessed at."""
+    import json
+
+    rows = [{"frame": f, "atS": f / 30, "keypoints": {"nose": [float(f), 0.0, 0.9]}}
+            for f in range(0, 30, 5)]
+    (tmp_path / "poses.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows))
+    pose = live_pose.SideloadPose(tmp_path)
+    assert pose.stride == 5 and pose.span == 30
+    served = {slot: pose.step(None, slot, slot / 30)["keypoints"]
+              for slot in (0, 3, 7, 10, 13, 17, 20, 23, 27)}
+    # 3 -> 5 (two away), 7 -> 5, 13 -> 15, 17 -> 15, 23 -> 25, 27 -> 25;
+    # 0, 10, 20 are rows of their own.
+    assert {s: (kp or {}).get("nose", [None])[0] for s, kp in served.items()} == {
+        0: 0.0, 3: 5.0, 7: 5.0, 10: 10.0, 13: 15.0, 17: 15.0, 20: 20.0,
+        23: 25.0, 27: 25.0}
+    # A 9 fps capture replayed at 9 fps: every slot is its own row and the
+    # interval is the pattern's shortest gap.
+    nine = [{"frame": f, "atS": f / 30, "keypoints": {"nose": [float(f), 0.0, 0.9]}}
+            for f in (0, 3, 7, 10, 13, 17, 20, 23, 27)]
+    (tmp_path / "poses.jsonl").write_text("".join(json.dumps(r) + "\n" for r in nine))
+    pose = live_pose.SideloadPose(tmp_path)
+    assert pose.stride == 3 and pose.span == 30
+    # ... and the replay wraps at the span, so the second second's slots
+    # get the first's rows.
+    assert all(pose.step(None, f, f / 30)["keypoints"]["nose"][0] == float(f % 30)
+               for f in (0, 3, 7, 10, 13, 17, 20, 23, 27, 30, 33, 37))
+    # A slot two away from the nearest row (frame 5, between 3 and 7) has
+    # no row within half the interval: replayed as no pose.
+    assert pose.step(None, 5, 5 / 30)["keypoints"] is None
+
+
 # -- the parity check ------------------------------------------------------------
 
 
@@ -406,3 +441,81 @@ def test_a_bench_that_fails_is_printed_and_counted_not_fatal(monkeypatch, capsys
     assert pose.bench_batches("8") is None
     assert "poseBench: failed: RuntimeError('CUDA out of memory')" in capsys.readouterr().out
     assert pose.telemetry.snapshot()["counters"]["poseBenchFailed"] == 1
+
+
+# -- the load bench knob ----------------------------------------------------------
+
+
+def _load_pose(monkeypatch, run):
+    import pose_load
+
+    monkeypatch.setattr(pose_load, "run", run)
+    pose = live_pose.GpuPose(device="cuda", telemetry=Telemetry())
+    pose.tracker = StubTracker()
+    return pose
+
+
+def test_the_load_bench_runs_only_when_the_knob_names_a_load(monkeypatch):
+    import pose_load
+
+    calls = []
+
+    def run(step, spec, **kwargs):
+        calls.append((step, spec, kwargs))
+        return {"steps": 0}
+
+    pose = _load_pose(monkeypatch, run)
+    assert pose.bench_load(None) is None
+    assert pose.bench_load("") is None
+    assert pose.bench_load("0") is None
+    assert calls == []
+    assert pose.bench_load("9,9,120") == {"steps": 0}
+    (step, spec, kwargs), = calls
+    assert spec == pose_load.LoadSpec(9.0, 9.0, 120.0)
+    assert callable(step)
+    # The session's lock, so the bench's steps take turns as views do, and
+    # the telemetry the gauges land on.
+    assert kwargs["lock"] is pose._lock and kwargs["telemetry"] is pose.telemetry
+
+
+def test_the_load_step_is_the_sessions_device_work(monkeypatch):
+    """Upload as the decoder's frame is uploaded, detect on every
+    POSE_DETECT_STRIDE-th step of a view, pose a fixed box on every step;
+    and what the bench's detections left on the tracker is cleared."""
+    monkeypatch.setenv("POSE_DETECT_STRIDE", "3")
+    tracker = StubTracker()
+    pose = live_pose.GpuPose(device="cuda", telemetry=Telemetry())
+    pose.tracker = tracker
+    step = pose.load_stepper(size=(720, 1280))
+    for k in range(6):
+        step("body", k)
+    assert tracker.frames == [((720, 1280, 3), "cuda")] * 6
+    assert tracker.detects == 2  # k = 0 and 3
+    assert len(tracker.posed) == 6 and all(box == tracker.posed[0] for box in tracker.posed)
+    x, y, w, h = tracker.posed[0]
+    assert 0 <= x and x + w <= 1280 and 0 <= y and y + h <= 720 and w > 0 and h > 0
+    frame = live_pose.GpuPose.load_frame((720, 1280))
+    assert frame.shape == (720, 1280, 3) and frame.dtype == np.uint8 and frame.flags.c_contiguous
+    assert frame.std() > 0
+
+    # After a run - here one that returns at once - the tracker's identity
+    # anchor and scenery are the fresh slot's.
+    import pose_load
+    monkeypatch.setattr(pose_load, "run", lambda step, spec, **kwargs: {"steps": 1})
+    tracker.previous = "anchor"
+    tracker.scenery = ["box"]
+    assert pose.bench_load("9,9,5") == {"steps": 1}
+    assert tracker.previous is None and tracker.scenery == []
+
+
+def test_a_load_bench_that_fails_is_printed_and_counted_not_fatal(monkeypatch, capsys):
+    def run(step, spec, **kwargs):
+        raise RuntimeError("CUDA error: device-side assert")
+
+    pose = _load_pose(monkeypatch, run)
+    pose.tracker.previous = "anchor"
+    assert pose.bench_load("9,9,120") is None
+    assert ("poseLoad: failed: RuntimeError('CUDA error: device-side assert')"
+            in capsys.readouterr().out)
+    assert pose.telemetry.snapshot()["counters"]["poseLoadFailed"] == 1
+    assert pose.tracker.previous is None

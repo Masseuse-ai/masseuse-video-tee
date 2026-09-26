@@ -75,6 +75,7 @@ class StubDecoder:
         self.kwargs = kwargs
         self.timing = "ntp"
         self.epoch = None
+        self.paced = True  # a live stream: decided rows never block on it
         self.stopped = False
         StubDecoder.made.append(self)
 
@@ -115,7 +116,7 @@ def session_args(tmp_path, **overrides):
     return args
 
 
-def run_session(monkeypatch, tmp_path, **overrides):
+def run_session(monkeypatch, tmp_path, scripts=None, **overrides):
     pose = StubPose()
     links = []
 
@@ -128,8 +129,9 @@ def run_session(monkeypatch, tmp_path, **overrides):
     monkeypatch.setattr(producer, "Decoder", StubDecoder)
     monkeypatch.setattr(producer, "open_link", open_link)
     StubDecoder.made = []
-    StubDecoder.scripts = {BODY_URL: [(0, 0.0), (1, 1 / 30), (2, 2 / 30)],
-                           FACE_URL: [(0, 0.0), (10, 10 / 30)]}
+    StubDecoder.scripts = scripts or {
+        BODY_URL: [(0, 0.0), (1, 1 / 30), (2, 2 / 30)],
+        FACE_URL: [(0, 0.0), (10, 10 / 30)]}
     StubDecoder.epochs = {BODY_URL: 1_000.0, FACE_URL: 1_002.0}
     session = producer.Session(session_args(tmp_path, **overrides), Telemetry())
     session.run()
@@ -140,7 +142,9 @@ def test_two_views_are_decoded_posed_and_reported(monkeypatch, tmp_path):
     session, pose, link = run_session(monkeypatch, tmp_path)
     assert session.face_stream == FACE_URL and session.audio_stream == FACE_URL
     assert link.fields["views"] == ["body", "face"]
-    assert link.fields["facePoseFps"] == producer.FACE_POSE_FPS
+    # The face view follows the body's cadence unless told otherwise.
+    assert session.face_pose_fps == 6.0
+    assert link.fields["poseFps"] == 6.0 and link.fields["facePoseFps"] == 6.0
     # Two decoders: the face's waits for its track rather than failing.
     by_url = {d.url: d for d in StubDecoder.made}
     assert set(by_url) == {BODY_URL, FACE_URL}
@@ -170,6 +174,37 @@ def test_two_views_are_decoded_posed_and_reported(monkeypatch, tmp_path):
     assert views["face"] == {"timing": "ntp", "epoch": 1_002.0, "url": FACE_URL}
     assert views["sync"] == {"timing": "ntp", "skewMs": 2000}
     assert session.telemetry.snapshot()["counters"]["faceFramesIn"] == 2
+
+
+def test_the_face_view_takes_its_own_cadence_when_given(monkeypatch, tmp_path):
+    """--face-pose-fps 3 with the body at 6: the face's frames 0 and 10 are
+    both on the 3 fps picker's slots (0, 10, 20, ...), and `hello` says
+    which cadence each view runs at."""
+    session, pose, link = run_session(monkeypatch, tmp_path, face_pose_fps=3.0)
+    assert session.pose_fps == 6.0 and session.face_pose_fps == 3.0
+    assert link.fields["poseFps"] == 6.0 and link.fields["facePoseFps"] == 3.0
+    assert [(index, at) for view, index, at in pose.steps if view == "face"] == [
+        (0, 0.0), (10, round(10 / 30, 4))]
+
+
+def test_a_nine_fps_body_submits_the_picker_slots(monkeypatch, tmp_path):
+    """pose_fps=9 on the 30 fps grid: slots 0, 3, 7, 10 go to the pose and
+    the frames between do not; the face view at the same cadence picks the
+    same slots of its own grid."""
+    grid = [(i, i / 30) for i in range(12)]
+    session, pose, link = run_session(
+        monkeypatch, tmp_path, pose_fps=9.0,
+        scripts={BODY_URL: grid, FACE_URL: grid})
+    assert session.pose_fps == 9.0 and session.face_pose_fps == 9.0
+    assert link.fields["poseFps"] == 9.0 and link.fields["facePoseFps"] == 9.0
+    body = sorted(index for view, index, _ in pose.steps if view == "body")
+    face = sorted(index for view, index, _ in pose.steps if view == "face")
+    assert body == [0, 3, 7, 10] and face == [0, 3, 7, 10]
+    # The pose rows the analysis sees are the picked slots, in order, at
+    # their grid times.
+    rows = [m for m in link.sent if m["kind"] == "pose"]
+    assert [row["frame"] for row in rows] == [0, 3, 7, 10]
+    assert [row["atS"] for row in rows] == [0.0, 0.1, round(7 / 30, 4), round(10 / 30, 4)]
 
 
 def test_one_view_without_a_face_stream(monkeypatch, tmp_path):

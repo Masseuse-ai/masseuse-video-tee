@@ -43,13 +43,18 @@ not cross it.
 ### `hello`, once, first
 
 ```json
-{"kind": "hello", "protocol": 1, "fps": 30.0, "poseFps": 6.0,
+{"kind": "hello", "protocol": 1, "fps": 30.0, "poseFps": 9.0,
  "postIntervalS": 1.0, "run": null,
  "audio": true, "audioModel": "ced.cpp-abi1:ced-small-f16.gguf"}
 ```
 
 - `fps`: the decode cadence the `frame` messages arrive at.
-- `poseFps`: the cadence the keypoint model runs at.
+- `poseFps`: the cadence the keypoint model runs at on the body view: the
+  `pose` rows per second. It need not divide `fps`; the model's frames are
+  the decode grid's slots nearest each ideal instant (at 9 of 30 fps, the
+  frames 0, 3, 7, 10, 13, 17, ...: a 3-4-3 pattern of frame gaps, nine
+  per thirty frames), so consecutive `pose` rows are three or four frames
+  apart, not a fixed stride.
 - `postIntervalS`: how often the analysis is expected to emit a `post`.
 - `run`: the operator's name for a captured test session, or `null` in
   production.
@@ -63,7 +68,9 @@ not cross it.
   is not marked otherwise - and the user's phone, pointed at their face,
   as a second view whose keypoints arrive as `facePose`; the audio stage
   then reads the phone's track. `facePoseFps` is the face view's keypoint
-  cadence (`null` with one view).
+  cadence (`null` with one view): the body's unless the producer was
+  started with a different one for the face, and picked from the face
+  view's own decode grid the same way.
 
 ### `pose`, every keypoint-model result, in order
 
@@ -121,7 +128,8 @@ body view's alone.
   `null` when the two frames were not consecutive or either had no usable
   pelvis frame.
 - `slow`: the same descriptor for the pair five frames apart, present only on
-  every fifth frame.
+  every fifth frame. Its spacing is its own (0.167 s, the interval the
+  slow statistics were defined over), not `poseFps`'s.
 
 A descriptor (`workload/pixel/motion.py`, `MotionSample.as_json`):
 

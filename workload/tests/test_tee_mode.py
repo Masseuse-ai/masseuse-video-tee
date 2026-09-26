@@ -116,7 +116,7 @@ def make_tee(**overrides) -> tee_mode.TeeMode:
 
 
 def server_args(**overrides) -> argparse.Namespace:
-    base = dict(stream="", pose="sideload", pose_fps=6.0, device="cpu",
+    base = dict(stream="", pose="sideload", pose_fps=9.0, device="cpu",
                 track="", analysis_socket="", sink_dir="/tmp/x", run="",
                 capture_bucket="", post_url="", post_interval_s=1.0,
                 # A /teardown in a test must never reach its os._exit: the

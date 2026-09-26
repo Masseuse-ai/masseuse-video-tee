@@ -1,6 +1,7 @@
 """The producer core: the online row assembler and the pose worker.
 
-The assembler turns 6 fps pose rows into one row per 30 fps frame, decided
+The assembler turns pose-cadence rows (6 fps here, 9 in production: the
+slots `cadence.CadencePicker` picks) into one row per 30 fps frame, decided
 as late as it must be (snap, bridge, or poseless) and never later; the
 worker keeps the pose off the decode thread, drops when its queue is full,
 and hands every slot to the assembler - and every real pose row to
@@ -20,22 +21,50 @@ WORKLOAD = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(WORKLOAD / "producer"))
 sys.path.insert(0, str(WORKLOAD / "pixel"))
 
+from cadence import CadencePicker  # noqa: E402
 from motion import POSE_SNAP_S, RowAssembler  # noqa: E402
 from producer import MOUNT_ROOT, PoseWorker, Session, mounted_path  # noqa: E402
 from telemetry import Telemetry  # noqa: E402
 
 
 def pose_rows(count: int, pose_fps: float = 6.0) -> list[dict]:
-    """`count` posed rows at the pose cadence, the hips drifting a pixel a
-    row so an interpolated row is told apart from a snapped one."""
-    stride = int(round(30.0 / pose_fps))
+    """`count` posed rows at the pose cadence - on the grid slots the
+    producer's picker sends to the model, at those slots' times - the hips
+    drifting a pixel a row so an interpolated row is told apart from a
+    snapped one."""
+    slots = CadencePicker(30.0, pose_fps).slots(count)
     return [
-        {"frame": i * stride, "atS": round(i / pose_fps, 4),
+        {"frame": slot, "atS": round(slot / 30.0, 4),
          "box": [0.0, 0.0, 8.0, 8.0], "boxScore": 0.9, "people": 1,
          "keypoints": {"left_hip": [1.0 + i, 2.0, 0.9],
                        "right_hip": [3.0 + i, 2.0, 0.9]}}
-        for i in range(count)
+        for i, slot in enumerate(slots)
     ]
+
+
+def test_the_assembler_snaps_and_bridges_a_nine_fps_track():
+    """At 9 fps the pose rows sit on slots 0, 3, 7, 10, ... (3-4-3): every
+    picked slot's frame snaps to its own pose bit for bit, every frame
+    between two poses is interpolated over a gap of 3 or 4 frames, and
+    nothing is left poseless while the track is whole."""
+    track = pose_rows(10, pose_fps=9.0)
+    assert [row["frame"] for row in track] == [0, 3, 7, 10, 13, 17, 20, 23, 27, 30]
+    assembler = RowAssembler(30.0)
+    rows = []
+    for row in track:  # as the decode loop does: a pose row, then a flush
+        assembler.push_pose(row)
+        rows.extend(assembler.flush())
+    by_frame = {row["frame"]: row for row in rows}
+    assert min(by_frame) == 0 and max(by_frame) >= 27
+    for pose in track[:-1]:
+        assert by_frame[pose["frame"]]["keypoints"] == pose["keypoints"]
+    for frame, row in by_frame.items():
+        assert row["keypoints"] is not None, f"frame {frame} was left poseless"
+    # Frame 5 lies between the poses at 3 and 7: interpolated halfway
+    # (the rows' atS are rounded to 4 decimals, as the wire's are).
+    assert by_frame[5]["keypoints"]["left_hip"][0] == pytest.approx(2.0 + 0.5, abs=1e-3)
+    # Frame 8 lies between 7 and 10: a third of the way.
+    assert by_frame[8]["keypoints"]["left_hip"][0] == pytest.approx(3.0 + 1 / 3, abs=1e-3)
 
 
 def test_the_assembler_waits_for_the_far_endpoint_of_a_bridge():

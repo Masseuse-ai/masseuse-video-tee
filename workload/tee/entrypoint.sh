@@ -33,6 +33,10 @@
 #                                      for the boot-time pose graph bench
 #                                      (pixel/pose_bench.py); a debug-slot
 #                                      knob set by hand, never by Terraform
+#   POSE_LOAD_BENCH                    optional, unset: "bodyFps,faceFps,seconds"
+#                                      ("9,9,120") for the boot-time pose load
+#                                      bench (pixel/pose_load.py); the same
+#                                      kind of knob
 set -euo pipefail
 
 log() { printf 'entrypoint: %s\n' "$*"; }
@@ -175,7 +179,7 @@ log "producer --tee for $SLOT_NAME -> $TRAINER_URL (idle exit ${TEE_IDLE_EXIT_S}
 python3 /app/workload/producer/producer.py \
     --tee \
     --pose gpu \
-    --pose-fps 6 \
+    --pose-fps 9 \
     --stream rtsp://127.0.0.1:8554/cam \
     --input-lost-after 90 \
     --teardown-drain-s "$TEE_IDLE_EXIT_S" \
@@ -187,7 +191,8 @@ python3 /app/workload/producer/producer.py \
     --capture-bucket "" \
     --overlay-publish rtsp://127.0.0.1:8554/overlay \
     --overlay-size 720x1280 \
-    --overlay-fps 15 \
+    --overlay-fps 30 \
+    --overlay-bitrate 6M \
     --overlay-delay-s 1.0 \
     --overlay-encoder x264 \
     --overlay-mirror \

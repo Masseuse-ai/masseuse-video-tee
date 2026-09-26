@@ -67,13 +67,13 @@ def test_handshake_dispatch_and_summary():
     got: list[dict] = []
     errors: list[str] = []
     link = analysis_link.open_link(fake.path, got.append, errors.append,
-                                   fps=30.0, poseFps=6.0, postIntervalS=1.0,
+                                   fps=30.0, poseFps=9.0, postIntervalS=1.0,
                                    run=None)
     assert link.connected
     assert link.ready["version"] == "t-1"
     hello = fake.received[0]
     assert hello["kind"] == "hello" and hello["protocol"] == analysis_link.PROTOCOL
-    assert hello["fps"] == 30.0 and hello["run"] is None
+    assert hello["fps"] == 30.0 and hello["poseFps"] == 9.0 and hello["run"] is None
 
     link.send({"kind": "frame", "frame": 3, "atS": 0.1, "keypoints": None,
                "fast": None, "slow": None})
