@@ -324,7 +324,13 @@ def test_the_record_routes_every_stream_to_parts_under_the_prefix(tmp_path):
     assert hello["startedWallS"] == T0
     assert hello["producer"]["imageVersion"] == "v0.6.0"
     assert hello["keypoints"]["count"] == 308 and hello["keypoints"]["body"]["0"] == "nose"
-    assert hello["keypoints"]["face"] == [63, 307] and hello["keypoints"]["leftHand"] == [21, 41]
+    assert hello["keypoints"]["rightHand"] == [21, 41] and hello["keypoints"]["leftHand"] == [42, 62]
+    assert hello["keypoints"]["armAndNeck"] == [63, 69] and hello["keypoints"]["face"] == [70, 307]
+    assert hello["keypoints"]["handOrderVerified"] is True
+    names = hello["keypoints"]["names"]
+    assert len(names) == 308 and names[:2] == ["nose", "left_eye"]
+    assert names[21] == "right_thumb4" and names[41] == "right_wrist" and names[62] == "left_wrist"
+    assert names[69] == "neck" and names[178] == "tip_of_nose" and names[272] == "l_center_of_iris"
     assert hello["streams"]["poses"] == {"format": "parquet", "view": "body"}
     assert hello["streams"]["vocal"] == {"format": "jsonl.gz"}
     assert "hello" not in hello and "ready" not in hello, "a run's terms are the run's file"

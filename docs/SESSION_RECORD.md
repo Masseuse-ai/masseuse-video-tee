@@ -94,8 +94,18 @@ release stamp (`producer.imageVersion`, `producer.imageCommit`,
 | indices | block |
 | --- | --- |
 | 0–20 | body: `nose`, `left_eye`, `right_eye`, `left_ear`, `right_ear`, `left_shoulder`, `right_shoulder`, `left_elbow`, `right_elbow`, `left_hip`, `right_hip`, `left_knee`, `right_knee`, `left_ankle`, `right_ankle`, `left_big_toe`, `left_small_toe`, `left_heel`, `right_big_toe`, `right_small_toe`, `right_heel` (names in `keypoints.body`) |
-| 21–41, 42–62 | left hand, right hand: 21 points each on the standard root-plus-four-joints-per-finger topology; the internal order is a hypothesis (`handOrderVerified: false`) until checked against stored tracks |
-| 63–307 | face: 245 dense landmarks in the model's own order (`LABEL_63` .. `LABEL_307`) |
+| 21–41, 42–62 | right hand, left hand: 21 points each, for every finger its tip, distal, middle and base joints, thumb to little finger, then the wrist (`right_wrist` 41, `left_wrist` 62); the order is the Sapiens2 definition's, checked on the shipped models (`handOrderVerified: true`) |
+| 63–69 | arm and neck: left and right olecranon, cubital fossa and acromion, then `neck` |
+| 70–307 | face: 238 landmarks in the Sapiens2 `keypoints308.py` order (its `goliath` definition with the teeth removed): midline, eyebrows, eyelids, nose, lips, ears, iris (272–289), pupil (290–307) |
+
+Every index's name is in `keypoints.names`, in order, so a column can be read
+by name (`workload/pixel/keypoints.py`, `ALL_NAMES`, says how the order was
+checked). The pupil points came back flat on both shipped model sizes in that
+check, so they fall under `minKeypointScore` in practice; the iris points did
+not. Records written before this layout carried `leftHand: [21, 41]`,
+`rightHand: [42, 62]` and `face: [63, 307]` with `handOrderVerified: false`:
+their sides are the other way round, and their indices 63–69 are the arm and
+neck points, not the face.
 
 A score below `minKeypointScore` (0.3) means the model placed a point it
 could not see; the coordinates are still written. Coordinates are in the

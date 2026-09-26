@@ -127,22 +127,30 @@ def parse_record(value, part_s: int = DEFAULT_PART_S) -> tuple[dict | None, str]
 
 def keypoint_layout() -> dict:
     """Which index is which, for hello.json and the Parquet metadata: the
-    body block by name (pixel/keypoints.py), the hands and the face by
-    range. The face's 245 are in the model's own order (`LABEL_63` ..
-    `LABEL_307`); the hands' internal order is the standard 21-point
-    topology by hypothesis, not by check."""
-    from keypoints import (BODY, KEYPOINT_NAMES, LEFT_HAND,  # noqa: PLC0415
-                           MIN_KEYPOINT_SCORE, RIGHT_HAND)
+    body block by name (pixel/keypoints.py), the hands, the arm and neck
+    points and the face by range, and every index's name in the model's
+    order (`names`: the Sapiens2 `keypoints308.py` definition, checked
+    against the shipped models as keypoints.py describes). Records written
+    before this layout carried `leftHand: [21, 41]`, `rightHand: [42, 62]`
+    and `face: [63, 307]` with `handOrderVerified: false`; the sides there
+    are the other way round."""
+    from keypoints import (ALL_NAMES, ARM_AND_NECK, BODY, FACE,  # noqa: PLC0415
+                           KEYPOINT_NAMES, LEFT_HAND, MIN_KEYPOINT_SCORE,
+                           RIGHT_HAND)
     return {
         "count": KEYPOINT_COUNT,
         "coordinates": "pixels of the decoded frame (frameW x frameH), "
                        "origin top-left; score is the model's confidence",
         "body": {str(i): KEYPOINT_NAMES[i] for i in BODY},
-        "leftHand": [LEFT_HAND[0], LEFT_HAND[-1]],
         "rightHand": [RIGHT_HAND[0], RIGHT_HAND[-1]],
-        "handOrderVerified": False,
-        "face": [RIGHT_HAND[-1] + 1, KEYPOINT_COUNT - 1],
-        "faceOrder": "the model's (LABEL_63 .. LABEL_307)",
+        "leftHand": [LEFT_HAND[0], LEFT_HAND[-1]],
+        "handOrder": "per finger tip, distal, middle, base; thumb to little "
+                     "finger; then the wrist",
+        "handOrderVerified": True,
+        "armAndNeck": [ARM_AND_NECK[0], ARM_AND_NECK[-1]],
+        "face": [FACE[0], FACE[-1]],
+        "faceOrder": "Sapiens2 keypoints308 (goliath, teeth removed)",
+        "names": list(ALL_NAMES),
         "minKeypointScore": MIN_KEYPOINT_SCORE,
     }
 
