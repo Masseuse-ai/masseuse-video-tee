@@ -887,3 +887,21 @@ def test_tee_mode_refuses_capture_configuration(monkeypatch, capsys):
     with pytest.raises(SystemExit) as excinfo:
         producer.main()
     assert "overlay-record" in str(excinfo.value)
+
+
+def test_the_default_verifier_tolerates_a_small_clock_skew(monkeypatch):
+    """A confidential VM's clock can lag the token service by a few seconds
+    after boot; a token minted and presented in the same second must not
+    be refused as used too early."""
+    id_token = pytest.importorskip("google.oauth2.id_token")
+    seen = {}
+
+    def fake_verify_token(token, request, audience=None, **kwargs):
+        seen.update(token=token, audience=audience, **kwargs)
+        return {"iss": "https://accounts.google.com"}
+
+    monkeypatch.setattr(id_token, "verify_token", fake_verify_token)
+    verify = tee_mode.google_id_token_verifier()
+    assert verify("t.o.k", "https://slot-0.example") == {"iss": "https://accounts.google.com"}
+    assert seen["audience"] == "https://slot-0.example"
+    assert seen["clock_skew_in_seconds"] == tee_mode.TOKEN_CLOCK_SKEW_S == 30

@@ -165,6 +165,13 @@ resource "google_compute_instance" "slot" {
 
   tags = ["masseuse-video-tee"]
 
+  # Changing debug_mode changes the boot image family, which the provider
+  # does not see as a change (the debug image's name contains the
+  # production family's): apply with
+  #   -replace='google_compute_instance.slot["slot-0"]'
+  # while the slot is TERMINATED and unleased. A replaced instance comes
+  # back without its instance-level IAM (trainer-iam.tf), so plan and apply
+  # once more right after; until then the trainer cannot start or stop it.
   lifecycle {
     # The trainer starts the VM and the enclave stops it (see the header):
     # its power state is theirs, not Terraform's, so a plan never fights a

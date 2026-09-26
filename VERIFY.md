@@ -115,6 +115,7 @@ and additionally pins the slot's TLS key to the SPKI hash in the token.
 | `sha256:a1e224492978c5a90c3c1faad81b2ebd83dfd302675291db6373210b5d95331e` | 2026-09-09 | **`v0.1.0`**, the first image built from this repository: tag [`v0.1.0`](https://github.com/FemLed/masseuse-video-tee/releases/tag/v0.1.0) by [`release.yml`](.github/workflows/release.yml) run `34383875573`, SLSA provenance and a keyless signature on `ghcr.io/femled/masseuse-video-tee@sha256:a1e22449…` (same digest), promoted by digest into the registry above and signed there with the KMS key. Debug image (`confidential-space-debug`, `dbgstat=enabled`); not a production posture. `ubuntu:24.04` base, zstd layers, live streams decoded at a pinned geometry, the directly reachable external camera (`PUT /ingest/source`) and the home-network camera connector's gateway (`masseuse-camlink-gateway` from the public [FemLed/masseuse-camlink](https://github.com/FemLed/masseuse-camlink) release `v0.1.0`, reproduced by the image build from `camlink.lock`, which refuses any other bytes). The producer is split: the pixel path (`workload/pixel`, `workload/producer`) is this tree, and the analysis of its keypoints and descriptors is the pinned bundle `2026.09.09-1` (`analysis.lock`, SHA-256 `d5c53436…`), run under its own user behind the local socket (`analysis/protocol.md`). `tee-verify -allow-debug` with `-cosign` passed every check on the pinned slot 2026-09-09 18:11 UTC; `slsa-verifier verify-image` and `cosign verify` passed on the `ghcr.io` digest in the release's own `promote` job before the copy. |
 | `sha256:c4d5dbb5a6c3c9f209772c28ad6fb810e64543b3697f399a0f8df11fbf23cb8b` | 2026-09-09 | **`v0.2.1`**: tag [`v0.2.1`](https://github.com/FemLed/masseuse-video-tee/releases/tag/v0.2.1), `release.yml` run `34392988036`, provenance and keyless signature on `ghcr.io/femled/masseuse-video-tee@sha256:c4d5dbb5…`, promoted and KMS-signed the same way. Same posture and base as `v0.1.0`; adds the audio path (`workload/audio`): the stream's audio track decoded to 16 kHz inside the enclave and classified into non-speech vocalization categories by the CED tagger built into the image (`libced.so` from a pinned ced.cpp commit, `ced-small-f16.gguf` at a pinned revision and SHA-256), with level and pitch; the labels cross the local socket to the analysis bundle `2026.09.09-2` (`analysis.lock`, SHA-256 `e1253179…`), which consumes them. Frames and audio stay in the public code. `tee-verify -allow-debug` with `-cosign` passed every check on the pinned slot 2026-09-09 19:25 UTC; the boot log shows the bundle fetched, checked and started under its own user, and the release's smoke test loaded the classifier (`ced.cpp-abi1:ced-small-f16.gguf`, 527 labels). (`v0.2.0` was tagged but its build failed before any image was pushed; no digest carries it.) |
 | `sha256:8b4a90f9b1442c1f00866b0c120babb86672f70c01563dced695d862a01f39d7` | 2026-09-09 | **`v0.2.2`**: tag [`v0.2.2`](https://github.com/FemLed/masseuse-video-tee/releases/tag/v0.2.2), `release.yml` run `34403106483`, provenance and keyless signature on `ghcr.io/femled/masseuse-video-tee@sha256:8b4a90f9…`, promoted and KMS-signed the same way. Same posture, base and analysis bundle (`2026.09.09-2`) as `v0.2.1`; the audio stage now reports the level of each window it scores (`audioDbfs` in the telemetry line, -90 being digital silence) and relays its ffmpeg's description of the track and its warnings into the log, after two `v0.2.1` sessions measured a phone's track as silence that a third did not (the cause is open; the phone's publisher now also checks its own microphone clone is heard). The trainer verified this digest on the pinned slot in a phone session 2026-09-09 21:07 UTC, in which the stage heard the room at -61 dBFS and a played sound at -20 dBFS, and the analysis bundle reported a vocalization event from it; `slsa-verifier verify-image` and `cosign verify` passed on the `ghcr.io` digest in the release's own `promote` job before the copy. |
+| `sha256:d3a66ace02fd692a1ceb02bf83f8e2358d06e976748e5e84096a00db21b15785` | 2026-09-09 | **`v0.2.3`**, the pinned image: tag [`v0.2.3`](https://github.com/FemLed/masseuse-video-tee/releases/tag/v0.2.3), `release.yml` run `34406935409`, provenance and keyless signature on `ghcr.io/femled/masseuse-video-tee@sha256:d3a66ace…`, promoted and KMS-signed the same way. Same posture, base and analysis bundle as `v0.2.2`; the relay (`workload/tee/mediamtx.tee.yml`) now waits 15 s rather than 2 for the first packet of each track a publisher's offer declared, after a phone whose video encoder started later than its microphone came online as an audio-only path the producer then crashed on; a stream with no video track now ends the producer session with a said reason (`producer: RuntimeError: no video track on …` in the trainer). `slsa-verifier verify-image` and `cosign verify` passed on the `ghcr.io` digest in the release's own `promote` job before the copy. The trainer verified this digest on the pinned slot in a phone session 2026-09-09 22:01 UTC: the relay gathered both tracks (`H264`, `Opus`), and over 129 readings the audio stage put the room at -75 to -79 dBFS and three played sounds at -20 to -25 dBFS with a pitch of 109-122 Hz at the seconds they were played. |
 
 Retired: the debug images from the first days of the enclave (2026-09-08
 and 2026-09-09), built by Cloud Build from a tree that was not yet public
@@ -122,11 +123,20 @@ and carrying no provenance: `sha256:efe3d2b7…`, `sha256:3c3fa7f0…`,
 `sha256:80df7800…`, `sha256:c95761f4…`, `sha256:4866753a…`,
 `sha256:e7c80084…`.
 
-Production digests are appended here with the flip to the production
-Confidential Space image (`debug_mode = false`, `require_signed_image =
-true`); a digest is removed when its image is retired, and the trainer's
-policy (`/api/tee-policy`) mirrors this list, with `imageSources` naming
-the release tag each digest was built from.
+Production posture since 2026-09-09 22:20 UTC: the slot boots the STABLE
+`confidential-space` image with debugging disabled since boot
+(`debug_mode = false`; `cs.dbgstat` = `disabled-since-boot`,
+`cs.support_attributes` = `[LATEST STABLE USABLE]`), the trainer's policy
+refuses a debug image (`allowDebug: false`, `requireStable: true`), and the
+container's output is not redirected anywhere (`tee.launch_policy.log_redirect`
+= `debugonly`): what the enclave does is observable only through the
+attestation, the readings and this repository. `tee-verify` without
+`-allow-debug`, with `-cosign`, passed all 22 checks against the pinned slot
+at 22:20 UTC on `v0.2.3`, and a phone session at 22:22 UTC attested
+`dbgstat=disabled-since-boot` on the same digest. A digest is removed here
+when its image is retired, and the trainer's policy (`/api/tee-policy`)
+mirrors this list, with `imageSources` naming the release tag each digest
+was built from.
 
 ## How the image is built
 
@@ -148,7 +158,7 @@ against its source:
 
 ```sh
 DIGEST=sha256:...   # from the attestation, the table above or /api/tee-policy
-TAG=v0.2.2          # the release the table (or imageSources) names for it
+TAG=v0.2.3          # the release the table (or imageSources) names for it
 slsa-verifier verify-image ghcr.io/femled/masseuse-video-tee@$DIGEST \
     --source-uri github.com/FemLed/masseuse-video-tee --source-tag $TAG
 cosign verify ghcr.io/femled/masseuse-video-tee@$DIGEST \

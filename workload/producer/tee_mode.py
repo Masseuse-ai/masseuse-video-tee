@@ -597,6 +597,14 @@ class IdleExit:
 # -- the trainer's token -----------------------------------------------------------
 
 
+# How far this VM's clock may sit from the token service's before a token is
+# refused as not yet valid or already expired. A confidential VM's clock can
+# lag by a few seconds in its first minutes after boot, and the trainer's
+# token is minted in the same second it is presented; the bound stays well
+# under the tokens' hour of life.
+TOKEN_CLOCK_SKEW_S = 30
+
+
 def google_id_token_verifier():
     """The default verifier: google-auth against Google's OAuth2 certs,
     checking the signature, expiry and audience. Issuer and email are
@@ -609,7 +617,9 @@ def google_id_token_verifier():
     request = google.auth.transport.requests.Request(session=session)
 
     def verify(token: str, audience: str) -> dict:
-        return google.oauth2.id_token.verify_token(token, request, audience=audience)
+        return google.oauth2.id_token.verify_token(
+            token, request, audience=audience,
+            clock_skew_in_seconds=TOKEN_CLOCK_SKEW_S)
 
     return verify
 
