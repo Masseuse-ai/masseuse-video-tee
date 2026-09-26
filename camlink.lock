@@ -8,5 +8,5 @@
 #
 # To roll the gateway: change both lines, then follow docs/OPERATIONS.md
 # "Rolling an image" (a new release; the deployment's digest pin changes).
-CAMLINK_VERSION=v0.6.5
-CAMLINK_SHA256=76cacfccc2f7500ede5802f1bc30540e113968e6dd18fc17c0fb7a7d5a510d69
+CAMLINK_VERSION=v0.6.6
+CAMLINK_SHA256=72992e3f5c7755c707d1aa2fdc53f3b650d93934546603416612e8c25242cf1f

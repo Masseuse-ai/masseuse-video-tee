@@ -91,9 +91,16 @@ FPS = 30.0
 # at whatever the first seconds carried.
 STREAM_LONG_SIDE = 1280
 POSE_QUEUE_DEPTH = 2
-# The secondary view's probe cadence while its path has no video track
-# (Decoder.wait_for_track): an ffprobe against the loopback relay.
+# The probe cadence while a path has no video track: an ffprobe against
+# the loopback relay. The secondary view (Decoder.wait_for_track) waits as
+# long as the session lasts; the primary waits TRACK_ABSENT_MAX_S - the
+# relay's re-pull of a fixed camera after its tunnel dropped and came back,
+# or the connector's capture starting, is a matter of seconds, and a
+# session that gave up at the first probe cost a whole /produce attempt
+# (2026-09-11: "no video track on ext" on the second attempt of every
+# switch to the connector's camera).
 TRACK_RETRY_S = 3.0
+TRACK_ABSENT_MAX_S = 15.0
 # A video track that is announced but carries no frame yet - the connector
 # drops video while its tunnel catches up and resumes at the next keyframe,
 # within seconds - is probed again this often, and given up on as a track
@@ -217,8 +224,10 @@ class Decoder:
     beside a fixed one): a path with no video track yet - the phone has
     not published, or is between cameras - is not an error but a wait,
     probed again every `TRACK_RETRY_S` until a track is there or the
-    session stops. The primary keeps raising: its track is what the
-    session was started for. A track that is there but starved - announced,
+    session stops. The primary waits the same way for at most
+    `TRACK_ABSENT_MAX_S` (the relay pulling a fixed camera again after its
+    tunnel came back, the connector's capture starting) and then raises:
+    its track is what the session was started for. A track that is there but starved - announced,
     no frame of it within ffprobe's window, which is the connector dropping
     video while its tunnel catches up - is waited for by both, the primary
     for at most `STARVED_TRACK_MAX_S`: the connector resumes at its next
@@ -359,13 +368,13 @@ class Decoder:
         within ffprobe's window - the connector dropping video while its
         tunnel catches up) is probed again every STARVED_RETRY_S, for at
         most STARVED_TRACK_MAX_S, then raised as an error. A track that is
-        not there at all is an error too - unless `wait_for_track`, in which
-        case both shapes are waited for as long as the session lasts, every
-        TRACK_RETRY_S. None once the session stopped while waiting.
+        not there at all is probed again every TRACK_RETRY_S: for at most
+        TRACK_ABSENT_MAX_S, then raised, unless `wait_for_track`, in which
+        case both shapes are waited for as long as the session lasts. None
+        once the session stopped while waiting.
         """
         starved_since: float | None = None
-        said = False
-        starved_since: float | None = None
+        absent_since: float | None = None
         while True:
             if self._stopped():
                 return None
@@ -386,13 +395,16 @@ class Decoder:
                 retry_s = STARVED_RETRY_S
             except (RuntimeError, OSError, ValueError,
                     subprocess.TimeoutExpired) as error:
-                if not self.wait_for_track:
-                    raise
-                self.telemetry.count("trackWaits")
-                if not said:
-                    said = True
+                now = self.clock()
+                if absent_since is None:
+                    absent_since = now
                     print(f"decoder: {self.url} has no video track yet "
                           f"({error}); waiting", flush=True)
+                elif (now - absent_since >= TRACK_ABSENT_MAX_S
+                      and not self.wait_for_track):
+                    raise RuntimeError(
+                        f"{error} after {TRACK_ABSENT_MAX_S:g} s") from None
+                self.telemetry.count("trackWaits")
                 retry_s = TRACK_RETRY_S
             deadline = self.clock() + retry_s
             while self.clock() < deadline:
@@ -1519,7 +1531,19 @@ def pump_session(session, runner: threading.Thread, wfile, subscription,
         return "client_left"
 
 
-def stop_session(holder: dict) -> tuple[int, dict]:
+# How long POST /stop waits for the stopped session to let go of the slot
+# (the pump releasing `busy` once the runner has wound down and written its
+# summary) before answering, and how often it looks. A caller that is about
+# to /produce again - the trainer restarting production on a camera change
+# - then meets a free slot rather than a 409 and a wasted attempt; a
+# wind-down that outlasts the wait is answered `stopping`, as before.
+STOP_WAIT_S = 5.0
+STOP_POLL_S = 0.05
+
+
+def stop_session(holder: dict, busy: threading.Lock | None = None,
+                 wait_s: float = STOP_WAIT_S, clock=time.monotonic,
+                 sleep=time.sleep) -> tuple[int, dict]:
     """Decide a `POST /stop`: (status, body).
 
     The explicit end of a session, for the caller that cannot rely on its
@@ -1529,13 +1553,25 @@ def stop_session(holder: dict) -> tuple[int, dict]:
     FemLed server says stop out loud and then waits for the lock to free
     before `/teardown`. Sets the running session's `stopping` flag; the
     pump writes the summary event and releases the lock as for any end.
-    404 when nothing is running.
+    With `busy` (the slot's session lock) the answer waits up to `wait_s`
+    for that release and says `stopped` once it has happened, `stopping`
+    when it has not by then. 404 when nothing is running.
     """
     session = holder.get("session")
     if session is None:
         return 404, {"error": "no session is running"}
     session.stopping.set()
-    return 200, {"status": "stopping", "run": session.run_name or None}
+    body = {"status": "stopping", "run": session.run_name or None}
+    if busy is not None and wait_s > 0:
+        deadline = clock() + wait_s
+        while True:
+            if not busy.locked():
+                body["status"] = "stopped"
+                break
+            if clock() >= deadline:
+                break
+            sleep(min(STOP_POLL_S, max(0.0, deadline - clock())))
+    return 200, body
 
 
 def serve(args, telemetry: Telemetry) -> int:
@@ -2177,7 +2213,9 @@ def build_server(args, telemetry: Telemetry,
             if parsed.path == "/stop":
                 if not self._control_gate():
                     return
-                code, body = stop_session(current)
+                # Answered once the slot is free again (up to STOP_WAIT_S):
+                # the trainer's next /produce then lands first time.
+                code, body = stop_session(current, busy)
                 if code == 200:
                     print(f"stop: {body}", flush=True)
                     if tee is not None:

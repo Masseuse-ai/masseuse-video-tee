@@ -184,7 +184,13 @@ running between sessions.
   `/teardown` on session release drains for the same 60 s. Either way the
   container ends, Caddy and MediaMTX with it, and the slot stops answering.
   `/warmup` polls count as interest while a lease could still follow; they
-  never keep an idle slot alive past `TEE_BOOT_IDLE_S`.
+  never keep an idle slot alive past `TEE_BOOT_IDLE_S`. A session's
+  `/stop` (the trainer ending a run, or restarting it on a camera change)
+  is answered once the run has let go of the slot, up to `STOP_WAIT_S`
+  (5 s): `{"status":"stopped"}`, or `"stopping"` when the wind-down
+  outlasted the wait; the `/produce` that follows then lands first time
+  instead of a 409 against the run still winding down. The lease is
+  cleared either way.
 - **Stop, part two: the VM.** What happens next is the launcher's
   (go-tpm-tools `launcher/launcher/main.go` `getExitCode` and the image's
   `exit_script.sh`). The **debug image always holds** the VM after any

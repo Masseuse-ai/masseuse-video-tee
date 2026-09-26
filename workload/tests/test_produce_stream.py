@@ -153,6 +153,53 @@ def test_an_explicit_stop_ends_the_session_through_the_normal_summary():
         404, {"error": "no session is running"})
 
 
+def test_a_stop_given_the_slot_lock_answers_stopped_once_the_run_let_go():
+    """The trainer restarts production on a camera change: its /stop is
+    answered once the slot is free, so the /produce that follows lands
+    first time rather than meeting the 409 of a run still winding down."""
+    from producer import STOP_POLL_S, STOP_WAIT_S
+
+    clock = {"now": 0.0}
+    slept: list[float] = []
+
+    def sleeper(lock: threading.Lock, release_at: float | None):
+        def sleep(s: float) -> None:
+            slept.append(s)
+            clock["now"] += s
+            if release_at is not None and clock["now"] >= release_at and lock.locked():
+                lock.release()  # the pump letting go once the runner wound down
+        return sleep
+
+    session = FakeSession(run_name="session-xyz")
+    busy = threading.Lock()
+    busy.acquire()  # the /produce handler holds it for the run
+    code, body = stop_session({"session": session}, busy, clock=lambda: clock["now"],
+                              sleep=sleeper(busy, release_at=1.2))
+    assert (code, body) == (200, {"status": "stopped", "run": "session-xyz"})
+    assert session.stopping.is_set()
+    assert 1.2 <= clock["now"] < 1.2 + 2 * STOP_POLL_S
+    assert slept and max(slept) <= STOP_POLL_S
+
+    # A run that will not let go within the wait is reported `stopping`,
+    # the answer of old; the caller goes on as before.
+    session = FakeSession(run_name="session-slow")
+    slow = threading.Lock()
+    slow.acquire()
+    clock["now"] = 0.0
+    code, body = stop_session({"session": session}, slow, clock=lambda: clock["now"],
+                              sleep=sleeper(slow, release_at=None))
+    assert (code, body) == (200, {"status": "stopping", "run": "session-slow"})
+    assert STOP_WAIT_S <= clock["now"] < STOP_WAIT_S + STOP_POLL_S
+    slow.release()
+
+    # A slot already free answers `stopped` without a wait.
+    clock["now"] = 0.0
+    free = threading.Lock()
+    code, body = stop_session({"session": FakeSession(run_name="r")}, free,
+                              clock=lambda: clock["now"], sleep=sleeper(free, release_at=None))
+    assert (code, body["status"], clock["now"]) == (200, "stopped", 0.0)
+
+
 def test_a_runner_that_will_not_wind_down_is_reported_not_awaited_forever():
     telemetry = Telemetry()
     session = FakeSession()

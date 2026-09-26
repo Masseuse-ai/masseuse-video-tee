@@ -330,6 +330,41 @@ def test_a_starved_track_is_given_up_on_after_the_bound(monkeypatch):
     assert STARVED_TRACK_MAX_S <= clock.now - start < STARVED_TRACK_MAX_S + 2
 
 
+def test_a_primary_view_waits_for_an_absent_track_then_decodes(monkeypatch):
+    """The fixed camera's path with no track for two probes (the relay
+    pulling it again after the tunnel came back), then the geometry: the
+    session is not lost to one bad probe, it waits TRACK_RETRY_S at a
+    time and pins the pipe to what the third one said."""
+    from producer import TRACK_RETRY_S
+
+    _probe_result(monkeypatch, {"streams": []}, {"streams": []},
+                  {"streams": [{"width": 1280, "height": 720}]})
+    clock = _Clock()
+    telemetry = Telemetry()
+    decoder = Decoder("rtsp://127.0.0.1:8554/ext", telemetry,
+                      clock=clock, sleep=clock.sleep)
+    start = clock.now
+    assert decoder._await_probe() == (1280, 720)
+    assert clock.now - start == 2 * TRACK_RETRY_S
+    assert telemetry.snapshot()["counters"]["trackWaits"] == 2
+
+
+def test_a_primary_view_gives_up_on_an_absent_track_after_the_bound(monkeypatch):
+    import pytest
+
+    from producer import TRACK_ABSENT_MAX_S, TRACK_RETRY_S
+
+    _probe_result(monkeypatch, {"streams": []})
+    clock = _Clock()
+    decoder = Decoder("rtsp://127.0.0.1:8554/ext", Telemetry(),
+                      clock=clock, sleep=clock.sleep)
+    start = clock.now
+    with pytest.raises(RuntimeError,
+                       match=r"no video track on rtsp://127.0.0.1:8554/ext after 15 s"):
+        decoder._await_probe()
+    assert TRACK_ABSENT_MAX_S <= clock.now - start < TRACK_ABSENT_MAX_S + TRACK_RETRY_S
+
+
 def test_a_secondary_view_waits_out_a_starved_or_absent_track(monkeypatch):
     """With `wait_for_track` (the phone's camera beside a fixed one) a
     starved track is not given up on at the bound, and a track that is not
