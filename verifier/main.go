@@ -73,13 +73,18 @@ import (
 )
 
 const (
-	defaultJWKSURL   = "https://www.googleapis.com/service_accounts/v1/metadata/jwk/signer@confidentialspace-sign.iam.gserviceaccount.com"
-	expectedIssuer   = "https://confidentialcomputing.googleapis.com"
-	expectedSWName   = "CONFIDENTIAL_SPACE"
-	expectedHWModel  = "GCP_INTEL_TDX"
-	expectedGPU      = "GCP_NVIDIA_H100"
-	dbgstatProd      = "disabled-since-boot"
-	dbgstatDebug     = "enabled"
+	defaultJWKSURL  = "https://www.googleapis.com/service_accounts/v1/metadata/jwk/signer@confidentialspace-sign.iam.gserviceaccount.com"
+	expectedIssuer  = "https://confidentialcomputing.googleapis.com"
+	expectedSWName  = "CONFIDENTIAL_SPACE"
+	expectedHWModel = "GCP_INTEL_TDX"
+	expectedGPU     = "GCP_NVIDIA_H100"
+	dbgstatProd     = "disabled-since-boot"
+	dbgstatDebug    = "enabled"
+	// Where the enclave image running today was built and published
+	// (VERIFY.md, "Release history"): the source moved to
+	// github.com/Masseuse-ai/masseuse-video-tee, and these defaults follow
+	// the first image released from there; -source-uri and -image-repo name
+	// the other in the meantime.
 	defaultSourceURI = "github.com/FemLed/masseuse-video-tee"
 	defaultImageRepo = "ghcr.io/femled/masseuse-video-tee"
 )

@@ -23,8 +23,8 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/FemLed/masseuse-video-tee/workload/reader/decode"
-	"github.com/FemLed/masseuse-video-tee/workload/reader/source"
+	"github.com/Masseuse-ai/masseuse-video-tee/workload/reader/decode"
+	"github.com/Masseuse-ai/masseuse-video-tee/workload/reader/source"
 )
 
 func main() {

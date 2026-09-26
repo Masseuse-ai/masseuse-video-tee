@@ -1,4 +1,4 @@
-module github.com/FemLed/masseuse-video-tee/verifier
+module github.com/Masseuse-ai/masseuse-video-tee/verifier
 
 go 1.22
 

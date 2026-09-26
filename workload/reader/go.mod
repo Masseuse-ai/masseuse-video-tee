@@ -1,4 +1,4 @@
-module github.com/FemLed/masseuse-video-tee/workload/reader
+module github.com/Masseuse-ai/masseuse-video-tee/workload/reader
 
 go 1.27.1
 

@@ -1,5 +1,7 @@
 # The masseuse-camlink-gateway release the enclave image carries
-# (github.com/FemLed/masseuse-camlink). build.sh passes both values to
+# (github.com/Masseuse-ai/masseuse-camlink; releases up to v0.24.0 declare
+# the module path of the project's previous home, github.com/FemLed/masseuse-camlink,
+# which Dockerfile.tee installs them under). build.sh passes both values to
 # Dockerfile.tee, which reproduces the binary with `go install` at the tag
 # and refuses to build unless its sha256 equals the one below: the line
 # "masseuse-camlink-gateway_<version>_linux_amd64" of that release's

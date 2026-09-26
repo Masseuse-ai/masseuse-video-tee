@@ -1,0 +1,9 @@
+{
+  "previousHomeAllowed": [
+    "VERIFY.md",
+    "camlink.lock",
+    "verifier/main.go",
+    "verifier/main_test.go",
+    "workload/tee/Dockerfile.tee"
+  ]
+}

@@ -62,7 +62,7 @@ the next tag. A tag whose build failed keeps its Release saying so
 
 The workflow builds the base (`workload/Dockerfile`) and the TEE layer
 (`workload/tee/Dockerfile.tee`) with BuildKit, every layer zstd, one OCI
-manifest per image, pushes them to `ghcr.io/femled/masseuse-video-tee`
+manifest per image, pushes them to `ghcr.io/masseuse-ai/masseuse-video-tee`
 (and `-base`), runs the smoke test on the pushed image, signs it keyless,
 attaches SLSA provenance (the container generator, an isolated job), and
 then promotes: `crane copy` by digest into this project's Artifact Registry

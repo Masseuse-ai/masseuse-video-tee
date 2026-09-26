@@ -6,8 +6,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/FemLed/masseuse-video-tee/workload/reader/record"
-	"github.com/FemLed/masseuse-video-tee/workload/reader/testmedia"
+	"github.com/Masseuse-ai/masseuse-video-tee/workload/reader/record"
+	"github.com/Masseuse-ai/masseuse-video-tee/workload/reader/testmedia"
 )
 
 // recordSink collects records as run writes them.

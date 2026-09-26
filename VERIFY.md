@@ -4,7 +4,7 @@ masseuse.ai's camera pipeline runs in a Google Cloud Confidential Space
 enclave: an `a3-highgpu-1g` VM with Intel TDX on the CPU and an NVIDIA H100
 in confidential-computing mode. This document is how anyone, without an
 account at FemLed or Google, checks that the enclave your phone (or your
-home camera, through [masseuse-camlink](https://github.com/FemLed/masseuse-camlink))
+home camera, through [masseuse-camlink](https://github.com/Masseuse-ai/masseuse-camlink))
 would send video to is the one described here, and what that does and does
 not prove. If you are not technical, hand it to someone who is.
 
@@ -58,8 +58,8 @@ at every moment is in the attestation token itself:
   (`workload/tee/Dockerfile.tee`), attested with the rest of the workload
   environment. Images released before `v0.4.0` carry no stamp.
 - `submods.container.image_digest`: the digest that is running. The same
-  digest sits on `ghcr.io/femled/masseuse-video-tee` with its SLSA
-  provenance, which names the source commit; that commit must be the one
+  digest sits on the public registry its Release names (`ghcr.io/femled/masseuse-video-tee`
+  for images up to `v0.12.3`) with its SLSA provenance, which names the source commit; that commit must be the one
   the stamp names, and `slsa-verifier` checks the tag.
 
 The clients (the web app, the connector) pin the signing key and, once
@@ -69,7 +69,7 @@ project and registry the enclave must run from and this repository as the
 source are compiled into it as floors the served policy can only tighten,
 and it checks the digest's public record itself (below).
 Every release's digest and validation record is on its GitHub Release
-([releases](https://github.com/FemLed/masseuse-video-tee/releases)), written
+([releases](https://github.com/Masseuse-ai/masseuse-video-tee/releases)), written
 by the workflow that built it and appended to by the operators when the
 image has been verified on a slot and carried a session.
 
@@ -116,7 +116,7 @@ Each check, and why it matters:
 | `image.digest`, `image.reference` | the digest of the running container, reported (and pinned to `-allowed-digests` if you passed a list), pulled from FemLed's registry for this project. |
 | `image.env.TRAINER_URL` | the enclave posts its readings (numbers, never frames) to the trainer service you expect and nowhere else (the whole workload environment is in the token; `-v` shows it). |
 | `image.env.TEE_CAPTURE_BUCKET` | the one bucket a signed-in session's record (keypoints, descriptors, audio measurements, the analysis's rows; README "Session records") may be written to is the one you expect (`-capture-bucket`, default `masseuse-ai-prod`); the enclave refuses a lease naming a record when the variable is unset, and `-capture-bucket ""` requires a slot that keeps none. The trainer holds the same expectation before it leases. |
-| `provenance.source` | (with `-slsa-verifier`) the running digest, on `ghcr.io/femled/masseuse-video-tee`, carries SLSA provenance from this repository at the release the stamp names, and the provenance's commit is the stamp's commit: the image is the public source at that tag, built by GitHub's runners. |
+| `provenance.source` | (with `-slsa-verifier`) the running digest, on the public registry its release names (`-image-repo`), carries SLSA provenance from this project's release workflow (`-source-uri`) at the release the stamp names, and the provenance's commit is the stamp's commit: the image is the public source at that tag, built by GitHub's runners. |
 | `nonce.fresh` | `eat_nonce` contains the random nonce this run sent: the token was minted now, not replayed. |
 | `nonce.evidence-key` | `eat_nonce` contains `sha256(evidence key)`: the Ed25519 key that signs DTLS fingerprints lives in this enclave. |
 | `nonce.tls-spki` | `eat_nonce` contains `sha256(SubjectPublicKeyInfo)` of the certificate this very TLS connection negotiated: the TLS endpoint is the enclave, not a proxy in front of it. |
@@ -184,15 +184,26 @@ Rekor indexes of the entries it verified, so you can repeat the check.
 ## Release history
 
 Every release since `v0.1.0` has a GitHub Release at
-[github.com/FemLed/masseuse-video-tee/releases](https://github.com/FemLed/masseuse-video-tee/releases),
-created by the release workflow run that built it. Its body names the
-image digest (the same on `ghcr.io` and in the enclave's registry), the
-base image digest, the workflow run, and the commands that tie the digest
-to the tag; the operators append what the image changed, when `tee-verify`
-passed against a slot running it and when a session carried it, and when
-it left the trainer's policy. That record is the history this document
-used to hold as a table of digests, and it is written by the release, not
-ahead of it. A tag, once created, cannot be moved or deleted by anyone: a
+[github.com/Masseuse-ai/masseuse-video-tee/releases](https://github.com/Masseuse-ai/masseuse-video-tee/releases),
+created by the release workflow run that built it. Its body says what the
+release changed, names the image digest (the same on `ghcr.io` and in the
+enclave's registry) and the base image digest, and gives the commands that
+tie the digest to the tag and to the identity that signed it. That record
+is the history this document used to hold as a table of digests, and it is
+written by the release, not ahead of it.
+
+Releases up to and including `v0.12.3` were built and signed by this
+release workflow at the project's previous GitHub home,
+`github.com/FemLed/masseuse-video-tee`, and published to
+`ghcr.io/femled/masseuse-video-tee` (the base image to
+`ghcr.io/femled/masseuse-video-tee-base`), where they stay; their
+provenance and certificates name that identity, and this repository
+carries each of their tags with the tree the image was built from. From
+the next release on, images are built and signed here and published to
+`ghcr.io/masseuse-ai/masseuse-video-tee`. Each Release's Image and Verify
+sections name the registry and identity that apply to it; `tee-verify`'s
+`-source-uri` and `-image-repo` default to the ones of the image running
+today and are set on the command line for the other. A tag, once created, cannot be moved or deleted by anyone: a
 repository ruleset ("Tags are immutable", on every tag, with no bypass
 actor) refuses updates, deletions and force pushes, so the tag a
 provenance names is still the commit it named when the image was built.
@@ -227,14 +238,17 @@ layer with Caddy and MediaMTX by digest, the ACME and attestation tooling,
 the release stamp and the launch-policy labels), built with BuildKit
 through `buildx` so every layer is zstd and the push is a single OCI
 manifest, which is what a digest names. The workflow pushes to
-`ghcr.io/femled/masseuse-video-tee`, signs the digest keyless with cosign
+`ghcr.io/masseuse-ai/masseuse-video-tee`, signs the digest keyless with cosign
 (the certificate's identity is the workflow at the tag), attaches SLSA
 provenance with the
 [slsa-github-generator](https://github.com/slsa-framework/slsa-github-generator)
 container generator, and then a separate job copies the digest, unchanged,
 into the registry the attestation names and signs it there with the KMS key
 below, so the launcher's signature check is what it was; a last job writes
-the GitHub Release. To check the digest a token names against its source:
+the GitHub Release. To check the digest a token names against its source
+(as written, for an image released up to `v0.12.3`, which is every image
+so far; for a later image read `ghcr.io/masseuse-ai/masseuse-video-tee` and
+`github.com/Masseuse-ai/masseuse-video-tee`, "Release history"):
 
 ```sh
 DIGEST=sha256:...   # submods.container.image_digest in the token (tee-verify prints it)
@@ -258,9 +272,9 @@ on one is the provenance of the other.)
 Since `v0.1.0` the image carries one binary that is not built from the
 workload tree: `masseuse-camlink-gateway`, the enclave half of the
 home-network camera connector, from the public
-[FemLed/masseuse-camlink](https://github.com/FemLed/masseuse-camlink)
+[Masseuse-ai/masseuse-camlink](https://github.com/Masseuse-ai/masseuse-camlink)
 repository. The TEE Dockerfile has a `golang` stage that runs `go install
-github.com/FemLed/masseuse-camlink/cmd/masseuse-camlink-gateway@<tag>`
+github.com/Masseuse-ai/masseuse-camlink/cmd/masseuse-camlink-gateway@<tag>`
 through the Go module proxy with the release's pinned toolchain and flags,
 then `sha256sum -c` against the checksum in `camlink.lock`, which is the
 `masseuse-camlink-gateway_<version>_linux_amd64` line of that release's

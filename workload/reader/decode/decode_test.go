@@ -6,9 +6,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/FemLed/masseuse-video-tee/workload/reader/record"
-	"github.com/FemLed/masseuse-video-tee/workload/reader/source"
-	"github.com/FemLed/masseuse-video-tee/workload/reader/testmedia"
+	"github.com/Masseuse-ai/masseuse-video-tee/workload/reader/record"
+	"github.com/Masseuse-ai/masseuse-video-tee/workload/reader/source"
+	"github.com/Masseuse-ai/masseuse-video-tee/workload/reader/testmedia"
 )
 
 // records splits the decoder's output into headers and frames.
