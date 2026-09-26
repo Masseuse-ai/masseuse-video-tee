@@ -1,7 +1,9 @@
 # ---------------------------------------------------------------------------
-# Network: a static IP per slot, attached directly to the VM (no load
-# balancer between the phone and the enclave's TLS), and a firewall that
-# admits only what the workload serves.
+# Network: one VPC, a subnet in every region the slots span (slot_zones),
+# a static IP per slot in its own region, attached directly to the VM (no
+# load balancer between the phone and the enclave's TLS), and a firewall
+# that admits only what the workload serves. The firewall rules are
+# network-wide, so a slot in a new region needs only its subnet and IP.
 #
 #   tcp 443        Caddy: WHIP/WHEP signalling, /attestation, the trainer's
 #                  control routes, and the TLS-ALPN-01 challenge itself.
@@ -19,22 +21,39 @@ resource "google_compute_network" "tee" {
 }
 
 resource "google_compute_subnetwork" "tee" {
+  for_each                 = local.slot_regions
   project                  = var.project_id
-  name                     = "masseuse-video-tee-${var.region}"
-  region                   = var.region
+  name                     = "masseuse-video-tee-${each.key}"
+  region                   = each.key
   network                  = google_compute_network.tee.id
-  ip_cidr_range            = "10.90.0.0/24"
+  ip_cidr_range            = var.subnet_cidrs[each.key]
   private_ip_google_access = true
+
+  lifecycle {
+    precondition {
+      condition     = contains(keys(var.subnet_cidrs), each.key)
+      error_message = "slot_zones puts a slot in ${each.key}, which has no subnet_cidrs entry."
+    }
+  }
+}
+
+# The subnet predates slot_zones and was a single resource; it keeps its
+# name, range and state under the new key.
+moved {
+  from = google_compute_subnetwork.tee
+  to   = google_compute_subnetwork.tee["us-central1"]
 }
 
 resource "google_compute_address" "slot" {
   for_each     = toset(local.slot_names)
   project      = var.project_id
   name         = "masseuse-video-tee-${each.value}"
-  region       = var.region
+  region       = local.slot_region[each.value]
   address_type = "EXTERNAL"
   network_tier = "PREMIUM"
-  description  = "Direct static IP for ${local.slot_hosts[each.value]}"
+  # description is immutable on an address (a change would replace it, which
+  # prevent_destroy refuses), so it does not name the zone.
+  description = "Direct static IP for ${local.slot_hosts[each.value]}"
 
   lifecycle {
     prevent_destroy = true

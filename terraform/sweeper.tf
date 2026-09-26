@@ -68,9 +68,10 @@ resource "google_workflows_workflow" "sweeper" {
   # would only block that.
   deletion_protection = false
 
-  # For each slot: get status; if RUNNING and up longer than the cap, stop
-  # it (discarding the local SSDs). A stop that fails is logged and tried
-  # again on the next run. Anything not RUNNING is left alone.
+  # For each slot (each in its own zone, slot_zones): get status; if
+  # RUNNING and up longer than the cap, stop it (discarding the local
+  # SSDs). A stop that fails is logged and tried again on the next run.
+  # Anything not RUNNING is left alone.
   source_contents = <<-EOT
     main:
       params: [args]
@@ -78,21 +79,20 @@ resource "google_workflows_workflow" "sweeper" {
         - init:
             assign:
               - project: "${var.project_id}"
-              - zone: "${var.zone}"
-              - instances: ${jsonencode([for name in local.slot_names : "masseuse-video-tee-${name}"])}
+              - slots: ${jsonencode([for name in local.slot_names : { zone = local.slot_zone[name], instance = "masseuse-video-tee-${name}" }])}
               - max_uptime_s: ${var.slot_max_uptime_hours * 3600}
               - stopped: []
         - each:
             for:
-              value: instance
-              in: $${instances}
+              value: slot
+              in: $${slots}
               steps:
                 - status:
                     call: googleapis.compute.v1.instances.get
                     args:
                       project: $${project}
-                      zone: $${zone}
-                      instance: $${instance}
+                      zone: $${slot.zone}
+                      instance: $${slot.instance}
                     result: vm
                 - decide:
                     switch:
@@ -111,8 +111,8 @@ resource "google_workflows_workflow" "sweeper" {
                                           call: googleapis.compute.v1.instances.stop
                                           args:
                                             project: $${project}
-                                            zone: $${zone}
-                                            instance: $${instance}
+                                            zone: $${slot.zone}
+                                            instance: $${slot.instance}
                                             discardLocalSsd: true
                                         except:
                                           as: e
@@ -121,12 +121,12 @@ resource "google_workflows_workflow" "sweeper" {
                                                 call: sys.log
                                                 args:
                                                   severity: WARNING
-                                                  text: '$${"stop failed for " + instance + ", " + json.encode_to_string(e)}'
+                                                  text: '$${"stop failed for " + slot.instance + " in " + slot.zone + ", " + json.encode_to_string(e)}'
                                             - next_instance:
                                                 next: continue
                                     - note:
                                         assign:
-                                          - stopped: $${list.concat(stopped, instance)}
+                                          - stopped: $${list.concat(stopped, slot.zone + "/" + slot.instance)}
         - done:
             return: $${stopped}
   EOT

@@ -6,8 +6,9 @@
 # needs and nothing that can read it: the VM service account (can pull the
 # image, ask for attestation, and - debug only - write logs), the WIF pool
 # whose providers admit this image on TDX with the GPU in CC mode, the
-# models bucket only that federated identity may read, the registry, the
-# static IP, the firewall, and the a3-highgpu-1g Spot VM itself.
+# models bucket only that federated identity may read, the registry, a
+# subnet per region the slots span, a static IP per slot, the firewall, and
+# the a3-highgpu-1g Spot VMs themselves, spread over slot_zones.
 #
 # The trainer and Cloudflare stay in prod-femled-couple-router; the phone
 # talks to this project's VM directly (tee-dns.tf in link-router/terraform
@@ -21,6 +22,12 @@ data "google_project" "current" {
 locals {
   slot_names = [for i in range(var.slot_count) : "slot-${i}"]
   slot_hosts = { for name in local.slot_names : name => "${name}.${var.slot_domain}" }
+  # slot-i runs in slot_zones[i mod n]: with two zones, evens in the first
+  # and odds in the second. Its region (the zone minus the "-a") names the
+  # subnet and the static IP, both regional (network.tf).
+  slot_zone    = { for i, name in local.slot_names : name => var.slot_zones[i % length(var.slot_zones)] }
+  slot_region  = { for name, zone in local.slot_zone : name => regex("^(.*)-[a-z]$", zone)[0] }
+  slot_regions = toset(values(local.slot_region))
 
   # Google Trust Services through Cloud Public CA, in both modes: the slot
   # boots once per session and mints a fresh certificate each time, which
@@ -47,7 +54,6 @@ resource "google_project_service" "apis" {
     "iamcredentials.googleapis.com",
     "sts.googleapis.com",
     "artifactregistry.googleapis.com",
-    "cloudbuild.googleapis.com",
     "storage.googleapis.com",
     "logging.googleapis.com",
     "cloudkms.googleapis.com",

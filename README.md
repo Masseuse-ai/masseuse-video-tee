@@ -5,13 +5,14 @@ that anyone can read what happens to their video and check that the machine
 they are connected to is running exactly this.
 
 masseuse.ai looks at a camera while you use it. The camera is either the
-phone's own, a network camera behind you that the phone names, or a camera
-on your home network carried by the open-source connector
-[masseuse-camlink](https://github.com/FemLed/masseuse-camlink). Whichever it
-is, the video is decrypted in two places only: on your device and inside a
-Google Cloud Confidential Space VM (`a3-highgpu-1g`: Intel TDX, one H100 in
-confidential-computing mode) in the dedicated project
-`prod-masseuse-video-tee`. This repository is that VM's infrastructure, the
+phone's own, a network camera behind you that the phone names, or, through
+the open-source connector
+[masseuse-camlink](https://github.com/FemLed/masseuse-camlink) running on
+the computer in the room, that computer's own camera and microphone or a
+camera on your home network. Whichever it is, the video is decrypted in two
+places only: on your own devices and inside a Google Cloud Confidential
+Space VM (`a3-highgpu-1g`: Intel TDX, one H100 in confidential-computing
+mode) in the dedicated project `prod-masseuse-video-tee`. This repository is that VM's infrastructure, the
 container image it runs, and the tools to verify both.
 
 ## What happens to your video and audio
@@ -36,16 +37,16 @@ Inside the enclave, in code that is in this repository:
   and set aside) along with its level and pitch. No speech recognition or
   transcription runs; nothing identifies the voice.
 - Frames and audio are then discarded. Nothing is written to disk; the VM
-  has no persistent storage and no operator can read its memory.
+  has no persistent storage and nobody at masseuse.ai can read its memory.
 
 The keypoints, descriptors and vocalization labels, which identify nobody,
 go to an analysis module that turns them into a few numbers per second for
-the trainer (the masseuse.ai service on Cloud Run). The analysis module
+the masseuse (the masseuse.ai service on Cloud Run). The analysis module
 runs inside the same enclave as a separate process, receives no frames and
 no audio, and its logic is not published; its exact version is pinned by
 hash in this repository so the attested image says which one is running.
 The numbers, never frames or sound, are what leaves the enclave, over TLS to
-the trainer's address that is itself part of the attestation.
+the masseuse's address that is itself part of the attestation.
 
 All of that is `workload/`: `pixel/` is the decode geometry, person
 detection, keypoint detection and motion descriptors; `audio/` is the audio
@@ -69,44 +70,78 @@ record of each release is on its GitHub Release.
 
 - Cloudflare fronts `masseuse.ai` (HTML/JS, session API) but never carries
   SDP, media or the media capability, only the capability's SHA-256.
-- The trainer (Cloud Run, operator-run) orchestrates leases and receives the
-  readings. It does not proxy WHIP/WHEP for enclave slots.
+- The masseuse (Cloud Run, run by masseuse.ai) orchestrates leases and
+  receives the readings. It does not proxy WHIP/WHEP for enclave slots.
 - coturn is a TURN fallback the phone may use; it relays SRTP ciphertext.
-- The operator (the Google Cloud project owner) cannot read enclave memory,
-  SSH into the production image, redirect its logs, run an image the release
-  workflow did not build and sign from a tag of this repository, or obtain
-  the DTLS keys or the capability.
+- masseuse.ai itself, meaning any employee, contractor or administrator
+  working on its behalf, including the owners of the Google Cloud project,
+  cannot read enclave memory, SSH into the production image, redirect its
+  logs, run an image the release workflow did not build and sign from a tag
+  of this repository, or obtain the DTLS keys or the capability.
 - Residual: the JavaScript bundle and the policy (which signing key and
-  minimum release the clients accept) are operator-served. The provenance
-  on every release, this verifier, and the connector (which runs the checks
-  itself, outside the browser) are the mitigations.
+  minimum release the clients accept) are served by masseuse.ai. The
+  provenance on every release, this verifier, and the connector are the
+  mitigations: the connector runs the checks itself, outside the browser,
+  treats the served policy as something that can only tighten the anchors
+  compiled into its reproducible build, and verifies each attested digest's
+  signature and SLSA provenance against the public registry and the Sigstore
+  transparency log before it sends a frame.
 
-The two kinds of external camera keep the same boundary:
+The external cameras keep the same boundary, with one difference the third
+kind makes plain:
 
 - **A camera the user names (RTSPS, reachable from the internet).** The phone
   hands the enclave an `rtsps://` link (`PUT /ingest/source`, capability
   bearer, only after the phone has verified the attestation). The link is a
-  credential and stays in the enclave: the trainer and Cloudflare learn only
+  credential and stays in the enclave: the masseuse and Cloudflare learn only
   `source: external`, the enclave never logs it, nothing of it persists. The
   enclave probes the camera once for reachability and its certificate's
   SHA-256, then MediaMTX pulls RTSPS with that fingerprint pinned. Plain
-  `rtsp://`, private, loopback, link-local, multicast, CGNAT and unspecified
-  addresses and the VM's own address are refused before any connection. The
-  path is cleared on teardown and by a lease for a different session.
-- **A camera on the user's home network (masseuse-camlink).** The connector
-  carries the camera's RTSPS *ciphertext* to the enclave, where
-  `masseuse-camlink-gateway` (the second binary of that repository, running
-  as one of the processes in this image) hands it to MediaMTX on loopback as
-  if it were the camera. Nothing decrypts in between: the camera's TLS still
-  terminates in MediaMTX with the certificate fingerprint pinned, so neither
-  the connector nor the gateway holds the stream or can substitute one.
-  Before dialing, the connector verifies the slot's attestation the way the
-  phone does and pins the slot's TLS key to the SPKI hash in that
-  attestation. It dials only the single private-network `host:port` the
-  session names. The gateway binary in this image is pinned by release tag
-  and checksum (`camlink.lock`) and rebuilt from the Go module proxy by the
+  `rtsp://`, multicast, CGNAT and unspecified addresses and the VM's own
+  address are refused before any connection; a private, loopback or
+  link-local address is not dialed from the enclave at all but reached
+  through the connector's tunnel, below.
+- **A camera on the user's home network that the session names
+  (masseuse-camlink, relaying).** The connector carries the camera's RTSPS
+  *ciphertext* to the enclave, where `masseuse-camlink-gateway` (the second
+  binary of that repository, running as one of the processes in this image)
+  hands it to MediaMTX on loopback as if it were the camera. Nothing
+  decrypts in between: the camera's TLS still terminates in MediaMTX with
+  the certificate fingerprint pinned, so neither the connector nor the
+  gateway holds the stream or can substitute one. Before dialing, the
+  connector verifies the slot's attestation the way the phone does, against
+  a policy it only lets tighten the anchors compiled into it (the signing
+  key, the minimum release, this repository, the project and registry the
+  slot runs from), pins the slot's TLS key to the SPKI hash in that
+  attestation, and confirms in the public registry and the Sigstore
+  transparency log that the attested digest is what this repository's
+  release workflow signed and built at the release the image is stamped
+  with. It dials only the single private-network `host:port` the session
+  names. The gateway binary in this image is pinned by release tag and
+  checksum (`camlink.lock`) and rebuilt from the Go module proxy by the
   image build, which refuses to build unless the bytes match the signed,
   SLSA-attested release.
+- **The computer's own camera, or a home camera the connector names
+  (masseuse-camlink, serving).** The connector is itself an RTSPS server,
+  reachable only through its tunnel: the phone hands the enclave the fixed
+  link `rtsps://127.0.0.1:7443/camera`, the enclave treats the loopback
+  address as a tunnel target like any private one, probes and pins the
+  connector's certificate through the tunnel as it would a camera's, and
+  MediaMTX pulls the stream the same way. What the connector serves is the
+  computer's camera and microphone (captured with ffmpeg, only while a
+  session is reading) or a camera on the home network that it pulls itself,
+  terminating that camera's TLS on the computer and pinning its certificate
+  there. Here the connector is not a relay of ciphertext: it is the camera,
+  and holds the picture in the clear on the person's own computer, as any
+  camera program does. What holds unchanged is that the stream leaves that
+  computer only inside TLS this attested image terminates, that the
+  connector sends it to nothing but the slot it verified, that the enclave
+  is told of the camera only by the phone's capability, and that the
+  masseuse.ai service never carries a frame: it learns the connector's name
+  for the camera (`POST /api/camlink/source`, so the phone can show it) and
+  nothing else. That the connector does what it says is checked the way
+  this image is: it is open source, and its releases are reproducible and
+  signed.
 
 **One session per slot.** A slot serves one session at a time: the lease
 holds a single capability hash, and the publish and overlay routes accept
@@ -143,7 +178,7 @@ report a check that should hold and does not.
 | `analysis.lock` | The analysis bundle (version and SHA-256) the image will run; copied into the image |
 | `camlink.lock` | The `masseuse-camlink-gateway` release (tag and checksum) the image carries |
 | `.github/workflows/release.yml` | The build: images to `ghcr.io` stamped with the tag and commit, SLSA provenance, keyless signature, promotion by digest into the enclave's registry, KMS signature, the GitHub Release that records the digest |
-| `terraform/` | The project: service account, Workload Identity Federation pool and providers keyed to the attestation, models bucket, Artifact Registry, static IP, firewall, the slot VM(s), the trainer's start/stop role, the KMS signing key, the release workflow's identity, the sweeper, VPC Service Controls (off until the project has an organization) |
+| `terraform/` | The project: service account, Workload Identity Federation pool and providers keyed to the attestation, models bucket, Artifact Registry, a subnet per region and a static IP per slot, firewall, the slot VMs spread over `slot_zones` (even slots in us-central1-a, odd in us-east5-a), the masseuse's start/stop role, the KMS signing key, the release workflow's identity, the sweeper, VPC Service Controls (off until the project has an organization) |
 | `verifier/` | `tee-verify`, the standalone attestation checker |
 | `tools/` | `gts-acme-test.sh`: the rig that established Google Trust Services tolerates a fresh certificate on every boot |
 | `build.sh` | The same two image builds, locally, without a push |
@@ -153,7 +188,7 @@ report a check that should hold and does not.
 ## How it runs
 
 A slot exists only while a session needs it. When a masseuse.ai visitor taps
-Enable camera the trainer starts the VM (the one thing its service account
+Enable camera the masseuse starts the VM (the one thing its service account
 may do here); about three minutes later the enclave holds a fresh TLS
 certificate from Google Trust Services issued to a key generated inside it,
 the model weights are in a tmpfs, and the slot attests and takes the lease.

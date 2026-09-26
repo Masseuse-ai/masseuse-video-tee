@@ -11,14 +11,34 @@ variable "project_number" {
 }
 
 variable "region" {
-  type    = string
-  default = "us-central1"
+  description = "The home region: the registry, the signing key, the models bucket, the sweeper and the WIF image-prefix condition live here. The slot VMs themselves are placed by slot_zones and may sit in other regions; each such region gets its own subnet and static IPs (network.tf)."
+  type        = string
+  default     = "us-central1"
 }
 
-variable "zone" {
-  description = "Where the slot VMs run. a3-highgpu-1g exists in us-central1-a/b/c, but its Confidential VM form (Intel TDX with NVIDIA Confidential Computing) is offered in three zones only: us-central1-a, us-east5-a and europe-west4-c (Confidential VM, Supported configurations). Within us-central1 that is us-central1-a. The zone must sit in var.region: the subnet and the static IPs (network.tf) are regional."
-  type        = string
-  default     = "us-central1-a"
+variable "slot_zones" {
+  description = "Where the slot VMs run, round-robin by index: slot-0 in the first zone, slot-1 in the second, slot-2 in the first again. With the default two zones the even slots are in us-central1-a and the odd ones in us-east5-a, so a Spot stockout in one zone leaves the other half of the fleet to lease. a3-highgpu-1g exists in more zones, but its Confidential VM form (Intel TDX with NVIDIA Confidential Computing) is offered in three only: us-central1-a, us-east5-a and europe-west4-c (Confidential VM, Supported configurations). Every zone's region needs an entry in subnet_cidrs."
+  type        = list(string)
+  default     = ["us-central1-a", "us-east5-a"]
+
+  validation {
+    condition     = length(var.slot_zones) > 0 && alltrue([for zone in var.slot_zones : can(regex("^[a-z]+-[a-z]+[0-9]-[a-z]$", zone))]) && length(distinct(var.slot_zones)) == length(var.slot_zones)
+    error_message = "slot_zones must be a non-empty list of distinct zone names such as us-central1-a."
+  }
+}
+
+variable "subnet_cidrs" {
+  description = "One subnet per region the slots span (network.tf), keyed by region. Fixed here rather than derived from slot_zones so that reordering the zones never renumbers, and so replaces, a subnet."
+  type        = map(string)
+  default = {
+    us-central1 = "10.90.0.0/24"
+    us-east5    = "10.90.1.0/24"
+  }
+
+  validation {
+    condition     = alltrue([for cidr in values(var.subnet_cidrs) : can(cidrnetmask(cidr))])
+    error_message = "Every subnet_cidrs value must be an IPv4 CIDR range."
+  }
 }
 
 # ---------------------------------------------------------------------------
@@ -42,9 +62,14 @@ variable "debug_mode" {
 }
 
 variable "slot_count" {
-  description = "How many slot VMs (slot-0..N-1). Each is one a3-highgpu-1g Spot VM with its own static IP and hostname."
+  description = "How many slot VMs (slot-0..N-1), spread over slot_zones by index. Each is one a3-highgpu-1g Spot VM with its own static IP and hostname, TERMINATED until a visitor needs it; the count is the number of visitors the fleet can serve at once. An idle slot costs its boot disk and its reserved IP (about $24 a month); a new one boots once when created (vm.tf). Spot H100 quota is 64 per region."
   type        = number
-  default     = 1
+  default     = 20
+
+  validation {
+    condition     = var.slot_count >= 1 && var.slot_count <= 128
+    error_message = "slot_count must be between 1 and 128."
+  }
 }
 
 variable "vm_running" {
@@ -125,7 +150,7 @@ variable "image_signer_fingerprints_extra" {
 # ---------------------------------------------------------------------------
 
 variable "slot_domain" {
-  description = "Slot hostnames are slot-<n>.<slot_domain>; the A records live in link-router/terraform/tee-dns.tf."
+  description = "Slot hostnames are slot-<n>.<slot_domain>, whatever zone the slot is in; the A records live in link-router/terraform/tee-dns.tf, fed by the slot_hosts output."
   type        = string
   default     = "tee.masseuse.ai"
 }

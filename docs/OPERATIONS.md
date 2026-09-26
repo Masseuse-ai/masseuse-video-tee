@@ -31,6 +31,21 @@ The state bucket `gs://prod-masseuse-video-tee-tf-state` was created by
 hand (`versions.tf`). `terraform output slot_hosts` prints the static IP per
 hostname.
 
+**Where the slots are.** `slot_count` slots are spread over `slot_zones` by
+index: with the defaults, even slots in `us-central1-a` and odd slots in
+`us-east5-a` (`terraform output slot_zones`), each region with its own
+subnet and static IPs (`network.tf`). A Spot stockout in one zone then
+leaves the trainer the other zone's slots to start. The examples below use
+`slot-0`, which is in `us-central1-a`; for an odd slot pass its zone. Adding
+slots is a change to `slot_count` followed by, in order: a targeted apply of
+the addresses (`-target=google_compute_address.slot`, plus
+`-target=google_compute_subnetwork.tee` for a new region), the link-router
+DNS apply so the new hostnames resolve before their first boot mints a
+certificate, then the full apply. Each new VM boots once when created (the
+provider cannot create a local-SSD VM stopped) and its boot idle exit
+powers it off about five minutes later; a create refused with
+`ZONE_RESOURCE_POOL_EXHAUSTED` is re-applied later.
+
 ## 2. The image
 
 Every image is built by `.github/workflows/release.yml` from a tag:
@@ -38,6 +53,12 @@ Every image is built by `.github/workflows/release.yml` from a tag:
 ```sh
 git tag vX.Y.Z && git push origin vX.Y.Z   # through the release identity
 ```
+
+A tag is final: the repository's ruleset "Tags are immutable" (every tag;
+no update, deletion or force push; no bypass actor, the release identity
+included) refuses to move or remove one, so a mistaken tag is answered by
+the next tag. A tag whose build failed keeps its Release saying so
+(`v0.2.0`).
 
 The workflow builds the base (`workload/Dockerfile`) and the TEE layer
 (`workload/tee/Dockerfile.tee`) with BuildKit, every layer zstd, one OCI

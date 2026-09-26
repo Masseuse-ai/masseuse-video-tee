@@ -9,13 +9,18 @@ output "slot_origins" {
 }
 
 output "slot_vms" {
-  description = "Each slot the trainer can start and stop on demand (the trainer's TEE_SLOT_VMS_JSON): its public origin keyed to the project, zone and instance name the trainer drives through the Compute API."
+  description = "Each slot the trainer can start and stop on demand (the trainer's TEE_SLOT_VMS_JSON): its public origin keyed to the project, zone and instance name the trainer drives through the Compute API. The zone differs per slot (slot_zones)."
   value = [for name in local.slot_names : {
     origin   = "https://${local.slot_hosts[name]}"
     project  = var.project_id
-    zone     = var.zone
+    zone     = local.slot_zone[name]
     instance = google_compute_instance.slot[name].name
   }]
+}
+
+output "slot_zones" {
+  description = "Slot name -> zone, for the operator: slot-0 is in the first slot_zones entry, slot-1 in the second, and so on."
+  value       = local.slot_zone
 }
 
 output "vm_service_account" {

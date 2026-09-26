@@ -60,7 +60,11 @@ resource "google_iam_workload_identity_pool_provider" "github" {
   # request, a branch build, or another workflow file added to the
   # repository (even on a tag) gets no token exchange. job_workflow_ref is
   # the workflow file the running job belongs to, at the ref that ran it,
-  # so the signing job is the release.yml of the tag's own commit.
+  # so the signing job is the release.yml of the tag's own commit. The tag
+  # itself cannot be moved or deleted afterwards: the repository's ruleset
+  # "Tags are immutable" (all tags; no update, deletion or force push; no
+  # bypass actor) keeps the commit a provenance names the commit the tag
+  # named when it was released.
   attribute_condition = join(" && ", [
     "assertion.repository == '${var.github_repository}'",
     "assertion.ref_type == 'tag'",

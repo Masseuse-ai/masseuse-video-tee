@@ -64,6 +64,10 @@ at every moment is in the attestation token itself:
 
 The clients (the web app, the connector) pin the signing key and, once
 every running image is stamped, a minimum release; they do not pin digests.
+The connector goes further: the signing key, the minimum release, the
+project and registry the enclave must run from and this repository as the
+source are compiled into it as floors the served policy can only tighten,
+and it checks the digest's public record itself (below).
 Every release's digest and validation record is on its GitHub Release
 ([releases](https://github.com/FemLed/masseuse-video-tee/releases)), written
 by the workflow that built it and appended to by the operators when the
@@ -157,10 +161,24 @@ negotiated, so the `nonce.tls-spki` check is the verifier's job; the
 browser's DTLS fingerprint check gives the media the same property.
 
 The home-network connector (`masseuse-camlink`) runs the same checks
-before it dials a slot (`internal/attest` there is a port of `verifier/`),
-additionally pins the slot's TLS key to the SPKI hash in the token, and
-logs the `slsa-verifier` and `cosign` commands for the digest and release
-your session attested.
+before it dials a slot (`internal/attest` there is a port of `verifier/`)
+and additionally pins the slot's TLS key to the SPKI hash in the token. It
+does not take the served policy at its word: the token issuer and key set,
+the signing key, the minimum release, this repository and its public
+registry, the Google Cloud project and the registry path the enclave must
+have been pulled from, and the `.tee.masseuse.ai` suffix are floors
+compiled into the connector (`internal/attest/floors.go`), and a served
+policy that contradicts them is refused rather than applied. Then, before
+the first frame leaves the machine, it does what the two commands above do
+(`internal/provenance`, on sigstore-go): it reads from `ghcr.io` the
+Sigstore bundle and the SLSA provenance attached to the attested digest and
+verifies against the public Sigstore trust root that the signature's
+certificate is this repository's `release.yml` at the very tag the image is
+stamped with, and that the provenance, signed by the SLSA GitHub generator,
+names this repository at that tag and commit. An image without both records
+in the transparency log is refused. It logs the `slsa-verifier` and
+`cosign` commands for the digest and release your session attested, and the
+Rekor indexes of the entries it verified, so you can repeat the check.
 
 ## Release history
 
@@ -173,7 +191,10 @@ to the tag; the operators append what the image changed, when `tee-verify`
 passed against a slot running it and when a session carried it, and when
 it left the trainer's policy. That record is the history this document
 used to hold as a table of digests, and it is written by the release, not
-ahead of it.
+ahead of it. A tag, once created, cannot be moved or deleted by anyone: a
+repository ruleset ("Tags are immutable", on every tag, with no bypass
+actor) refuses updates, deletions and force pushes, so the tag a
+provenance names is still the commit it named when the image was built.
 
 Images before `v0.1.0` were built by Cloud Build in the enclave's project
 from a source tree that was not yet public, with the same Dockerfiles but
@@ -285,7 +306,8 @@ policy and in the WIF provider, all in this repository's history.
   FemLed through Cloudflare. A modified bundle could skip the checks above,
   which is why the checks are also documented for you to run from outside,
   and why the home-network connector, which is open source and reproducible,
-  runs them itself.
+  runs them itself, with the policy's anchors compiled in and the digest's
+  provenance verified against the public registry and the transparency log.
 - What the analysis module does with the readings. It consumes keypoints
   and descriptors, not frames; its logic is not published (`README.md`,
   "What happens to your video").
@@ -312,4 +334,9 @@ policy and in the WIF provider, all in this repository's history.
   start, no identity.
 - FemLed: the policy (which signing key and minimum release the clients
   accept) and the JavaScript, as above. The provenance, the Releases and
-  this verifier are how that trust is checked rather than assumed.
+  this verifier are how that trust is checked rather than assumed. For the
+  home-network connector this residual is smaller: the policy can only
+  tighten anchors fixed in its reproducible build, and it verifies each
+  digest's signature and provenance against the public registry and the
+  transparency log itself, so a served policy or a served script cannot
+  send it to an image this repository's release workflow did not build.

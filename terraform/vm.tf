@@ -5,6 +5,10 @@
 # per slot, Spot - Confidential Space GPU VMs must be Spot or Flex-start -
 # booting the Confidential Space image family debug_mode selects, running
 # the TEE workload image by digest with the tee-env-* the entrypoint reads.
+# The slots are spread over slot_zones by index (evens in us-central1-a,
+# odds in us-east5-a with the defaults), each in its region's subnet with
+# its region's static IP, so that a Spot stockout in one zone leaves the
+# trainer the other zone's slots to start (masseuse-trainer slot-pool.js).
 #
 # The VM's running state is not Terraform's: the trainer starts a slot when
 # a masseuse.ai visitor taps Enable camera (the trainer calls the Compute
@@ -84,7 +88,7 @@ resource "google_compute_instance" "slot" {
   project      = var.project_id
   name         = "masseuse-video-tee-${each.value}"
   machine_type = "a3-highgpu-1g"
-  zone         = var.zone
+  zone         = local.slot_zone[each.value]
 
   # Never "TERMINATED": stopping a VM with local SSDs needs the API's
   # discard-local-ssd flag, which the provider does not send, so a create
@@ -144,7 +148,7 @@ resource "google_compute_instance" "slot" {
   }
 
   network_interface {
-    subnetwork = google_compute_subnetwork.tee.id
+    subnetwork = google_compute_subnetwork.tee[local.slot_region[each.value]].id
 
     access_config {
       nat_ip       = google_compute_address.slot[each.value].address

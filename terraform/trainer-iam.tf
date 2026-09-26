@@ -10,8 +10,15 @@
 # nothing else in the project (it cannot read the models bucket, cannot
 # reach the enclave, cannot change the VM). Starting a VM that runs as a
 # service account also needs actAs on that account, granted on the VM's SA
-# alone. The trainer polls instances.get for status rather than the
-# zone operation, so no zoneOperations.get is needed.
+# alone.
+#
+# One project-wide grant besides: reading a zone operation. A Spot start the
+# API accepts can still come to nothing (ZONE_RESOURCE_POOL_EXHAUSTED), and
+# the operation is where that is said, within seconds; the trainer reads it
+# and starts a slot in the other zone at once instead of inferring the
+# stockout from a VM still TERMINATED half a minute later. Operations are
+# not instance-level resources, so the grant is project-wide, like the
+# sweeper's; the project holds nothing but the slots.
 # ---------------------------------------------------------------------------
 resource "google_project_iam_custom_role" "slot_operator" {
   project     = var.project_id
@@ -28,10 +35,26 @@ resource "google_project_iam_custom_role" "slot_operator" {
 resource "google_compute_instance_iam_member" "trainer_operates_slot" {
   for_each      = google_compute_instance.slot
   project       = var.project_id
-  zone          = var.zone
+  zone          = each.value.zone
   instance_name = each.value.name
   role          = google_project_iam_custom_role.slot_operator.id
   member        = "serviceAccount:${var.trainer_service_account}"
+}
+
+resource "google_project_iam_custom_role" "slot_start_watcher" {
+  project     = var.project_id
+  role_id     = "masseuseVideoTeeSlotStartWatcher"
+  title       = "masseuse-video-tee slot start watcher"
+  description = "Read a zone operation: how the trainer learns within seconds that a Spot start found no capacity."
+  permissions = [
+    "compute.zoneOperations.get",
+  ]
+}
+
+resource "google_project_iam_member" "trainer_watches_starts" {
+  project = var.project_id
+  role    = google_project_iam_custom_role.slot_start_watcher.id
+  member  = "serviceAccount:${var.trainer_service_account}"
 }
 
 # actAs on the VM's own service account: starting an instance that runs as
