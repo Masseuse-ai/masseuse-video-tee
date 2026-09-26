@@ -100,7 +100,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
 # CUDA base carried it). The NVIDIA_* variables and LD_LIBRARY_PATH are what
 # the CUDA base set: the driver mount is where libcuda lives at run time.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        python3 python3-pip python3-venv ffmpeg ca-certificates \
+        python3 python3-pip python3-venv ffmpeg ca-certificates fonts-dejavu-core \
     && rm -rf /var/lib/apt/lists/*
 ENV NVIDIA_VISIBLE_DEVICES=all \
     NVIDIA_DRIVER_CAPABILITIES=compute,utility \

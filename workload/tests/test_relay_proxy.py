@@ -219,6 +219,9 @@ def test_route_recognises_the_seven_shapes_and_nothing_else():
     assert route(f"/ingest/whip/{WHIP_SECRET}") == ("whip", WHIP_SECRET, None)
     assert route("/ingest/source") == ("source", None, None)
     assert route("/ingest/view") == ("view", None, None)
+    assert route("/ingest/egress") == ("egress", None, None)
+    assert route("/egress/stop") == ("egress-stop", None, None)
+    assert route("/overlay/hud") == ("hud", None, None)
     matched = route("/overlay/whep")
     assert matched.kind == "whep" and matched.secret is None and matched.path == "overlay"
     for bad in ("/overlay", "/overlay/", "/overlay/whep/", "/overlay/whep/a/b",
@@ -227,7 +230,9 @@ def test_route_recognises_the_seven_shapes_and_nothing_else():
                 "/ingest", "/ingest/", "/ingest/whep", "/ingest/whip/",
                 "/ingest/whip/a/b", "/cam/whip", "/ingest/whip/" + "x" * 65,
                 "/ingest/source/", "/ingest/source/x", "/overlay/source",
-                "/ingest/view/", "/ingest/view/x", "/overlay/view"):
+                "/ingest/view/", "/ingest/view/x", "/overlay/view",
+                "/ingest/egress/", "/ingest/egress/x", "/egress", "/egress/stop/",
+                "/overlay/hud/", "/overlay/hud/x", "/ingest/hud"):
         assert route(bad) is None, bad
 
 

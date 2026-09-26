@@ -312,7 +312,9 @@ it on the session's event stream or send it anywhere else.
 
 Text lines for the annotated view. The overlay draws whatever it is given
 under its own status lines; the producer does not interpret them. The
-annotated view is returned only to the user whose camera it came from.
+annotated view is returned only to the user whose camera it came from,
+and, when that user opens a live stream (README, "The live stream"), to
+the one destination they named.
 
 ### `gauges`
 

@@ -27,7 +27,10 @@ Inside the enclave, in code that is in this repository:
   which direction a region moves).
 - An annotated view (skeleton, boxes, a status line) is drawn on the frames
   and streamed back to the same device that sent the video, and to nothing
-  else. It is encoded in four renditions at once, from the one picture:
+  else unless the user opens a live stream (below, "The live stream"): then
+  the same view, with a HUD card drawn over it and with the microphone when
+  asked, also goes to the one streaming destination the user named from
+  their device. It is encoded in four renditions at once, from the one picture:
   the full view at 30 fps, the full view at 15 fps, and three quarters of
   its size at 15 fps at two bit rates. They give things up in that order -
   frame rate first, then resolution, then bits - and the device picks one
@@ -75,7 +78,8 @@ runs inside the same enclave as a separate process, receives no frames and
 no audio, and its logic is not published; its exact version is pinned by
 hash in this repository so the attested image says which one is running.
 The numbers, never frames or sound, are what leaves the enclave, over TLS to
-the masseuse's address that is itself part of the attestation.
+the masseuse's address that is itself part of the attestation; the one
+exception is the live stream the user opens, below.
 
 For a signed-in session the enclave also keeps the session's record: the
 keypoints of both views (all 308 the model emits, with their scores), the
@@ -112,6 +116,9 @@ record of each release is on its GitHub Release.
   SDP, media or the media capability, only the capability's SHA-256.
 - The masseuse (Cloud Run, run by masseuse.ai) orchestrates leases and
   receives the readings. It does not proxy WHIP/WHEP for enclave slots.
+  Of a live stream the user opens it learns that one is on and to which
+  host, may stop it, and sends the words of the HUD card drawn into it;
+  the destination itself goes from the phone to the enclave alone.
 - coturn is a TURN fallback the phone may use; it relays SRTP ciphertext.
 - masseuse.ai itself, meaning any employee, contractor or administrator
   working on its behalf, including the owners of the Google Cloud project,
@@ -196,6 +203,30 @@ of either picture.
 holds a single capability hash, and the publish and overlay routes accept
 only that capability as a bearer, so a second person cannot join a slot
 that is someone else's.
+
+**The live stream (opt-in).** A user may send the annotated view on to a
+live-streaming service of their choosing, the way a creator streams a
+show: the page hands the enclave the service's `rtmps://` address, stream
+key included (`PUT /ingest/egress {url, audio?, hud?}`, the same
+capability bearer as WHIP, over the slot's own TLS, after the attestation
+check), and one `ffmpeg` inside the image reads the view back from the
+relay's loopback path and pushes it there, with the microphone as AAC
+when `audio` is asked for and, when `hud` is (the default), a HUD card
+composited over the view at the bottom-left. The card's words come from
+the trainer (`PUT /overlay/hud`, the trainer's identity; a few tiles, a
+row for the unit, a count of viewers), bounded and drawn as given; the
+producer interprets none of them. The destination is checked the way a
+camera link is: `rtmps://` only (a plain `rtmp://` address would carry
+the view across the internet in the clear), a host that resolves to a
+public address and not this VM's; nothing about it beyond its host is
+logged or reported, and the key stays inside the process. `GET` says
+whether a stream is on and to which host, `DELETE` stops it; the trainer
+sees the same in `/ingest/status` (`egress`) and may stop the stream
+(`POST /egress/stop`), never start one or name where it goes. The stream
+lives for the lease: it survives a `/stop` (a production restarting) and
+ends with the user's `DELETE`, the trainer's stop, `/teardown` and a lease
+for another session. Without this, nothing of the view leaves the enclave
+but the WHEP leg to the same device.
 
 **Hardware-signed evidence.** Each session is gated on a Google Cloud
 Attestation OIDC token (TDX quote + GPU report → Google-signed JWT) whose

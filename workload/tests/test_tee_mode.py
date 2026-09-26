@@ -37,7 +37,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "pixel"))
 import producer  # noqa: E402
 import tee_mode  # noqa: E402
 from camlink_gateway import CamlinkGateway  # noqa: E402
+from egress import Egress  # noqa: E402
 from external_source import ExternalSource  # noqa: E402
+from hud_card import HudCard  # noqa: E402
 from relay_proxy import RelayProxy  # noqa: E402
 from telemetry import Telemetry  # noqa: E402
 from test_camlink_gateway import CONNECTOR_KEY, TICKET_HASH, FakeGateway  # noqa: E402
@@ -138,6 +140,45 @@ def request(port: int, method: str, path: str, body: bytes = b"",
     return response.status, dict(response.getheaders()), payload
 
 
+class FakeEgressProc:
+    """The live stream's ffmpeg, scripted: it runs until terminated and
+    never touches the network. `communicate` blocks on its end."""
+
+    def __init__(self, argv):
+        self.argv = argv
+        self.returncode = None
+        self.stdin = self
+        self._done = threading.Event()
+
+    def poll(self):
+        return self.returncode
+
+    def communicate(self, timeout=None):
+        self._done.wait(timeout)
+        return b"", b""
+
+    def wait(self, timeout=None):
+        self._done.wait(timeout)
+        return self.returncode
+
+    def terminate(self):
+        self.returncode = -15
+        self._done.set()
+
+    def kill(self):
+        self.returncode = -9
+        self._done.set()
+
+    def write(self, data):
+        pass
+
+    def flush(self):
+        pass
+
+    def close(self):
+        pass
+
+
 class Slot:
     """A TEE-mode producer server over a stub relay and a fake connector
     gateway, for one test. Its external camera resolves every name to a
@@ -161,12 +202,25 @@ class Slot:
             gateway=CamlinkGateway("http://127.0.0.1:1" if gateway_down else self.gateway.base,
                                    timeout_s=1.0, status_cache_s=0.0,
                                    log=lambda *a, **k: None))
+        # The live stream over a scripted ffmpeg: every spawn is recorded,
+        # none runs; the destination resolves to a public address.
+        self.egress_procs: list[FakeEgressProc] = []
+
+        def popen(argv, **kwargs):
+            proc = FakeEgressProc(argv)
+            self.egress_procs.append(proc)
+            return proc
+
+        self.egress = Egress(
+            "rtsp://127.0.0.1:8554/overlay", "rtsp://127.0.0.1:8554/cam", own_ip="34.1.2.3",
+            hud_card=HudCard(), resolver=resolver_for(GLOBAL), popen=popen,
+            clock=lambda: 1_700_000_000.0, log=lambda *a, **k: None)
         self.server = producer.build_server(
             server_args(overlay_publish="rtsp://127.0.0.1:8554/overlay",
                         overlay_renditions="hi,half,small,lean",
                         overlay_relay_webrtc=self.relay.base,
                         overlay_relay_api=self.relay.base),
-            Telemetry(), tee=self.tee, external=self.external)
+            Telemetry(), tee=self.tee, external=self.external, egress=self.egress)
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
         self.port = self.server.server_address[1]
@@ -176,6 +230,7 @@ class Slot:
 
     def __exit__(self, *exc):
         self.server.current["session"] = None
+        self.egress.clear("test over")
         self.server.shutdown()
         self.server.server_close()
         self.relay.stop()
@@ -1145,3 +1200,108 @@ def test_the_default_verifier_tolerates_a_small_clock_skew(monkeypatch):
     assert verify("t.o.k", "https://slot-0.example") == {"iss": "https://accounts.google.com"}
     assert seen["audience"] == "https://slot-0.example"
     assert seen["clock_skew_in_seconds"] == tee_mode.TOKEN_CLOCK_SKEW_S == 30
+
+
+def test_the_phone_opens_a_live_stream_with_its_capability_and_the_trainer_may_only_stop_it():
+    json_type = {"Content-Type": "application/json"}
+    destination = b'{"url": "rtmps://live.example.com/app/sk_live_1234", "audio": true}'
+    with Slot() as slot:
+        # Without a lease the destination is refused before anything looks at it.
+        cap0, _ = capability()
+        code, headers, body = slot.as_phone(cap0, "PUT", "/ingest/egress", destination, json_type)
+        assert code == 401 and json.loads(body)["reason"] == "no lease"
+        assert headers["Access-Control-Allow-Origin"] == ORIGIN
+        assert slot.egress_procs == []
+        code, headers, _ = slot.request(
+            "OPTIONS", "/ingest/egress", b"",
+            {"Origin": ORIGIN, "Access-Control-Request-Method": "PUT",
+             "Access-Control-Request-Headers": "authorization, content-type"})
+        assert code == 204 and "PUT" in headers["Access-Control-Allow-Methods"]
+
+        cap = slot.lease()
+        code, headers, body = slot.as_phone(cap, "GET", "/ingest/egress")
+        assert code == 200 and json.loads(body)["active"] is False
+        assert headers["Cache-Control"] == "no-store"
+        assert slot.as_phone(cap, "PATCH", "/ingest/egress")[0] == 405
+        # A plain rtmp address, a private host, not JSON: each says why, and nothing starts.
+        code, _, body = slot.as_phone(cap, "PUT", "/ingest/egress", b'{"url": "rtmp://live.example.com/app/k"}', json_type)
+        assert code == 400 and json.loads(body) == {"status": "failed", "reason": "not-rtmps",
+                                                     "error": json.loads(body)["error"]}
+        code, _, body = slot.as_phone(cap, "PUT", "/ingest/egress", b"not json", json_type)
+        assert code == 400 and json.loads(body)["reason"] == "bad-url"
+        assert slot.as_phone(cap, "PUT", "/ingest/egress", b"x" * 5000, json_type)[0] == 413
+        assert slot.egress_procs == []
+
+        # The real thing: started, the answer and the status name the host and never the address.
+        code, headers, body = slot.as_phone(cap, "PUT", "/ingest/egress", destination, json_type)
+        assert code == 200, body
+        answer = json.loads(body)
+        assert answer["status"] == "connected" and answer["active"] is True
+        assert answer["host"] == "live.example.com" and answer["audio"] is True and answer["hud"] is True
+        assert "sk_live" not in body.decode()
+        assert headers["Access-Control-Allow-Origin"] == ORIGIN
+        assert len(slot.egress_procs) == 1
+        assert slot.egress_procs[0].argv[-1] == "rtmps://live.example.com/app/sk_live_1234"
+        assert "-c:a" in slot.egress_procs[0].argv and "pipe:0" in slot.egress_procs[0].argv
+
+        # The trainer's poll says a stream is on, to which host; nothing more.
+        code, _, body = slot.as_trainer("GET", "/ingest/status")
+        status = json.loads(body)
+        assert code == 200 and status["egress"]["active"] is True
+        assert status["egress"]["host"] == "live.example.com"
+        assert "sk_live" not in body.decode()
+        # The trainer's HUD card state is taken (its identity, PUT only); the phone's capability is not.
+        card = json.dumps({"tiles": [{"key": "clench", "label": "Clench rate", "value": "36", "unit": "/min", "state": "live"}],
+                           "unit": {"name": "MK-312BT", "detail": "Stroke", "tone": "live", "level": 35, "max": 70},
+                           "fans": {"watching": 4, "controlling": 1}}).encode()
+        code, _, body = slot.as_trainer("PUT", "/overlay/hud", card, json_type)
+        assert code == 200 and json.loads(body) == {"status": "ok", "tiles": 1, "egress": True}
+        assert slot.as_trainer("POST", "/overlay/hud", card, json_type)[0] == 405
+        assert slot.as_phone(cap, "PUT", "/overlay/hud", card, json_type)[0] == 401
+        assert slot.request("PUT", "/overlay/hud", card, json_type)[0] == 401
+        code, _, body = slot.as_trainer("PUT", "/overlay/hud", b"[1,2]", json_type)
+        assert code == 400
+        assert slot.egress.status()["card"]["held"] is True
+
+        # The trainer may stop the stream, and only stop it: no PUT for it on the phone's route.
+        assert slot.as_trainer("PUT", "/ingest/egress", destination, json_type)[0] == 401
+        assert slot.request("POST", "/egress/stop")[0] == 401
+        assert slot.as_trainer("GET", "/egress/stop")[0] == 405
+        code, _, body = slot.as_trainer("POST", "/egress/stop")
+        assert code == 200 and json.loads(body)["status"] == "stopped" and json.loads(body)["active"] is False
+        assert slot.egress_procs[0].returncode == -15
+        code, _, body = slot.as_trainer("POST", "/egress/stop")
+        assert json.loads(body)["status"] == "none"
+
+        # The phone's own DELETE; a stream survives /stop and goes with a teardown.
+        slot.as_phone(cap, "PUT", "/ingest/egress", destination, json_type)
+        assert len(slot.egress_procs) == 2
+        code, _, body = slot.as_phone(cap, "DELETE", "/ingest/egress")
+        assert code == 200 and json.loads(body)["status"] == "removed"
+        assert slot.egress_procs[1].returncode == -15
+        code, _, body = slot.as_phone(cap, "DELETE", "/ingest/egress")
+        assert json.loads(body)["status"] == "none"
+        slot.as_phone(cap, "PUT", "/ingest/egress", destination, json_type)
+        assert len(slot.egress_procs) == 3
+        slot.as_trainer("POST", "/stop")  # 404: nothing running, and the lease stands
+        assert slot.egress.active is True, "a /stop restarts a production; the stream stays"
+        code, _, _ = slot.as_trainer("POST", "/teardown?mode=now")
+        assert code == 200
+        assert slot.egress.active is False
+        assert slot.egress_procs[2].returncode == -15
+
+
+def test_a_lease_for_another_session_takes_the_live_stream_with_it():
+    json_type = {"Content-Type": "application/json"}
+    destination = b'{"url": "rtmps://live.example.com/app/sk_live_1234"}'
+    with Slot() as slot:
+        cap = slot.lease("sess-1")
+        assert slot.as_phone(cap, "PUT", "/ingest/egress", destination, json_type)[0] == 200
+        assert slot.egress.active is True and slot.egress.session_id == "sess-1"
+        # The same session leasing again (a trainer restart) keeps it.
+        slot.lease("sess-1")
+        assert slot.egress.active is True
+        # Another session's lease does not inherit it.
+        slot.lease("sess-2")
+        assert slot.egress.active is False
+        assert slot.egress_procs[0].returncode == -15

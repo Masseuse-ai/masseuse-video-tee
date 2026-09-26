@@ -28,7 +28,11 @@ against production, and a check that should hold but does not is a report.
   duration of a decode and are not written anywhere. The data that leaves
   are the readings the analysis derives (numbers, never frames or sound)
   posted to the trainer, the annotated view streamed back to the same
-  user's phone, and, for a signed-in session, the session record (README,
+  user's phone, the same view (with the microphone, when asked) to the one
+  live-streaming destination the user names from their phone when they
+  open a live stream (README, "The live stream"; the destination and its
+  key reach the enclave alone, and the trainer may only stop the stream),
+  and, for a signed-in session, the session record (README,
   "Session records"): the keypoints, motion descriptors, audio
   measurements and the analysis's rows, written to the one bucket the
   attested environment names (`TEE_CAPTURE_BUCKET`) under the prefix the

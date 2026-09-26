@@ -105,6 +105,9 @@ def route(path: str) -> Route | None:
     ('whip', None|secret)              /ingest/whip[/<secret>]
     ('source', None)                   PUT/GET/DELETE /ingest/source
     ('view', None)                     PUT/GET /ingest/view
+    ('egress', None)                   PUT/GET/DELETE /ingest/egress  (the live stream, the phone's)
+    ('egress-stop', None)              POST /egress/stop              (the trainer's)
+    ('hud', None)                      PUT /overlay/hud               (the trainer's HUD card state)
     """
     if path == "/overlay/status":
         return Route("status", None)
@@ -116,6 +119,12 @@ def route(path: str) -> Route | None:
         return Route("source", None)
     if path == "/ingest/view":
         return Route("view", None)
+    if path == "/ingest/egress":
+        return Route("egress", None)
+    if path == "/egress/stop":
+        return Route("egress-stop", None)
+    if path == "/overlay/hud":
+        return Route("hud", None)
     if path.startswith("/ingest/whip/") and WHEP_SECRET.match(path[len("/ingest/whip/"):]):
         return Route("whip", path[len("/ingest/whip/"):])
     for relay_path in OVERLAY_PATHS:
@@ -351,10 +360,12 @@ class RelayProxy:
             return 503, body
         return 200, body
 
-    def ingest_status(self, external=None) -> tuple[int, dict]:
+    def ingest_status(self, external=None, egress=None) -> tuple[int, dict]:
         """(status code, body) for GET /ingest/status: the relay's view of
         the session's camera, flattened so `ready` and `tracks` sit at the
-        top, plus which camera that is.
+        top, plus which camera that is, plus the live stream (`egress`:
+        egress.Egress.status, on a slot that has one) so the trainer knows
+        a stream is on and to which host, never where exactly.
 
         The camera is the phone's (`cam`) unless `external` (an
         external_source.ExternalSource) is active, in which case the top
@@ -396,4 +407,6 @@ class RelayProxy:
         body["phone"] = {"ready": bool(phone.get("ready")),
                          "tracks": list(phone.get("tracks") or [])}
         body["whip"] = "/ingest/whip"
+        if egress is not None:
+            body["egress"] = egress.status()
         return 200, body

@@ -204,7 +204,10 @@ running between sessions.
   on the VM's own service account, which starting a VM that runs as one
   requires. It holds no other permission in this project. During the boot
   the phone runs an on-device skeleton. There is no Cloud Run fallback:
-  video is processed in the attested enclave or on the phone, nowhere else.
+  video is processed in the attested enclave or on the phone, nowhere else
+  (a user who opens a live stream sends the enclave's annotated view on to
+  the destination they named; the processing is still the enclave's, README
+  "The live stream").
 - **Stop, part one: the enclave decides.** The producer's idle watchdog
   exits 0 when no lease is held and nothing is working for `TEE_IDLE_EXIT_S`
   (60 s; a page refresh reconnects inside that), or `TEE_BOOT_IDLE_S`

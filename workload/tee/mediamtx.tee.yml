@@ -12,7 +12,11 @@
 #     the entrypoint as MTX_WEBRTCADDITIONALHOSTS), not the container's
 #     interfaces and not a TURN allocation - the phone's SRTP goes to the
 #     enclave and nowhere else. The phone may still use coturn on its side
-#     when its own NAT needs it; the relay only sees ciphertext arrive;
+#     when its own NAT needs it; the relay only sees ciphertext arrive.
+#     (The view leaves the relay over loopback only: WHEP to the phone, and
+#     the producer's own ffmpeg when the user opens a live stream, which
+#     reads `overlay` back over RTSP and pushes it out itself; the relay
+#     publishes nothing to the internet: rtmp stays off);
 #   - RTSPS in is gone: the camera arrives over WHIP, the producer reads it
 #     back over loopback RTSP, nothing else connects to the relay. RTSPS
 #     out is the one exception: when the phone names a fixed camera

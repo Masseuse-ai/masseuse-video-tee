@@ -74,7 +74,9 @@ from audio_stage import AudioSource, AudioStage  # noqa: E402
 from cadence import CadencePicker, FreshPicker  # noqa: E402
 from camlink_gateway import (CamlinkGateway, GatewayError,  # noqa: E402
                              parse_expectation)
+from egress import Egress, EgressError  # noqa: E402
 from external_source import ExternalSource, SourceError  # noqa: E402
+from hud_card import HudCard  # noqa: E402
 from live_pose import GpuPose, SideloadPose, prefetch_model_store  # noqa: E402
 from motion import FRAMES_PER_POSE, DescriptorWorker, RowAssembler  # noqa: E402
 from overlay import build_renderer, parse_renditions  # noqa: E402
@@ -1959,13 +1961,14 @@ def external_view_args(session_args, external) -> bool:
 
 def build_server(args, telemetry: Telemetry,
                  tee: TeeMode | None = None,
-                 external: ExternalSource | None = None) -> ThreadingHTTPServer:
+                 external: ExternalSource | None = None,
+                 egress: Egress | None = None) -> ThreadingHTTPServer:
     """The session server, bound and ready for serve_forever. `tee` (built
     by serve() from the environment, or handed in by a test) switches the
     handler into TEE mode; its attestation loop is the caller's to start.
     `external` is the slot's external camera (built here in TEE mode when
     the relay is configured; a test hands in one with its network calls
-    replaced)."""
+    replaced); `egress` the slot's live stream (egress.py), the same way."""
     busy = threading.Lock()
     # The session behind the busy lock, for /stop; set and cleared by the
     # /produce handler while it holds the lock.
@@ -2062,6 +2065,22 @@ def build_server(args, telemetry: Telemetry,
     if tee is None:
         external = None
     gateway = external.gateway if external is not None else None
+    # The live stream (egress.py): TEE only, for the same reason as the
+    # external camera - its destination is a credential (the stream key
+    # rides in it) that must reach the enclave and nothing in front of it.
+    # It reads the view back from the relay's overlay path and, when asked,
+    # the microphone from the camera path; the HUD card (hud_card.py) is
+    # what the trainer's PUT /overlay/hud fills.
+    if egress is None and tee is not None and relay is not None:
+        egress = Egress(
+            getattr(args, "overlay_publish", "") or f"{rtsp_base}/overlay",
+            f"{rtsp_base}/cam",
+            own_ip=os.environ.get("TEE_PUBLIC_IP", ""),
+            hud_card=HudCard(),
+            encoder="nvenc" if getattr(args, "overlay_encoder", "x264") == "nvenc" else "x264",
+            telemetry=telemetry)
+    if tee is None:
+        egress = None
 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *_):
@@ -2176,6 +2195,10 @@ def build_server(args, telemetry: Telemetry,
                 if (external is not None and external.active
                         and external.session_id != answer["sessionId"]):
                     external.clear("lease for another session")
+                # Nor the last one's live stream: a stream is one session's.
+                if (egress is not None and egress.active
+                        and egress.session_id != answer["sessionId"]):
+                    egress.clear("lease for another session")
                 # Nor the last one's home connector: an expectation posted
                 # for another session is dropped with it.
                 if (gateway is not None and gateway.session_id
@@ -2405,6 +2428,113 @@ def build_server(args, telemetry: Telemetry,
                              "view": (snapshot or {}).get("view")},
                        cors + [("Cache-Control", "no-store")])
 
+        # -- the live stream --------------------------------------------------
+
+        def _egress(self) -> None:
+            """/ingest/egress: the live stream the phone opens (egress.py).
+            PUT {url, audio?, hud?} starts it to the rtmps:// destination
+            named, GET says whether one is on (and to which host, never
+            more), DELETE stops it. Gated by the phone's capability like
+            WHIP: the destination carries the stream key, so it goes to
+            the enclave and nowhere in front of it, and nothing about it
+            beyond the host is logged.
+            """
+            cors = self._cors()
+            if self.command == "OPTIONS":
+                self.send_response(204)
+                for name, value in cors:
+                    self.send_header(name, value)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            if self.command not in ("PUT", "GET", "DELETE"):
+                self._json(405, {"error": "method not allowed"},
+                           cors + [("Allow", "OPTIONS, PUT, GET, DELETE")])
+                return
+            session_id = self._tee_signalling_gate("egress")
+            if session_id is None:
+                return
+            if self.command == "GET":
+                self._json(200, egress.status(), cors + [("Cache-Control", "no-store")])
+                return
+            if self.command == "DELETE":
+                had = egress.clear("the phone asked")
+                body = dict(egress.status())
+                body["status"] = "removed" if had else "none"
+                self._json(200, body, cors)
+                return
+            length = int(self.headers.get("Content-Length") or 0)
+            if length > LEASE_BODY_CAP:
+                self._json(413, {"status": "failed", "reason": "bad-url",
+                                 "error": "body too large"}, cors)
+                return
+            try:
+                body = json.loads(self.rfile.read(length) or b"{}")
+                if not isinstance(body, dict):
+                    raise ValueError("not an object")
+            except ValueError as error:
+                self._json(400, {"status": "failed", "reason": "bad-url",
+                                 "error": f"invalid JSON: {error}"}, cors)
+                return
+            try:
+                answer = egress.connect(body, session_id)
+            except EgressError as error:
+                telemetry.count("egressRefused")
+                print(f"egress: not started ({error.reason}) for session "
+                      f"{session_id}", flush=True)
+                self._json(error.status, error.body(), cors)
+                return
+            except Exception as error:  # noqa: BLE001 - never the destination itself
+                telemetry.count("egressFailed")
+                print(f"egress: failed ({type(error).__name__}) for session "
+                      f"{session_id}", flush=True)
+                self._json(500, {"status": "failed", "reason": "internal",
+                                 "error": "the slot could not start the stream"},
+                           cors)
+                return
+            self._json(200, answer, cors)
+
+        def _egress_stop(self) -> None:
+            """POST /egress/stop from the trainer: cut the live stream (its
+            kill switch for the fans' layer). The trainer may stop a
+            stream, never start one or name where it goes."""
+            if self.command != "POST":
+                self._json(405, {"error": "method not allowed"}, [("Allow", "POST")])
+                return
+            if not self._control_gate():
+                return
+            length = int(self.headers.get("Content-Length") or 0)
+            if 0 < length <= LEASE_BODY_CAP:
+                self.rfile.read(length)
+            had = egress.clear("the trainer asked")
+            if had:
+                telemetry.count("egressStoppedByTrainer")
+            self._json(200, {"status": "stopped" if had else "none", **egress.status()})
+
+        def _hud(self) -> None:
+            """PUT /overlay/hud from the trainer: the HUD card's state for
+            the live stream (hud_card.py), drawn into the stream and
+            nowhere else. The words are the trainer's; the card bounds
+            them and draws what it is given."""
+            if self.command != "PUT":
+                self._json(405, {"error": "method not allowed"}, [("Allow", "PUT")])
+                return
+            if not self._control_gate():
+                return
+            length = int(self.headers.get("Content-Length") or 0)
+            if length > LEASE_BODY_CAP:
+                self._json(413, {"error": "body too large"})
+                return
+            try:
+                body = json.loads(self.rfile.read(length) or b"{}")
+                state = egress.set_hud_state(body)
+            except ValueError as error:
+                self._json(400, {"error": f"invalid body: {error}"})
+                return
+            telemetry.count("hudCardUpdates")
+            self._json(200, {"status": "ok", "tiles": len(state["tiles"]),
+                             "egress": egress.status()["active"]})
+
         # -- the relay routes ------------------------------------------------
 
         def _overlay(self) -> bool:
@@ -2448,6 +2578,17 @@ def build_server(args, telemetry: Telemetry,
                 else:
                     self._view()
                 return True
+            if kind in ("egress", "egress-stop", "hud"):
+                if egress is None:
+                    self._json(404, {"error": "a live stream needs a "
+                                              "Confidential Space slot"})
+                elif kind == "egress":
+                    self._egress()
+                elif kind == "egress-stop":
+                    self._egress_stop()
+                else:
+                    self._hud()
+                return True
             if kind in ("status", "ingest-status"):
                 if self.command != "GET":
                     self.send_response(405)
@@ -2457,7 +2598,7 @@ def build_server(args, telemetry: Telemetry,
                 if not self._control_gate():
                     return True
                 code, body = (relay.status(current["session"])
-                              if kind == "status" else relay.ingest_status(external))
+                              if kind == "status" else relay.ingest_status(external, egress))
                 self._json(code, body)
                 return True
             leg = "whip" if kind == "whip" else "whep"
@@ -2628,6 +2769,8 @@ def build_server(args, telemetry: Telemetry,
                     records.close_in_background("teardown")
                 if external is not None:
                     external.clear("teardown")
+                if egress is not None:
+                    egress.clear("teardown")
                 if gateway is not None:
                     # The slot is ending: the connector is dropped so it is
                     # free for the next one (a no-op if the camera's clear
@@ -2663,6 +2806,8 @@ def build_server(args, telemetry: Telemetry,
                                        if overlay is not None else None)
                 views = getattr(session, "views", None) if session else None
                 snapshot["views"] = views() if callable(views) else None
+                # The live stream: on or off, its host, its restarts; never the address.
+                snapshot["egress"] = egress.status() if egress is not None else None
                 # The lease's record, open between runs or not: its prefix
                 # is the trainer's opaque ids, never a person.
                 snapshot["records"] = [
@@ -2849,6 +2994,8 @@ def build_server(args, telemetry: Telemetry,
     # and /statz.
     server.external = external  # type: ignore[attr-defined]
     server.gateway = gateway  # type: ignore[attr-defined]
+    # TEE: the live stream, for tests and /statz.
+    server.egress = egress  # type: ignore[attr-defined]
     # The GPU boot, for serve() to start ahead of the first /warmup.
     server.start_warmup = start_warmup  # type: ignore[attr-defined]
     # The slot's open session records, for serve()'s SIGTERM flush, tests
