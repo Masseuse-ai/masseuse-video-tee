@@ -306,7 +306,15 @@ beside the fields from before, which are `null` while the stance is
 standing, seated or wariza (no lying reference applies) and computed as
 before otherwise. The word is judged from one camera's 21 body keypoints in
 the body's own units and against each landmark's rest line, so the camera
-may be anywhere around him.
+may be anywhere around him. From 2026.09.25-3 (`stance/v3`) the word is
+`unknown` rather than a guess while the hips' rest line is not yet
+credible and the row's shape fits both a lying posture and a kneeling one
+(the same keypoints from a camera behind him), and a hips' line that
+would put the hips' rest above the shoulders' rest is not used until a
+lying stretch corrects it; the `stance` constants name the thresholds
+(`rest.hipsAboveShouldersMaxBu`, `unresolved`, `kneeChest.rearKneeFlexDeg`).
+The fields are the same; only the word's timing at the start of a run and
+its reading of a fold seen from below the hips change.
 From 2026.09.24-2 (`face/v5`) the reading's `face` object also carries
 `hazard`: the analysis's probability that the response peaks within 30 and
 within 60 seconds (`p30`, `p60`, their logits, and `featuresPresent`, the
