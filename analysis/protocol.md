@@ -271,6 +271,20 @@ read by the newest face row's clock, not the reading's: a face row's
 `bodyAtS` leads the body clock the readings are posted on by several
 seconds (2026.09.22-2; 2026.09.22-1 read them by the reading's clock and
 posted `regions` as `null`).
+`stance`, when present (a bundle from 2026.09.24-1 on), is the same for the
+posture word the readings carry: the names (`prone`, `knee_chest`, `wariza`,
+`seated`, `standing`, `supine`, `side`, `unknown`), the body unit, the vote
+and hold windows and the thresholds each word is judged by, kept in
+`hello.json` the same way. From that bundle the reading's `positioning`
+object carries `stance`, `stanceConfidence` (the two-second vote's share
+behind the word) and `stanceSinceS`, with `orientation` derived from the
+stance for readers from before, and its `posture` object carries `stance`
+and `hipRiseBu` (the hips' height above their rest line, in body units)
+beside the fields from before, which are `null` while the stance is
+standing, seated or wariza (no lying reference applies) and computed as
+before otherwise. The word is judged from one camera's 21 body keypoints in
+the body's own units and against each landmark's rest line, so the camera
+may be anywhere around him.
 
 ### `post`, at the post cadence
 
