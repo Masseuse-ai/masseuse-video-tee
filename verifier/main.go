@@ -80,13 +80,12 @@ const (
 	expectedGPU     = "GCP_NVIDIA_H100"
 	dbgstatProd     = "disabled-since-boot"
 	dbgstatDebug    = "enabled"
-	// Where the enclave image running today was built and published
-	// (VERIFY.md, "Release history"): the source moved to
-	// github.com/Masseuse-ai/masseuse-video-tee, and these defaults follow
-	// the first image released from there; -source-uri and -image-repo name
-	// the other in the meantime.
-	defaultSourceURI = "github.com/FemLed/masseuse-video-tee"
-	defaultImageRepo = "ghcr.io/femled/masseuse-video-tee"
+	// Where the enclave image is built and published: this repository and
+	// its registry, from v0.12.4 on (VERIFY.md, "Release history"). For an
+	// image released up to v0.12.3, built at the project's previous home,
+	// -source-uri and -image-repo name that home.
+	defaultSourceURI = "github.com/Masseuse-ai/masseuse-video-tee"
+	defaultImageRepo = "ghcr.io/masseuse-ai/masseuse-video-tee"
 )
 
 type config struct {
