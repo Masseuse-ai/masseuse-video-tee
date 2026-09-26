@@ -245,6 +245,17 @@ class Poster:
     cannot spare. `post` hands the body over and returns; a body still
     unsent when the next arrives is replaced, since the consumer wants the
     newest reading, not a backlog of stale ones.
+
+    The body goes out compact (no separators' whitespace): a reading is a
+    few kilobytes and grows with the analysis, and the receiving route has
+    a body limit. How the far end answers is counted by kind, so a route
+    refusing the readings is told apart from a network that drops them:
+    `postsOk`; `postsRefused4xx` for a refusal (a body it would not read, a
+    caller it would not take, no session listening); `postsFailed5xx` for
+    the far end failing; `postsFailed` for that and for a send that never
+    got an answer (the transport). The first refusal of a session is
+    printed once with its status and the body's size, since a route
+    refusing every reading otherwise leaves no trace but the counter.
     """
 
     def __init__(self, url: str, telemetry=None, timeout_s: float = 2.0,
@@ -262,6 +273,7 @@ class Poster:
         self._state = threading.Condition()
         self._pending: dict | None = None
         self._closed = False
+        self._refusal_printed = False
         self._sender = threading.Thread(target=self._send_loop, daemon=True)
         self._sender.start()
 
@@ -306,14 +318,33 @@ class Poster:
             self._send(body)
 
     def _send(self, body: dict) -> None:
+        data = json.dumps(body, separators=(",", ":")).encode()
         try:
             request = urllib.request.Request(
-                self.url, data=json.dumps(body).encode(),
-                headers=self._headers())
+                self.url, data=data, headers=self._headers())
             with urllib.request.urlopen(request, timeout=self.timeout_s):
                 pass
             if self.telemetry:
                 self.telemetry.count("postsOk")
+        except urllib.error.HTTPError as error:
+            # An answer, and a refusal: the far end read the request and
+            # would not take it (4xx), or failed on it (5xx).
+            status = int(error.code)
+            if 400 <= status < 500:
+                if self.telemetry:
+                    self.telemetry.count("postsRefused4xx")
+                if not self._refusal_printed:
+                    self._refusal_printed = True
+                    print(f"poster: the readings' route refused a reading: "
+                          f"HTTP {status}, body {len(data)} bytes; further "
+                          f"refusals are counted (postsRefused4xx)",
+                          flush=True)
+            else:
+                if self.telemetry:
+                    self.telemetry.count("postsFailed")
+                    if status >= 500:
+                        self.telemetry.count("postsFailed5xx")
         except (urllib.error.URLError, OSError, ValueError):
+            # No answer: the transport.
             if self.telemetry:
                 self.telemetry.count("postsFailed")

@@ -90,6 +90,96 @@ def test_a_dead_sink_is_counted_never_raised():
     counters = telemetry.snapshot()["counters"]
     assert counters["postsFailed"] == 1
     assert counters["postsUnauthenticated"] == 1
+    assert "postsRefused4xx" not in counters, "no answer is not a refusal"
+
+
+def answering_server(status: int):
+    """A route that answers every POST with one status and keeps the raw bodies."""
+    raw = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *_):
+            return
+
+        def do_POST(self):
+            length = int(self.headers.get("Content-Length", 0))
+            raw.append(self.rfile.read(length))
+            self.send_response(status)
+            self.end_headers()
+            self.wfile.write(b'{"error":"refused"}')
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return server, raw
+
+
+def settled(telemetry: Telemetry, name: str, value: int) -> bool:
+    for _ in range(300):
+        if telemetry.snapshot()["counters"].get(name) == value:
+            return True
+        time.sleep(0.01)
+    return False
+
+
+def test_a_route_that_refuses_is_counted_apart_from_the_transport_and_said_once(capsys):
+    """A 4xx is the far end reading the request and refusing it: counted as
+    a refusal, not a failure, and the first is printed with its status and
+    the body's size, since a route refusing every reading (a body limit
+    outgrown) otherwise leaves nothing but a counter."""
+    server, raw = answering_server(400)
+    telemetry = Telemetry()
+    poster = Poster(f"http://127.0.0.1:{server.server_address[1]}/api/pose-signals/readings",
+                    telemetry, token_supplier=lambda: "t")
+    poster.post({"atS": 1.0, "posture": {"hipElevationPx": 0.4}})
+    assert settled(telemetry, "postsRefused4xx", 1)
+    poster.post({"atS": 2.0, "posture": {"hipElevationPx": 0.5}})
+    assert settled(telemetry, "postsRefused4xx", 2)
+    poster.close(timeout_s=5)
+    server.shutdown()
+
+    counters = telemetry.snapshot()["counters"]
+    assert counters["postsRefused4xx"] == 2
+    assert "postsFailed" not in counters
+    assert "postsOk" not in counters
+    out = capsys.readouterr().out
+    lines = [line for line in out.splitlines() if line.startswith("poster:")]
+    assert len(lines) == 1, "the first refusal alone is printed"
+    assert "HTTP 400" in lines[0]
+    assert f"body {len(raw[0])} bytes" in lines[0]
+
+
+def test_a_failing_route_is_a_failure_with_its_class():
+    server, _ = answering_server(503)
+    telemetry = Telemetry()
+    poster = Poster(f"http://127.0.0.1:{server.server_address[1]}/x", telemetry,
+                    token_supplier=lambda: "t")
+    poster.post({"atS": 1.0})
+    assert settled(telemetry, "postsFailed", 1)
+    poster.close(timeout_s=5)
+    server.shutdown()
+    counters = telemetry.snapshot()["counters"]
+    assert counters["postsFailed"] == 1
+    assert counters["postsFailed5xx"] == 1
+    assert "postsRefused4xx" not in counters
+
+
+def test_the_body_goes_out_compact():
+    """No whitespace after the separators: the receiving route has a body
+    limit, and a reading of a few kilobytes is a tenth smaller this way."""
+    server, raw = answering_server(200)
+    telemetry = Telemetry()
+    poster = Poster(f"http://127.0.0.1:{server.server_address[1]}/x", telemetry,
+                    token_supplier=lambda: "t")
+    body = {"atS": 1.5, "recentOnsetsS": [0.5, 1.0], "posture": {"hipElevationPx": 0.4, "instability": {"score": 0.0}},
+            "vocal": {"topTags": ["Breathing 0.079", "Sigh 0.070"]}}
+    poster.post(body)
+    assert settled(telemetry, "postsOk", 1)
+    poster.close(timeout_s=5)
+    server.shutdown()
+    assert json.loads(raw[0]) == body
+    assert b", " not in raw[0].replace(b"Breathing 0.079", b"").replace(b"Sigh 0.070", b"")
+    assert b": " not in raw[0]
+    assert len(raw[0]) == len(json.dumps(body, separators=(",", ":")).encode())
 
 
 def test_the_poster_never_blocks_the_pipeline_and_keeps_the_newest():
