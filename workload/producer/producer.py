@@ -108,6 +108,12 @@ PENDING_CAP = 256
 # Decided frames waiting for the descriptors thread; ~8 MB of 4K luma each.
 DESCRIPTORS_QUEUE_DEPTH = 128
 STALL_RESTART_S = 10.0
+# A video track that is announced but carries no frame yet - the connector
+# drops video while its tunnel catches up and resumes at the next keyframe,
+# within seconds - is probed again this often, and given up on as a track
+# without frames after STARVED_TRACK_MAX_S in that state.
+STARVED_RETRY_S = 1.0
+STARVED_TRACK_MAX_S = 30.0
 LOG_EVERY_S = 15.0
 # Summary keys the producer owns; the analysis summary never overwrites them.
 RESERVED_SUMMARY_KEYS = frozenset({
@@ -125,12 +131,20 @@ def pipe_size(probed: tuple[int, int],
     becomes 720x1280, a 1080x1920 phone stays 1080x1920.
     """
     width, height = probed
+    if width <= 0 or height <= 0:
+        raise ValueError(f"probe without a geometry: {width}x{height}")
     scale = max(1.0, long_side / max(width, height))
 
     def even(value: float) -> int:
         return max(2, int(round(value * scale / 2)) * 2)
 
     return even(width), even(height)
+
+
+class StarvedTrack(RuntimeError):
+    """A video track the relay announces but no frame of which reached the
+    probe: the sender is between keyframes with its video gated, or has
+    not started sending it yet."""
 
 
 class Decoder:
@@ -155,6 +169,12 @@ class Decoder:
     ended, the way a file ending is, and the session writes its summary.
     0 keeps reconnecting forever, the standing behaviour for a persistent
     RTSP source.
+
+    A track that is there but starved - announced, no frame of it within
+    ffprobe's window, which is the connector dropping video while its
+    tunnel catches up - is waited for, for at most `STARVED_TRACK_MAX_S`:
+    the connector resumes at its next keyframe, and a probe of 0x0 is not a
+    geometry to pin the pipe to.
     """
 
     def __init__(self, url: str, telemetry: Telemetry,
@@ -200,7 +220,17 @@ class Decoder:
             # it never sent any. Nothing to decode; said plainly.
             raise RuntimeError(f"no video track on {self.url}")
         stream = streams[0]
-        return int(stream["width"]), int(stream["height"])
+        width = int(stream.get("width") or 0)
+        height = int(stream.get("height") or 0)
+        if width <= 0 or height <= 0:
+            # The track is there (the relay's description names the codec)
+            # but ffprobe saw no frame of it within its analysis window:
+            # the connector is dropping video while its tunnel catches up.
+            # No geometry to pin the pipe to yet; waited for, not divided
+            # by (2026-09-10: every run of a session ended on a
+            # ZeroDivisionError in pipe_size while the gate was shut).
+            raise StarvedTrack(f"video track on {self.url} carries no frames yet")
+        return width, height
 
     def _input_flags(self) -> list[str]:
         if self.url.startswith(("rtsp://", "rtsps://")):
@@ -232,10 +262,43 @@ class Decoder:
     def _spawn(self) -> None:
         self.proc = subprocess.Popen(self._argv(), stdout=subprocess.PIPE)
 
+    def _stopped(self) -> bool:
+        return self.stopping is not None and self.stopping.is_set()
+
+    def _await_probe(self) -> tuple[int, int] | None:
+        """The probe, repeated while the track is starved of frames, for at
+        most STARVED_TRACK_MAX_S; None once the session stopped while
+        waiting."""
+        starved_since: float | None = None
+        while True:
+            if self._stopped():
+                return None
+            try:
+                return self._probe()
+            except StarvedTrack as error:
+                now = self.clock()
+                if starved_since is None:
+                    starved_since = now
+                    print(f"decoder: {self.url} has a video track but no "
+                          f"frames yet; waiting for its next keyframe",
+                          flush=True)
+                elif now - starved_since >= STARVED_TRACK_MAX_S:
+                    raise RuntimeError(
+                        f"{error} after {STARVED_TRACK_MAX_S:g} s") from None
+                self.telemetry.count("starvedProbes")
+            deadline = self.clock() + STARVED_RETRY_S
+            while self.clock() < deadline:
+                if self._stopped():
+                    return None
+                self.sleep(min(0.25, max(0.0, deadline - self.clock())))
+
     def frames(self):
         """Yields (index, at_s, yuv) forever; index survives reconnects."""
         if self.size is None:
-            self.probed = self._probe()
+            probed = self._await_probe()
+            if probed is None:
+                return
+            self.probed = probed
             self.size = pipe_size(self.probed) if self.network else self.probed
             print(f"decoder: {self.url} probed {self.probed[0]}x{self.probed[1]}, "
                   f"decoding at {self.size[0]}x{self.size[1]}", flush=True)

@@ -243,3 +243,109 @@ def test_probe_names_a_stream_without_a_video_track(monkeypatch):
                         lambda *a, **k: Done(json.dumps({"streams": [{"width": 960, "height": 540}]})))
     assert decoder._probe() == (960, 540)
     assert subprocess is producer_module.subprocess
+
+
+# -- a video track without frames yet ----------------------------------------
+#
+# The connector drops whole video frames while its tunnel is behind and
+# resumes at the next keyframe; ffprobe against the relay then reports the
+# track (the description names the codec) at 0x0. That is not a geometry
+# to pin the pipe to - pipe_size divided by it and every production run of
+# 2026-09-10's session ended on a ZeroDivisionError - but a wait.
+
+
+def test_pipe_size_refuses_a_probe_without_geometry():
+    import pytest
+
+    with pytest.raises(ValueError, match="probe without a geometry: 0x0"):
+        pipe_size((0, 0))
+
+
+def _probe_result(monkeypatch, *payloads):
+    """subprocess.run replaced by successive ffprobe outputs, the last one
+    repeating."""
+    import json
+
+    import producer as producer_module
+
+    class Done:
+        def __init__(self, stdout):
+            self.stdout = stdout
+            self.returncode = 0
+
+    queue = [json.dumps(payload) for payload in payloads]
+
+    def run(*_a, **_k):
+        return Done(queue.pop(0) if len(queue) > 1 else queue[0])
+
+    monkeypatch.setattr(producer_module.subprocess, "run", run)
+
+
+def test_probe_names_a_starved_track_rather_than_dividing_by_zero(monkeypatch):
+    import pytest
+
+    from producer import StarvedTrack
+
+    _probe_result(monkeypatch, {"streams": [{"width": 0, "height": 0}]})
+    decoder = Decoder("rtsp://127.0.0.1:8554/ext", Telemetry())
+    with pytest.raises(StarvedTrack, match="carries no frames yet"):
+        decoder._probe()
+
+    _probe_result(monkeypatch, {"streams": [{"codec_type": "video"}]})  # no size keys
+    with pytest.raises(StarvedTrack):
+        decoder._probe()
+
+
+def test_a_starved_track_is_waited_for_then_decoded(monkeypatch):
+    """Two probes of 0x0, then the geometry: the decoder waits a second
+    between them and pins the pipe to what the third one said."""
+    from producer import STARVED_RETRY_S
+
+    _probe_result(monkeypatch,
+                  {"streams": [{"width": 0, "height": 0}]},
+                  {"streams": [{"width": 0, "height": 0}]},
+                  {"streams": [{"width": 1280, "height": 720}]})
+    clock = _Clock()
+    telemetry = Telemetry()
+    decoder = Decoder("rtsp://127.0.0.1:8554/ext", telemetry,
+                      clock=clock, sleep=clock.sleep)
+    start = clock.now
+    assert decoder._await_probe() == (1280, 720)
+    assert clock.now - start == 2 * STARVED_RETRY_S
+    assert telemetry.snapshot()["counters"]["starvedProbes"] == 2
+
+
+def test_a_starved_track_is_given_up_on_after_the_bound(monkeypatch):
+    import pytest
+
+    from producer import STARVED_TRACK_MAX_S
+
+    _probe_result(monkeypatch, {"streams": [{"width": 0, "height": 0}]})
+    clock = _Clock()
+    decoder = Decoder("rtsp://127.0.0.1:8554/ext", Telemetry(),
+                      clock=clock, sleep=clock.sleep)
+    start = clock.now
+    with pytest.raises(RuntimeError, match="carries no frames yet after 30 s"):
+        decoder._await_probe()
+    assert STARVED_TRACK_MAX_S <= clock.now - start < STARVED_TRACK_MAX_S + 2
+
+
+def test_a_stop_while_starved_lands(monkeypatch):
+    """A /stop during the wait ends frames() quietly, as one during a
+    reconnect does."""
+    _probe_result(monkeypatch, {"streams": [{"width": 0, "height": 0}]})
+    clock = _Clock()
+    stopping = threading.Event()
+    decoder = Decoder("rtsp://127.0.0.1:8554/ext", Telemetry(),
+                      clock=clock, sleep=clock.sleep, stopping=stopping)
+    start = clock.now
+    original_sleep = clock.sleep
+
+    def sleep(s):
+        original_sleep(s)
+        if clock.now - start > 5:
+            stopping.set()
+
+    decoder.sleep = sleep
+    assert list(decoder.frames()) == []
+    assert 5 < clock.now - start < 30
