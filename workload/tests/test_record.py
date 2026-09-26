@@ -371,7 +371,11 @@ def test_the_record_routes_every_stream_to_parts_under_the_prefix(tmp_path):
 
     class Source:
         def snapshot(self):
-            return {"counters": {"framesIn": 3}, "gauges": {"streamS": 0.1}, "stages": {}}
+            # The shape telemetry.Telemetry.snapshot() has: the timings are
+            # `stagesMs`, per stage its percentiles and count.
+            return {"atWall": 1.0, "uptimeS": 2.0, "bootMs": {},
+                    "counters": {"framesIn": 3}, "gauges": {"streamS": 0.1},
+                    "stagesMs": {"audioPitch": {"p50": 4.2, "p95": 6.1, "n": 12}}}
 
     record.telemetry_from(Source())
     wait_for(lambda: record.streams["telemetry"].snapshot()["rows"] >= 1, timeout_s=3.0)
@@ -413,7 +417,13 @@ def test_the_record_routes_every_stream_to_parts_under_the_prefix(tmp_path):
         {"wallS": T0, "frame": 1, "atS": 0.033, "keypoints": {}, "fast": None}]
     assert rows_of(gcs, f"{PREFIX}/segments/{part}.jsonl.gz")[0]["error"] == "no-audio"
     assert rows_of(gcs, f"{PREFIX}/vocal/{part}.jsonl.gz")[0]["verdict"] == "vocal"
-    assert rows_of(gcs, f"{PREFIX}/telemetry/{part}.jsonl.gz")[0]["counters"] == {"framesIn": 3}
+    telemetry_row = rows_of(gcs, f"{PREFIX}/telemetry/{part}.jsonl.gz")[0]
+    assert telemetry_row["counters"] == {"framesIn": 3}
+    assert telemetry_row["gauges"] == {"streamS": 0.1}
+    # The stage timings under the snapshot's own name; a row has exactly
+    # the three blocks and the wall clock, nothing of the summary's.
+    assert telemetry_row["stagesMs"] == {"audioPitch": {"p50": 4.2, "p95": 6.1, "n": 12}}
+    assert set(telemetry_row) == {"wallS", "counters", "gauges", "stagesMs"}
     poses = read_parquet(gcs, f"{PREFIX}/poses/{part}.parquet")
     assert poses["frame"] == [0, 3] and poses["frameW"] == [1280, None]
     assert poses["dropped"] == [False, True] and len(poses["x"][0]) == 308 and poses["x"][1] is None

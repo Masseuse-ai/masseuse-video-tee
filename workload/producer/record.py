@@ -786,10 +786,16 @@ class Record:
                 last_telemetry = now
                 try:
                     snapshot = source.snapshot()
+                    # The snapshot's own names (telemetry.Telemetry.snapshot):
+                    # the per-stage timings are `stagesMs`, as in the run
+                    # summary. Until 2026-09-17 this read `stages`, a key the
+                    # snapshot never had, so every telemetry row of every
+                    # record carried `stages: null` and the only timings a
+                    # session kept were the summary's.
                     self.append("telemetry", {
                         "counters": snapshot.get("counters"),
                         "gauges": snapshot.get("gauges"),
-                        "stages": snapshot.get("stages"),
+                        "stagesMs": snapshot.get("stagesMs"),
                     })
                 except Exception as error:  # noqa: BLE001 - said, survived
                     self._say(f"record: telemetry snapshot failed: {error!r}")

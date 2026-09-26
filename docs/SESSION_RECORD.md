@@ -114,7 +114,7 @@ One JSON object per line, `wallS` first. The rows are the messages of
 | `events/` | paired event | `fromS`, `toS` |
 | `payloads/` | analysis payload | the payload's own fields |
 | `posts/` | reading posted to the trainer | the reading's own fields (`atS`, `modelVersion`, …) |
-| `telemetry/` | second | `counters`, `gauges`, `stages` of the producer's telemetry snapshot |
+| `telemetry/` | second | `counters`, `gauges`, `stagesMs` of the producer's telemetry snapshot (the stage timings as the run summary names them, per stage `p50`, `p95` and `n` in milliseconds; `stages: null` in every record before v0.8.3, which read a key the snapshot never had) |
 | `log/` | line either process said about a failure | `source` (`producer` or `analysis`), `text` (a send that failed, a reconnect, a handler that could not take a message; at most 10 lines a second, `droppedBefore` counting what the cap held back). Empty in a session that went well; the enclave's stdout is not shipped, so this is where such a line is read afterwards |
 
 ## `hello.json`
