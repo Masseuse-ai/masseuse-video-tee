@@ -1,0 +1,140 @@
+# The Confidential Space slot image: the base image plus the three binaries
+# that would otherwise be sidecars, the analysis lock, and one entrypoint.
+#
+# Confidential Space runs exactly one container per VM and attests its
+# digest, so the relay (MediaMTX), the TLS terminator (Caddy) and the
+# home-camera tunnel gateway (masseuse-camlink-gateway) ride inside this
+# image rather than beside it. MediaMTX and Caddy are copied from their
+# pinned upstream images (the digests are the multi-arch indexes on Docker
+# Hub); the gateway is reproduced from its signed release (see its stage
+# below). BASE is the image built by workload/Dockerfile from the same
+# tree, so the enclave runs the very code the tests here exercise. It is
+# built on ubuntu:24.04 with the torch set in five layers and every layer
+# zstd (see the header of workload/Dockerfile): the launcher pulls the
+# whole image on every boot, and the pull was a third of the boot.
+#
+# Build: .github/workflows/release.yml on a tag (both images, the smoke
+# test, signatures, provenance, promotion into Artifact Registry); locally,
+# bash build.sh at the repository root runs the same two builds without a
+# push. The gateway tag and checksum come from camlink.lock.
+#
+# Launch policy (the labels Confidential Space reads):
+#   log_redirect=debugonly   stdout reaches Cloud Logging on the debug image
+#                            only; the production image cannot be made to log.
+#   allow_cmd_override=false the baked entrypoint is the workload; no tee-cmd.
+#   allow_env_override       exactly the deployment knobs the entrypoint reads;
+#                            none of them can change what code runs or where
+#                            the camera goes (the phone checks the image
+#                            digest and the origin it is talking to).
+#   allow_mount_destinations the two tmpfs mounts: weights and the boot's
+#                            ephemeral state (TLS key, capture rows).
+#                            Colon-separated (a comma makes one bad path and
+#                            the launcher refuses both mounts: first boot).
+#   hardened_monitoring=none / debug_monitoring=memoryonly
+#                            memory metrics on the debug image only (the
+#                            launcher's replacement for monitoring_memory_allow,
+#                            which it reports as deprecated). The values are
+#                            none | memoryonly | all (go-tpm-tools
+#                            launcher/spec/launch_policy.go); anything else
+#                            and the launcher refuses the image.
+# The base image (workload/Dockerfile), by digest in the release workflow;
+# the default is what bash build.sh tags locally.
+ARG BASE=masseuse-video-tee-base:local
+# bluenviron/mediamtx v1.20.1 (2026-08-18); the WebRTC keys in
+# mediamtx.tee.yml are this version's.
+FROM bluenviron/mediamtx@sha256:1b029d11049be75630e9b73bb0d5f47b08a7db4eaee89a80bf8f53bc40e56414 AS mediamtx
+# caddy 2.10.2 (Docker Hub library/caddy, multi-arch index).
+FROM caddy@sha256:c3d7ee5d2b11f9dc54f947f68a734c84e9c9666c92c88a7f30b9cba5da182adb AS caddy
+
+# masseuse-camlink-gateway: the enclave end of the home-camera tunnel
+# (github.com/FemLed/masseuse-camlink, Apache-2.0). Installed from the Go
+# module proxy at the pinned tag with the release's exact toolchain and
+# flags, then compared with the release's published checksum
+# (masseuse-video-tee/camlink.lock, from checksums.txt of that release): the
+# binary in this image is the signed, SLSA-attested release binary byte for
+# byte, and anyone can repeat this command to confirm it
+# (masseuse-camlink/VERIFY.md). golang:1.27.1-bookworm, multi-arch index.
+ARG CAMLINK_VERSION
+ARG CAMLINK_SHA256
+FROM golang@sha256:648f440f42a0958804efb24df176f806f9d353b41f1c0627f666428e40310f6b AS camlink
+ARG CAMLINK_VERSION
+ARG CAMLINK_SHA256
+ENV CGO_ENABLED=0 GOTOOLCHAIN=go1.27.1 GOFLAGS= \
+    GOPROXY=https://proxy.golang.org,direct GOSUMDB=sum.golang.org
+RUN test -n "${CAMLINK_VERSION}" && test -n "${CAMLINK_SHA256}" \
+ && GOOS=linux GOARCH=amd64 go install -trimpath -buildvcs=false -ldflags='-s -w -buildid=' \
+      "github.com/FemLed/masseuse-camlink/cmd/masseuse-camlink-gateway@${CAMLINK_VERSION}" \
+ && echo "${CAMLINK_SHA256}  /go/bin/masseuse-camlink-gateway" | sha256sum -c - \
+ && /go/bin/masseuse-camlink-gateway --version
+
+FROM ${BASE}
+
+COPY --from=mediamtx /mediamtx /usr/local/bin/mediamtx
+COPY --from=caddy /usr/bin/caddy /usr/local/bin/caddy
+COPY --from=camlink /go/bin/masseuse-camlink-gateway /usr/local/bin/masseuse-camlink-gateway
+
+# Ed25519 evidence signatures and the TLS leaf's SPKI (tee_mode.py). The
+# system trust store the ACME client and GCS need comes with the base
+# (workload/Dockerfile installs ca-certificates). zstd is for unpacking the
+# analysis bundle (tee_models.py, `tar --zstd`); setpriv (util-linux, in
+# the base) drops the analysis process to its own user.
+RUN apt-get update && apt-get install -y --no-install-recommends zstd \
+    && rm -rf /var/lib/apt/lists/* \
+    && /venv/bin/pip install --no-cache-dir cryptography
+
+# The analysis process's user (workload/tee/entrypoint.sh): no home, no
+# shell, no groups; it owns nothing in the image and reads the bundle
+# tee_models.py unpacks world-readable under /models/analysis.
+RUN groupadd --system analysis && useradd --system --gid analysis \
+    --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin analysis
+
+# The workload, copied again over the base's copy so the layer the digest
+# is measured on carries exactly this tree; analysis.lock fixes which
+# analysis bundle the entrypoint may run (analysis/protocol.md).
+COPY workload/pixel /app/workload/pixel
+COPY workload/producer /app/workload/producer
+COPY analysis.lock /app/analysis.lock
+COPY workload/tee/entrypoint.sh /app/tee/entrypoint.sh
+COPY workload/tee/Caddyfile /app/tee/Caddyfile
+COPY workload/tee/mediamtx.tee.yml /app/tee/mediamtx.tee.yml
+COPY workload/tee/wif-credential.json.tmpl /app/tee/wif-credential.json.tmpl
+RUN chmod 0755 /app/tee/entrypoint.sh
+
+# Confidential Space mounts the driver it installed at /usr/local/nvidia;
+# the CUDA runtime in the image and torch's bundled libraries find it here.
+ENV LD_LIBRARY_PATH=/usr/local/nvidia/lib64 \
+    PATH=/usr/local/nvidia/bin:/venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+# The model store as tee_models.py lays it out on the /models tmpfs.
+# POSE_PREFETCH stays off: there is no mount to prefetch from, the store is
+# already in place when the producer starts.
+ENV HF_HOME=/models/hf-bf16 \
+    HF_HUB_OFFLINE=1 \
+    TRANSFORMERS_OFFLINE=1 \
+    POSE_MODELS_MOUNT=/models \
+    POSE_DETECTOR_CHECKPOINT=/models/detectors/rtdetrv4/rtv4_hgnetv2_x_coco_ema.safetensors \
+    POSE_DETECT_STRIDE=3 \
+    POSE_QUEUE_DEPTH=4 \
+    POSE_FLIP_TTA=0 \
+    POSE_PREFETCH=0
+# Caddy's storage and the TLS leaf tee_mode.py reads back, all on tmpfs.
+ENV TEE_TLS_CERT_DIR=/run/tee/caddy/certificates \
+    XDG_DATA_HOME=/run/tee \
+    XDG_CONFIG_HOME=/run/tee
+# The page origins the phone signals from (CORS allow-list on the WHIP/WHEP
+# routes and /attestation); the deployment appends the trainer's own origin
+# for the direct path (terraform phone_origins).
+ENV TEE_ALLOWED_ORIGINS=https://masseuse.ai,https://www.masseuse.ai
+
+LABEL "tee.launch_policy.log_redirect"="debugonly"
+LABEL "tee.launch_policy.allow_cmd_override"="false"
+LABEL "tee.launch_policy.allow_env_override"="TEE_PUBLIC_HOST,TEE_PUBLIC_IP,SLOT_NAME,TRAINER_URL,TRAINER_INVOKER_SERVICE_ACCOUNT,TEE_ALLOWED_ORIGINS,MODELS_BUCKET,WIF_AUDIENCE,GOOGLE_CLOUD_PROJECT,ACME_DIRECTORY_URL,ACME_CONTACT_EMAIL,ACME_EAB_IMPERSONATE,TEE_IDLE_EXIT_S,TEE_BOOT_IDLE_S"
+LABEL "tee.launch_policy.allow_mount_destinations"="/models:/run/tee"
+LABEL "tee.launch_policy.hardened_monitoring"="none"
+LABEL "tee.launch_policy.debug_monitoring"="memoryonly"
+
+EXPOSE 443/tcp
+EXPOSE 8189/udp
+EXPOSE 8189/tcp
+
+ENTRYPOINT ["/app/tee/entrypoint.sh"]
+CMD []

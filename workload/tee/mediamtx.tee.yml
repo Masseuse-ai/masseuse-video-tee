@@ -1,0 +1,56 @@
+# The relay inside the Confidential Space slot (Dockerfile.tee): the DTLS-SRTP
+# endpoint the phone's camera terminates on, and the only thing in the
+# enclave that speaks WebRTC.
+#
+# A standard MediaMTX configuration with the choices a VM with its own
+# public IP makes:
+#   - the WebRTC HTTP endpoint and the control API stay on loopback: every
+#     signalling request arrives through Caddy (TLS) -> producer
+#     (relay_proxy.py, capability check, evidence) -> here;
+#   - media is direct: the relay's ICE candidate is the VM's public IP on
+#     udp/tcp 8189 (webrtcAdditionalHosts is filled from TEE_PUBLIC_IP by
+#     the entrypoint as MTX_WEBRTCADDITIONALHOSTS), not the container's
+#     interfaces and not a TURN allocation - the phone's SRTP goes to the
+#     enclave and nowhere else. The phone may still use coturn on its side
+#     when its own NAT needs it; the relay only sees ciphertext arrive;
+#   - RTSPS in is gone: the camera arrives over WHIP, the producer reads it
+#     back over loopback RTSP, nothing else connects to the relay. RTSPS
+#     out is the one exception: when the phone names a fixed camera
+#     (producer /ingest/source, external_source.py) the producer adds an
+#     `ext` path through the API below with that rtsps:// link as its
+#     source, pinned to the certificate it probed, and reads it back over
+#     loopback like `cam`. Runtime only; nothing about it lands here.
+rtspAddress: 127.0.0.1:8554
+rtspEncryption: "no"
+rtmp: no
+hls: no
+srt: no
+moq: no
+
+webrtc: yes
+webrtcAddress: 127.0.0.1:8889
+webrtcEncryption: no
+# CORS is the producer's (tee_mode.cors_headers): it answers the phone's
+# preflight itself and replaces whatever this says on the way out.
+webrtcAllowOrigins: ['*']
+webrtcTrustedProxies: [127.0.0.1]
+webrtcLocalUDPAddress: :8189
+webrtcLocalTCPAddress: :8189
+webrtcIPsFromInterfaces: no
+# Overridden at boot: MTX_WEBRTCADDITIONALHOSTS=<TEE_PUBLIC_IP>
+webrtcAdditionalHosts: []
+webrtcICEServers2: []
+webrtcHandshakeTimeout: 10s
+webrtcTrackGatherTimeout: 2s
+webrtcSTUNGatherTimeout: 5s
+
+api: yes
+apiAddress: 127.0.0.1:9997
+
+paths:
+  # The phone's camera (WHIP in, RTSP out to the producer).
+  cam: {}
+  # The annotated view (RTSP in from the producer, WHEP out to the phone).
+  overlay: {}
+  # `ext` (the external camera, RTSPS pulled in, RTSP out to the producer)
+  # is added and removed at runtime by the producer; it is not listed here.

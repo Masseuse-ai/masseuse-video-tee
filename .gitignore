@@ -1,0 +1,11 @@
+terraform/.terraform/
+terraform/*.tfstate
+terraform/*.tfstate.*
+terraform/*.tfplan
+terraform/terraform.tfvars
+terraform/.terraform.lock.hcl
+node_modules/
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/

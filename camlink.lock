@@ -1,0 +1,12 @@
+# The masseuse-camlink-gateway release the enclave image carries
+# (github.com/FemLed/masseuse-camlink). build.sh passes both values to
+# Dockerfile.tee, which reproduces the binary with `go install` at the tag
+# and refuses to build unless its sha256 equals the one below: the line
+# "masseuse-camlink-gateway_<version>_linux_amd64" of that release's
+# checksums.txt, which is signed keyless by the release workflow and covered
+# by its SLSA provenance (masseuse-camlink/VERIFY.md).
+#
+# To roll the gateway: change both lines, then follow README "Rolling the
+# enclave image" (the image digest changes, so tee_policy changes).
+CAMLINK_VERSION=v0.1.0
+CAMLINK_SHA256=87ecd6822ae52f614815ad5d562a0a39bd8a6244b714953e591583b7f16ab068

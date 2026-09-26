@@ -1,0 +1,81 @@
+# TLS termination inside the enclave.
+#
+# Caddy owns :443 for the slot's hostname, mints its certificate from the
+# ACME directory in ACME_DIRECTORY_URL by TLS-ALPN-01 on that same port
+# (no port 80 anywhere: the firewall has none and the HTTP challenge is
+# disabled), keeps the key on the /run/tee tmpfs so it never touches a disk
+# the operator could read, and proxies everything to the producer on
+# loopback. A fresh certificate per boot, like auth-broker-tee's
+# acme-renewal.js: tee_mode.tls_spki_nonce reads the leaf's SPKI back out
+# of the same storage and binds it into the attestation token.
+#
+# ACME_DIRECTORY_URL is Google Trust Services through Cloud Public CA
+# (masseuse-video-tee/README.md "Certificate authority"): the slot boots
+# once per session and every boot is a new account and a new certificate,
+# which Let's Encrypt's five-a-week-per-hostname limit cannot take. GTS
+# admits an account only with an External Account Binding; EAB_KID and
+# EAB_HMAC are minted at boot by tee_eab.py with the enclave's attested
+# identity and reach this file through Caddy's environment alone.
+{
+	admin off
+	auto_https disable_redirects
+	email {$ACME_CONTACT_EMAIL}
+	acme_ca {$ACME_DIRECTORY_URL}
+	storage file_system {
+		root /run/tee/caddy
+	}
+	servers {
+		protocols h1 h2
+		trusted_proxies static private_ranges
+	}
+	log {
+		output stdout
+		format console
+		level WARN
+	}
+}
+
+{$TEE_PUBLIC_HOST} {
+	tls {
+		issuer acme {
+			dir {$ACME_DIRECTORY_URL}
+			email {$ACME_CONTACT_EMAIL}
+			eab {$EAB_KID} {$EAB_HMAC}
+			disable_http_challenge
+		}
+	}
+	# A tight surface: signalling and status bodies are kilobytes.
+	request_body {
+		max_size 256KB
+	}
+	header {
+		Strict-Transport-Security "max-age=31536000"
+		-Server
+	}
+	# The home-camera tunnel: a WebSocket from masseuse-camlink, terminated
+	# here (the connector pins this certificate's key, the one the
+	# attestation token binds) and handed to the gateway on loopback. The
+	# gateway checks the ticket and the connector's Ed25519 proof; Caddy
+	# only carries bytes. Host is passed through unchanged: the connector's
+	# proof is over the hostname it dialed.
+	handle /ingest/tunnel {
+		reverse_proxy 127.0.0.1:8090 {
+			transport http {
+				read_timeout 0
+				write_timeout 0
+				dial_timeout 5s
+			}
+		}
+	}
+	handle {
+		reverse_proxy 127.0.0.1:8080 {
+			# /produce is a server-sent event stream that must not be buffered.
+			flush_interval -1
+			transport http {
+				read_timeout 0
+				write_timeout 0
+				dial_timeout 5s
+			}
+		}
+	}
+}

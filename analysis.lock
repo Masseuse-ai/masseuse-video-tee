@@ -1,0 +1,10 @@
+# The analysis bundle the enclave runs (analysis/protocol.md).
+#
+# tee_models.py fetches `object` from the models bucket at boot, refuses it
+# unless its SHA-256 is `sha256`, and unpacks it for the analysis process.
+# This file is copied into the image, so the attested image digest fixes
+# which bundle may run. The bundle's source is not published; its bytes are
+# pinned here and its inputs and outputs are the protocol document's.
+version=2026.09.09-1
+object=analysis/analysis-2026.09.09-1.tar.zst
+sha256=d5c534366cb277ea331a4a87787552e0a65004df2873cec3a7b71e9069635b9a

@@ -1,0 +1,278 @@
+name: release
+
+# Tag vX.Y.Z and this workflow produces the enclave image, end to end, on
+# GitHub-hosted runners from the tagged tree:
+#
+#   image       workload/Dockerfile (torch + ffmpeg on ubuntu:24.04) and
+#               workload/tee/Dockerfile.tee (MediaMTX, Caddy, the gateway,
+#               the entrypoint, the launch-policy labels) pushed to ghcr.io
+#               as one OCI manifest per image, every layer zstd; then the
+#               smoke test of workload/tee/buildx.sh on the pushed image,
+#               and a keyless cosign signature (Fulcio certificate naming
+#               this workflow at this tag, Rekor entry).
+#   provenance  slsa-github-generator's container generator attaches SLSA
+#               v1 build provenance to the image on ghcr.io: which commit,
+#               which workflow, which builder produced the digest.
+#   promote     the same digest copied into the Artifact Registry
+#               repository the enclave's launcher pulls from (its WIF
+#               condition requires an image under that repository), then
+#               signed with the Cloud KMS key from terraform/signing.tf in
+#               the layout the Confidential Space launcher reads
+#               (<repo>:sha256-<digest>.sig with the sigalg/pub
+#               annotations). Runs as the github-release service account
+#               through the GitHub OIDC pool in terraform/github-release.tf,
+#               only for tag refs of this repository.
+#
+# The digest is the same in all three places; the promote job checks that
+# and prints the terraform.tfvars / tee_policy lines for the roll
+# (README "Rolling the enclave image"). Verifying a running slot against
+# this workflow: VERIFY.md.
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions: {}
+
+env:
+  IMAGE: ghcr.io/femled/masseuse-video-tee
+  BASE_IMAGE: ghcr.io/femled/masseuse-video-tee-base
+  # moby/buildkit:v0.32.2 (multi-arch index on Docker Hub); the BuildKit the
+  # docker-container driver runs, so the layer bytes do not depend on the
+  # runner image's Docker.
+  BUILDKIT_IMAGE: moby/buildkit@sha256:28a898719c18a33f4e8000685287fa36fd0dd9560c6440227d3a732d79bb41d8
+  COMPRESSION: zstd
+  COMPRESSION_LEVEL: "3"
+
+jobs:
+  image:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    permissions:
+      contents: read
+      packages: write # ghcr.io/femled/masseuse-video-tee, -base
+      id-token: write # keyless signing (Fulcio)
+    outputs:
+      image: ghcr.io/femled/masseuse-video-tee
+      digest: ${{ steps.tee.outputs.digest }}
+      base_digest: ${{ steps.base.outputs.digest }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Room for the torch layers
+        # The runner image ships ~20 GB free; the wheel set, the installed
+        # venv and the zstd export need more than that in BuildKit's store.
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL /usr/local/.ghcup /usr/share/swift /usr/local/share/powershell
+          sudo docker image prune -af > /dev/null
+          df -h / | tail -1
+      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+        id: buildx
+        with:
+          driver: docker-container
+          driver-opts: image=${{ env.BUILDKIT_IMAGE }}
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+      - name: The gateway release this image carries
+        # camlink.lock: Dockerfile.tee reproduces the masseuse-camlink-gateway
+        # binary with go install at the tag and refuses to build unless its
+        # sha256 is the one from that release's signed checksums.txt.
+        run: |
+          . ./camlink.lock
+          [[ "${CAMLINK_VERSION:-}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+ ]] || { echo "camlink.lock: bad CAMLINK_VERSION" >&2; exit 64; }
+          [[ "${CAMLINK_SHA256:-}" =~ ^[0-9a-f]{64}$ ]] || { echo "camlink.lock: bad CAMLINK_SHA256" >&2; exit 64; }
+          { echo "CAMLINK_VERSION=${CAMLINK_VERSION}"; echo "CAMLINK_SHA256=${CAMLINK_SHA256}"; } >> "$GITHUB_ENV"
+      - name: Base image (torch, ffmpeg)
+        id: base
+        env:
+          BUILDX_BUILDER: ${{ steps.buildx.outputs.name }}
+        run: |
+          . workload/tee/buildx.sh
+          buildx_image "${BASE_IMAGE}:${GITHUB_REF_NAME}" "$COMPRESSION" "$COMPRESSION_LEVEL" \
+            -f workload/Dockerfile \
+            --build-arg CUDA_BASE=ubuntu:24.04 \
+            .
+          digest=$(buildx_last_digest)
+          echo "digest=${digest}" >> "$GITHUB_OUTPUT"
+          echo "${BASE_IMAGE}@${digest}"
+      - name: Enclave image (MediaMTX, Caddy, gateway, entrypoint)
+        id: tee
+        env:
+          BUILDX_BUILDER: ${{ steps.buildx.outputs.name }}
+        run: |
+          . workload/tee/buildx.sh
+          buildx_image "${IMAGE}:${GITHUB_REF_NAME}" "$COMPRESSION" "$COMPRESSION_LEVEL" \
+            -f workload/tee/Dockerfile.tee \
+            --build-arg "BASE=${BASE_IMAGE}@${{ steps.base.outputs.digest }}" \
+            --build-arg "CAMLINK_VERSION=${CAMLINK_VERSION}" \
+            --build-arg "CAMLINK_SHA256=${CAMLINK_SHA256}" \
+            .
+          digest=$(buildx_last_digest)
+          echo "digest=${digest}" >> "$GITHUB_OUTPUT"
+          echo "${IMAGE}@${digest}"
+      - name: Smoke test on the pushed image
+        # Every import the enclave makes, CPU only: a system library the
+        # ubuntu base lacks fails here, not on an A3 boot.
+        env:
+          BUILDX_BUILDER: ${{ steps.buildx.outputs.name }}
+        run: |
+          . workload/tee/buildx.sh
+          buildx_smoke "${IMAGE}@${{ steps.tee.outputs.digest }}"
+      - name: Keyless signature
+        # Fulcio issues a certificate to this workflow run's OIDC identity;
+        # the signature and certificate are stored next to the image and
+        # the entry goes to Rekor. `cosign verify --certificate-identity-regexp
+        # '^https://github.com/FemLed/masseuse-video-tee/.github/workflows/release.yml@refs/tags/v'
+        # --certificate-oidc-issuer https://token.actions.githubusercontent.com`
+        # checks it (VERIFY.md).
+        run: |
+          cosign sign --yes "${IMAGE}@${{ steps.tee.outputs.digest }}"
+          cosign sign --yes "${BASE_IMAGE}@${{ steps.base.outputs.digest }}"
+      - name: Summary
+        run: |
+          {
+            echo "## Enclave image ${GITHUB_REF_NAME}"
+            echo
+            echo '```'
+            echo "${IMAGE}@${{ steps.tee.outputs.digest }}"
+            echo "${BASE_IMAGE}@${{ steps.base.outputs.digest }}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  provenance:
+    needs: image
+    permissions:
+      actions: read
+      id-token: write
+      packages: write
+    uses: slsa-framework/slsa-github-generator/.github/workflows/generator_container_slsa3.yml@v2.1.0
+    with:
+      image: ${{ needs.image.outputs.image }}
+      digest: ${{ needs.image.outputs.digest }}
+      registry-username: ${{ github.actor }}
+      # The provenance goes to the public transparency log whatever the
+      # repository's visibility; the repository name in it is not a secret.
+      private-repository: true
+    secrets:
+      registry-password: ${{ secrets.GITHUB_TOKEN }}
+
+  promote:
+    needs: [image, provenance]
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: read
+      id-token: write # GitHub OIDC -> GCP workload identity federation
+    env:
+      DIGEST: ${{ needs.image.outputs.digest }}
+      AR_IMAGE: us-central1-docker.pkg.dev/prod-masseuse-video-tee/masseuse-video-tee/masseuse-video-tee
+      # terraform/github-release.tf outputs github_release_workload_identity_provider
+      # and github_release_service_account.
+      WIF_PROVIDER: projects/181371164640/locations/global/workloadIdentityPools/github-release/providers/github-actions
+      WIF_SERVICE_ACCOUNT: github-release@prod-masseuse-video-tee.iam.gserviceaccount.com
+      # terraform/signing.tf: the key the launcher's image_signatures claim
+      # names and the production WIF provider pins (image_signer_kms_key_uri).
+      KMS_KEY: gcpkms://projects/prod-masseuse-video-tee/locations/us-central1/keyRings/masseuse-video-tee-cosign/cryptoKeys/image-signer
+      # cosign 2.x for the KMS signature: the launcher reads the legacy
+      # <repo>:sha256-<digest>.sig layout, not the OCI referrers cosign 3
+      # writes. Release binary and its published checksum.
+      COSIGN2_VERSION: v2.4.1
+      COSIGN2_SHA256: 8b24b946dd5809c6bd93de08033bcf6bc0ed7d336b7785787c080f574b89249b
+      SLSA_VERIFIER_VERSION: v2.7.1
+      SLSA_VERIFIER_SHA256: 946dbec729094195e88ef78e1734324a27869f03e2c6bd2f61cbc06bd5350339
+    steps:
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+      - uses: imjasonh/setup-crane@feee3b6bb0d4c68370f256a4502498c9227e5c6b # v0.7
+      - name: Pinned verifiers and cosign 2.x
+        run: |
+          curl -fsSL -o /usr/local/bin/slsa-verifier \
+            "https://github.com/slsa-framework/slsa-verifier/releases/download/${SLSA_VERIFIER_VERSION}/slsa-verifier-linux-amd64"
+          echo "${SLSA_VERIFIER_SHA256}  /usr/local/bin/slsa-verifier" | sha256sum -c -
+          chmod 0755 /usr/local/bin/slsa-verifier
+          curl -fsSL -o /usr/local/bin/cosign2 \
+            "https://github.com/sigstore/cosign/releases/download/${COSIGN2_VERSION}/cosign-linux-amd64"
+          echo "${COSIGN2_SHA256}  /usr/local/bin/cosign2" | sha256sum -c -
+          chmod 0755 /usr/local/bin/cosign2
+      - name: Registry logins
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: crane auth login ghcr.io -u "${{ github.actor }}" --password-stdin <<< "${GITHUB_TOKEN}"
+      - name: What was built is what gets promoted
+        # The keyless signature names this workflow at this tag; the SLSA
+        # provenance names this repository at this tag. Both must hold for
+        # the digest before it goes anywhere near the launcher.
+        run: |
+          cosign verify "${IMAGE}@${DIGEST}" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            --certificate-identity "https://github.com/${GITHUB_REPOSITORY}/.github/workflows/release.yml@${GITHUB_REF}" \
+            > /dev/null
+          slsa-verifier verify-image "${IMAGE}@${DIGEST}" \
+            --source-uri "github.com/${GITHUB_REPOSITORY}" \
+            --source-tag "${GITHUB_REF_NAME}"
+      - uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
+        id: gcp
+        with:
+          workload_identity_provider: ${{ env.WIF_PROVIDER }}
+          service_account: ${{ env.WIF_SERVICE_ACCOUNT }}
+          token_format: access_token
+          create_credentials_file: true
+      - name: Copy the digest into Artifact Registry
+        env:
+          ACCESS_TOKEN: ${{ steps.gcp.outputs.access_token }}
+        run: |
+          crane auth login us-central1-docker.pkg.dev -u oauth2accesstoken --password-stdin <<< "${ACCESS_TOKEN}"
+          crane copy "${IMAGE}@${DIGEST}" "${AR_IMAGE}:${GITHUB_REF_NAME}"
+          copied=$(crane digest "${AR_IMAGE}:${GITHUB_REF_NAME}")
+          echo "ghcr ${DIGEST}"
+          echo "ar   ${copied}"
+          test "${copied}" = "${DIGEST}"
+      - name: Sign with the KMS key, in the launcher's layout
+        # The launcher counts a signature towards
+        # submods.container.image_signatures[] only when its payload carries
+        # dev.cosignproject.cosign/sigalg and dev.cosignproject.cosign/pub
+        # (the unpadded base64 of the public key PEM); without them the .sig
+        # exists but no token lists it. No Rekor upload: the Artifact
+        # Registry repository is private and VERIFY.md is the public record.
+        run: |
+          cosign2 public-key --key "${KMS_KEY}" > signer.pub
+          openssl pkey -pubin -in signer.pub -outform DER | openssl dgst -sha256 | awk '{print "signer key_id " $NF}'
+          pub_b64=$(base64 -w0 < signer.pub | sed 's/=*$//')
+          cosign2 sign --yes \
+            --key "${KMS_KEY}" \
+            -a "dev.cosignproject.cosign/sigalg=ECDSA_P256_SHA256" \
+            -a "dev.cosignproject.cosign/pub=${pub_b64}" \
+            --tlog-upload=false \
+            "${AR_IMAGE}@${DIGEST}"
+          cosign2 verify --key "${KMS_KEY}" --insecure-ignore-tlog "${AR_IMAGE}@${DIGEST}" > /dev/null
+          echo "signed ${AR_IMAGE}@${DIGEST}"
+      - name: Lines for the roll
+        run: |
+          {
+            echo "## Promoted ${GITHUB_REF_NAME}"
+            echo
+            echo "Signed by the KMS key, digest identical on ghcr.io and Artifact Registry."
+            echo
+            echo '```hcl'
+            echo "# terraform/terraform.tfvars"
+            echo "container_image        = \"${AR_IMAGE}@${DIGEST}\""
+            echo "container_image_digest = \"${DIGEST}\""
+            echo "# masseuse-trainer tee_policy.allowed_image_digests / image_sources"
+            echo "\"${DIGEST}\" = { repo = \"${IMAGE}\", tag = \"${GITHUB_REF_NAME}\" }"
+            echo '```'
+            echo
+            echo "Verify from anywhere:"
+            echo
+            echo '```sh'
+            echo "slsa-verifier verify-image ${IMAGE}@${DIGEST} \\"
+            echo "  --source-uri github.com/${GITHUB_REPOSITORY} --source-tag ${GITHUB_REF_NAME}"
+            echo "cosign verify ${IMAGE}@${DIGEST} \\"
+            echo "  --certificate-oidc-issuer https://token.actions.githubusercontent.com \\"
+            echo "  --certificate-identity https://github.com/${GITHUB_REPOSITORY}/.github/workflows/release.yml@refs/tags/${GITHUB_REF_NAME}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

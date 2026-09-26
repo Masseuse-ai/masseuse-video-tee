@@ -1,0 +1,12 @@
+# The build context is the repository root (workload/Dockerfile,
+# workload/tee/Dockerfile.tee). Only the workload tree and the two lock
+# files are read; everything else stays out of the context and out of the
+# image.
+*
+!workload/
+!analysis.lock
+!camlink.lock
+workload/tests/
+**/__pycache__/
+**/*.pyc
+**/.pytest_cache/

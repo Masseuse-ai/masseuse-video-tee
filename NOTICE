@@ -1,0 +1,17 @@
+masseuse-video-tee
+Copyright 2026 FemLed
+
+Licensed under the Apache License, Version 2.0 (see LICENSE).
+
+The container image this repository builds also carries, unmodified and
+under their own licenses:
+
+- MediaMTX (github.com/bluenviron/mediamtx), MIT License
+- Caddy (github.com/caddyserver/caddy), Apache License 2.0
+- masseuse-camlink-gateway (github.com/FemLed/masseuse-camlink), Apache
+  License 2.0, pinned by release tag and checksum in camlink.lock
+- Ubuntu packages including ffmpeg (LGPL 2.1+ / GPL 2+), under the licenses
+  their packages declare
+
+The verifier depends on github.com/golang-jwt/jwt (MIT License) and
+github.com/MicahParks/keyfunc (Apache License 2.0).
