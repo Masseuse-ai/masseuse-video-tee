@@ -1,19 +1,24 @@
-"""The producer: a video stream in, keypoints and motion descriptors out.
+"""The producer: a media stream in, keypoints, descriptors and labels out.
 
-This process is the only one in the enclave that holds a decoded frame.
-One ffmpeg decode at 30fps yuv420p feeds everything: the Y plane is what
-the regional motion descriptors are measured on, and every fifth frame is
-converted to RGB for the pose worker (RT-DETRv4 person detection, then
-Sapiens2-1B keypoints). Pose runs at 6fps in its own thread behind a
-bounded queue; a stalled or slow pose drops frames - counted, clock still
-advanced with keypoint-less rows, released to the assembler in slot order -
-rather than ever blocking the decode. Rows come out of the online
-interpolator at frame cadence, the descriptors out of the pair arithmetic
-at both cadences (workload/pixel/motion.py), and both are handed over a
-local socket to the analysis process (analysis/protocol.md), whose readings
-come back to be posted to the trainer. Frames go no further than this file
-and the overlay renderer, which draws the annotated view returned to the
-same user's phone.
+This process is the only one in the enclave that holds a decoded frame or
+an audio sample. One ffmpeg decode at 30fps yuv420p feeds everything
+visual: the Y plane is what the regional motion descriptors are measured
+on, and every fifth frame is converted to RGB for the pose worker
+(RT-DETRv4 person detection, then Sapiens2-1B keypoints). Pose runs at 6fps
+in its own thread behind a bounded queue; a stalled or slow pose drops
+frames - counted, clock still advanced with keypoint-less rows, released to
+the assembler in slot order - rather than ever blocking the decode. Rows
+come out of the online interpolator at frame cadence, the descriptors out
+of the pair arithmetic at both cadences (workload/pixel/motion.py), and
+both are handed over a local socket to the analysis process
+(analysis/protocol.md), whose readings come back to be posted to the
+trainer. With --audio a second ffmpeg reads the same stream's audio track
+as 16 kHz mono PCM for the audio stage (workload/audio/audio_stage.py),
+which classifies it into non-speech vocalization labels with level and
+pitch and sends those numbers over the same socket. Frames go no further
+than this file and the overlay renderer, which draws the annotated view
+returned to the same user's phone; samples go no further than the audio
+stage.
 
 Two run shapes, one binary:
 
@@ -57,10 +62,12 @@ from urllib.parse import parse_qs, urlparse
 import cv2
 import numpy as np
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "audio"))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "pixel"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from analysis_link import open_link  # noqa: E402
+from audio_stage import AudioSource, AudioStage  # noqa: E402
 from camlink_gateway import (CamlinkGateway, GatewayError,  # noqa: E402
                              parse_expectation)
 from external_source import ExternalSource, SourceError  # noqa: E402
@@ -400,6 +407,29 @@ def gpu_pose_state() -> str:
     return "booting"
 
 
+# The audio classifier (workload/audio/ced.py): one ced.cpp context per
+# process, loaded on first use and warmed with a second of silence, shared by
+# every session the way the pose model is. Single-threaded by construction;
+# only the session's audio thread calls it.
+_AUDIO_LOCK = threading.Lock()
+_AUDIO: dict = {"classifier": None}
+
+
+def acquire_audio_classifier(telemetry: Telemetry):
+    with _AUDIO_LOCK:
+        classifier = _AUDIO["classifier"]
+        if classifier is None:
+            from ced import CedEngine  # noqa: PLC0415 - the library is optional
+            started = time.monotonic()
+            classifier = CedEngine()
+            classifier.classify(np.zeros(16_000, dtype=np.float32))
+            telemetry.boot_phase("audioReady", started)
+            print(f"audio: {classifier.version} from {classifier.library_path}",
+                  flush=True)
+            _AUDIO["classifier"] = classifier
+        return classifier
+
+
 class BootKeepalive:
     """Keeps a /produce SSE response alive while Session() waits for the boot.
 
@@ -508,20 +538,39 @@ class Session:
                   if getattr(args, "overlay_record", False) else None)
         self.overlay = build_renderer(args, telemetry, source_fps=FPS,
                                       record_path=record)
-        # The analysis process (analysis/protocol.md). Keypoints and
-        # descriptors go out; readings, records, HUD text and gauges come
-        # back through _on_analysis. Opened last so a session that fails to
-        # reach it has nothing else to tear down.
+        # The audio stage (workload/audio/audio_stage.py): the stream's
+        # audio track, if it has one, classified and measured in this
+        # process; its numbers go over the same socket. The classifier is
+        # loaded here, before the link, so a missing library fails the
+        # session before anything else is up.
+        self.stream_at_s: float | None = None
+        self.audio_classifier = (acquire_audio_classifier(telemetry)
+                                 if getattr(args, "audio", False) else None)
+        self.audio: AudioStage | None = None
+        # The analysis process (analysis/protocol.md). Keypoints,
+        # descriptors and audio measurements go out; readings, records, HUD
+        # text, gauges and segment requests come back through _on_analysis.
+        # Opened last so a session that fails to reach it has nothing else
+        # to tear down.
         self.analysis = open_link(
             getattr(args, "analysis_socket", "") or "",
             self._on_analysis, self._on_analysis_error,
             fps=FPS, poseFps=pose_fps, postIntervalS=self.post_interval_s,
-            run=self.run_name or None)
+            run=self.run_name or None,
+            audio=self.audio_classifier is not None,
+            audioModel=(self.audio_classifier.version
+                        if self.audio_classifier is not None else None))
         if self.analysis.connected:
             ready = self.analysis.ready or {}
             print(f"analysis: {ready.get('version', '?')} "
                   f"({ready.get('modelVersion', '?')}) on "
                   f"{args.analysis_socket}", flush=True)
+        if self.audio_classifier is not None:
+            self.audio = AudioStage(
+                AudioSource(args.stream, telemetry,
+                            realtime=args.pose == "gpu", stopping=self.stopping),
+                self.audio_classifier, self.analysis.send, telemetry,
+                stream_clock=lambda: self.stream_at_s)
 
     # -- what comes back from the analysis process ---------------------------
 
@@ -569,6 +618,16 @@ class Session:
                         self.telemetry.gauge(str(name), float(value))
         elif kind == "log":
             print(f"analysis: {message.get('text', '')}", flush=True)
+        elif kind == "classify":
+            # A span of the audio history to measure (audio_stage.segment):
+            # queued for the audio thread, the only one that may touch the
+            # samples or the classifier. Without an audio stage the answer
+            # is an error, never a guess.
+            if self.audio is not None:
+                self.audio.request(message)
+            else:
+                self.analysis.send({"kind": "segment", "id": message.get("id"),
+                                    "error": "no-audio"})
 
     def _on_analysis_error(self, text: str) -> None:
         self.telemetry.count("analysisErrors")
@@ -643,6 +702,8 @@ class Session:
                   f"{self.overlay.publisher.encoder}, {self.overlay.delay_s:.1f}s "
                   f"behind decode", flush=True)
         worker.start()
+        if self.audio is not None:
+            self.audio.start()
         # Descriptors off the decode thread. Measuring a frame pair costs
         # ~25 ms of a 33 ms frame budget, and decisions arrive in bunches -
         # each pose row released frees the frames under it - so measuring
@@ -668,6 +729,7 @@ class Session:
                     break
                 last_frame_wall = time.monotonic()
                 last_index = index
+                self.stream_at_s = at_s
                 if width is None:
                     width = yuv.shape[1]
                     height = yuv.shape[0] * 2 // 3
@@ -711,6 +773,12 @@ class Session:
         finally:
             worker.stopping.set()
             decoder.stop()
+            if self.audio is not None:
+                # Its ffmpeg dies with the decoder's; the thread finishes
+                # the hop it is on, answers pending requests "closed" and
+                # drops the samples.
+                self.audio.stop()
+                self.audio.join(timeout=5.0)
             if self.overlay is not None:
                 # Before the capture closes: the recording, if any, must be
                 # finalised on disk to ride the upload with the jsonl files.
@@ -1828,6 +1896,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--post-url", default="")
     parser.add_argument("--post-interval-s", type=float, default=1.0,
                         help="reading cadence the analysis is asked for")
+    parser.add_argument("--audio", action="store_true",
+                        help="also read the stream's audio track "
+                             "(workload/audio): classify it into non-speech "
+                             "vocalization labels with level and pitch and "
+                             "send those numbers over the analysis socket; "
+                             "needs CED_LIBRARY_PATH and CED_MODEL_PATH")
     parser.add_argument("--duration", type=float, default=0.0)
     parser.add_argument("--input-lost-after", type=float, default=0.0,
                         help="end the session once the stream has delivered "

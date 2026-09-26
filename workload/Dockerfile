@@ -115,10 +115,13 @@ RUN /venv/bin/pip install --no-cache-dir \
 
 WORKDIR /app
 # The workload: pixel/ (decode geometry, person detection, keypoints,
-# regional motion descriptors) and producer/ (the session shell, the overlay,
-# the relay proxy, the enclave's boot helpers). The tests are not copied
-# (.dockerignore); the TEE layer copies the same tree again.
+# regional motion descriptors), audio/ (the audio track's classification,
+# level and pitch; the classifier's library and weights are added by the
+# TEE layer) and producer/ (the session shell, the overlay, the relay proxy,
+# the enclave's boot helpers). The tests are not copied (.dockerignore); the
+# TEE layer copies the same tree again.
 COPY workload/pixel /app/workload/pixel
+COPY workload/audio /app/workload/audio
 COPY workload/producer /app/workload/producer
 
 ENV PATH="/venv/bin:$PATH"

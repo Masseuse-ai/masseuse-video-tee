@@ -21,7 +21,7 @@ sys.path.insert(0, str(WORKLOAD / "producer"))
 sys.path.insert(0, str(WORKLOAD / "pixel"))
 
 from motion import POSE_SNAP_S, RowAssembler  # noqa: E402
-from producer import MOUNT_ROOT, PoseWorker, mounted_path  # noqa: E402
+from producer import MOUNT_ROOT, PoseWorker, Session, mounted_path  # noqa: E402
 from telemetry import Telemetry  # noqa: E402
 
 
@@ -297,6 +297,32 @@ def test_telemetry_snapshot_carries_stages_and_boot_phases():
     assert snap["gauges"]["realtimeFactor"] == 1.25
     assert snap["bootMs"]["weights"] >= 45.0
     assert "pose=" in telemetry.log_line()
+
+
+def test_classify_requests_reach_the_audio_stage_or_are_refused():
+    """The analysis may ask for a span of audio to be measured; the request
+    goes to the audio thread and nowhere else, and a session without an
+    audio stage answers with an error rather than silence."""
+    class Sink:
+        def __init__(self):
+            self.items = []
+
+        def send(self, message):
+            self.items.append(message)
+
+        request = send
+
+    session = Session.__new__(Session)
+    session.analysis = Sink()
+    session.audio = None
+    request = {"kind": "classify", "id": 3, "fromS": 1.0, "toS": 1.5}
+    session._on_analysis(request)
+    assert session.analysis.items == [
+        {"kind": "segment", "id": 3, "error": "no-audio"}]
+    session.audio = Sink()
+    session._on_analysis(request)
+    assert session.audio.items == [request]
+    assert len(session.analysis.items) == 1
 
 
 def test_a_request_may_only_name_files_under_the_mount():

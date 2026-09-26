@@ -1,5 +1,6 @@
 # The Confidential Space slot image: the base image plus the three binaries
-# that would otherwise be sidecars, the analysis lock, and one entrypoint.
+# that would otherwise be sidecars, the audio classifier, the analysis lock,
+# and one entrypoint.
 #
 # Confidential Space runs exactly one container per VM and attests its
 # digest, so the relay (MediaMTX), the TLS terminator (Caddy) and the
@@ -7,7 +8,9 @@
 # image rather than beside it. MediaMTX and Caddy are copied from their
 # pinned upstream images (the digests are the multi-arch indexes on Docker
 # Hub); the gateway is reproduced from its signed release (see its stage
-# below). BASE is the image built by workload/Dockerfile from the same
+# below); the audio classifier's library is built from a pinned commit and
+# its weights fetched by pinned revision and SHA-256 (the `ced` stage).
+# BASE is the image built by workload/Dockerfile from the same
 # tree, so the enclave runs the very code the tests here exercise. It is
 # built on ubuntu:24.04 with the torch set in five layers and every layer
 # zstd (see the header of workload/Dockerfile): the launcher pulls the
@@ -67,18 +70,64 @@ RUN test -n "${CAMLINK_VERSION}" && test -n "${CAMLINK_SHA256}" \
  && echo "${CAMLINK_SHA256}  /go/bin/masseuse-camlink-gateway" | sha256sum -c - \
  && /go/bin/masseuse-camlink-gateway --version
 
+# The audio classifier (workload/audio/ced.py): ced.cpp, the ggml port of
+# Xiaomi's CED AudioSet tagger, built as a shared library from a pinned
+# commit (MIT; the licence files are copied into the image), and the GGUF
+# conversion of the ced-small weights (Apache-2.0) fetched at a pinned
+# revision and checked against its SHA-256. Both live in the image rather
+# than the weights bucket: together they are a few megabytes, and the
+# attested digest then covers exactly which classifier heard the audio.
+ARG CED_CPP_COMMIT=c04ac14b7992d00584d9e812c9bb6268598a6ce7
+ARG CED_GGUF_REVISION=b5e9a4aad6438763c8da16079d77563fbed35c65
+ARG CED_MODEL_FILE=ced-small-f16.gguf
+ARG CED_MODEL_SHA256=c391ed8697a1b08d7c1a463e4940a5c3a2f670e0544ab0d8ee23b544583602a8
+FROM ubuntu:24.04 AS ced
+ARG CED_CPP_COMMIT
+ARG CED_GGUF_REVISION
+ARG CED_MODEL_FILE
+ARG CED_MODEL_SHA256
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential ca-certificates cmake curl git \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /src
+RUN git clone --recursive https://github.com/localai-org/ced.cpp.git \
+ && cd ced.cpp \
+ && git checkout "${CED_CPP_COMMIT}" \
+ && test "$(git rev-parse HEAD)" = "${CED_CPP_COMMIT}" \
+ && git submodule update --init --recursive
+RUN cmake -S /src/ced.cpp -B /src/ced.cpp/build \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DGGML_NATIVE=OFF \
+        -DCED_SHARED=ON \
+        -DCED_BUILD_CLI=OFF \
+        -DCED_BUILD_TESTS=OFF \
+        -DBUILD_SHARED_LIBS=OFF \
+        -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+ && cmake --build /src/ced.cpp/build -j"$(nproc)" \
+ && test -s /src/ced.cpp/build/libced.so
+RUN mkdir -p /out \
+ && curl -fL --retry 3 \
+      "https://huggingface.co/mudler/ced-gguf/resolve/${CED_GGUF_REVISION}/${CED_MODEL_FILE}" \
+      -o "/out/${CED_MODEL_FILE}" \
+ && echo "${CED_MODEL_SHA256}  /out/${CED_MODEL_FILE}" | sha256sum -c -
+
 FROM ${BASE}
 
 COPY --from=mediamtx /mediamtx /usr/local/bin/mediamtx
 COPY --from=caddy /usr/bin/caddy /usr/local/bin/caddy
 COPY --from=camlink /go/bin/masseuse-camlink-gateway /usr/local/bin/masseuse-camlink-gateway
+COPY --from=ced /src/ced.cpp/build/libced.so /opt/ced/libced.so
+COPY --from=ced /out/ced-small-f16.gguf /opt/ced/ced-small-f16.gguf
+COPY --from=ced /src/ced.cpp/LICENSE /opt/ced/LICENSE.ced.cpp
+COPY --from=ced /src/ced.cpp/third_party/ggml/LICENSE /opt/ced/LICENSE.ggml
 
 # Ed25519 evidence signatures and the TLS leaf's SPKI (tee_mode.py). The
 # system trust store the ACME client and GCS need comes with the base
 # (workload/Dockerfile installs ca-certificates). zstd is for unpacking the
 # analysis bundle (tee_models.py, `tar --zstd`); setpriv (util-linux, in
-# the base) drops the analysis process to its own user.
-RUN apt-get update && apt-get install -y --no-install-recommends zstd \
+# the base) drops the analysis process to its own user; libgomp1 is the
+# OpenMP runtime ggml (libced.so) links against.
+RUN apt-get update && apt-get install -y --no-install-recommends zstd libgomp1 \
     && rm -rf /var/lib/apt/lists/* \
     && /venv/bin/pip install --no-cache-dir cryptography
 
@@ -92,6 +141,7 @@ RUN groupadd --system analysis && useradd --system --gid analysis \
 # is measured on carries exactly this tree; analysis.lock fixes which
 # analysis bundle the entrypoint may run (analysis/protocol.md).
 COPY workload/pixel /app/workload/pixel
+COPY workload/audio /app/workload/audio
 COPY workload/producer /app/workload/producer
 COPY analysis.lock /app/analysis.lock
 COPY workload/tee/entrypoint.sh /app/tee/entrypoint.sh
@@ -116,6 +166,9 @@ ENV HF_HOME=/models/hf-bf16 \
     POSE_QUEUE_DEPTH=4 \
     POSE_FLIP_TTA=0 \
     POSE_PREFETCH=0
+# The audio classifier (workload/audio/ced.py), as the `ced` stage left it.
+ENV CED_LIBRARY_PATH=/opt/ced/libced.so \
+    CED_MODEL_PATH=/opt/ced/ced-small-f16.gguf
 # Caddy's storage and the TLS leaf tee_mode.py reads back, all on tmpfs.
 ENV TEE_TLS_CERT_DIR=/run/tee/caddy/certificates \
     XDG_DATA_HOME=/run/tee \

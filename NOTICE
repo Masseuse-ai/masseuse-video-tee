@@ -10,6 +10,12 @@ under their own licenses:
 - Caddy (github.com/caddyserver/caddy), Apache License 2.0
 - masseuse-camlink-gateway (github.com/FemLed/masseuse-camlink), Apache
   License 2.0, pinned by release tag and checksum in camlink.lock
+- ced.cpp (github.com/localai-org/ced.cpp), MIT License, with its vendored
+  ggml (MIT License), built as libced.so at a pinned commit
+- CED audio tagger weights (Xiaomi, mispeech/ced-small), Apache License 2.0,
+  in the GGUF conversion distributed at huggingface.co/mudler/ced-gguf,
+  fetched at a pinned revision and SHA-256. The AudioSet labels it emits are
+  CC BY 4.0 (the ontology repository CC BY-SA 4.0)
 - Ubuntu packages including ffmpeg (LGPL 2.1+ / GPL 2+), under the licenses
   their packages declare
 

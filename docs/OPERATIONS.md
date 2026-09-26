@@ -415,14 +415,19 @@ send media to, a digest that is not in the policy:
 
 1. Release the image (tag; the workflow builds, signs, attests and
    promotes). Note the digest.
-2. Here: the new digest into `candidate_image_digests`, `terraform apply`
-   (the VM's `tee-image-reference` and the digest's WIF bindings).
+2. Here, with no slot running: the new digest into `container_image` /
+   `container_image_digest` (the VM's `tee-image-reference`) and the
+   previous one into `candidate_image_digests` (so it keeps its WIF
+   bindings and can be pinned back), `terraform apply`.
 3. Trainer: the new digest into its policy beside the previous one (so a
-   phone mid-session is not refused), apply, deploy.
-4. Hand-boot a slot with no lease and run `tee-verify` against it; every
-   check passes. Append the row to `VERIFY.md` (tag, digest, what changed).
-5. Move the digest into `container_image` / `container_image_digest`,
-   `terraform apply`; carry a session end to end from a phone.
+   phone mid-session is not refused) with its `image_sources` entry (the
+   release tag), apply.
+4. Hand-boot a slot with no lease (`gcloud compute instances start
+   masseuse-video-tee-slot-0 --zone us-central1-a`; the VM's power state is
+   not Terraform's after creation, see `vm.tf`) and run `tee-verify`
+   against it within the boot idle window; every check passes. Append the
+   row to `VERIFY.md` (tag, digest, what changed).
+5. Carry a session end to end from a phone.
 6. Drop the previous digest from the trainer's policy and from
    `candidate_image_digests` once no slot runs it.
 

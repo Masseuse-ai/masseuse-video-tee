@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # The Confidential Space slot's one entrypoint: Caddy (TLS), MediaMTX (the
 # DTLS-SRTP endpoint), the camlink gateway (the home-camera tunnel), the
-# producer in --tee mode with its arguments baked here, the weights and the
-# analysis bundle, then the analysis process under its own user - the
-# image's launch policy forbids a command override, so what this file says
-# is what the enclave runs, and the attestation token's
-# submods.container.image_digest vouches for it. Which analysis bundle may
-# run is fixed by /app/analysis.lock, also inside the image
-# (analysis/protocol.md).
+# producer in --tee mode with its arguments baked here (frames and, with
+# --audio, the stream's audio track), the weights and the analysis bundle,
+# then the analysis process under its own user - the image's launch policy
+# forbids a command override, so what this file says is what the enclave
+# runs, and the attestation token's submods.container.image_digest vouches
+# for it. Which analysis bundle may run is fixed by /app/analysis.lock, also
+# inside the image (analysis/protocol.md).
 #
 # Environment (the launch policy's allow_env_override list, set as
 # tee-env-* metadata by masseuse-video-tee/terraform):
@@ -177,6 +177,7 @@ python3 /app/workload/producer/producer.py \
     --teardown-drain-s "$TEE_IDLE_EXIT_S" \
     --post-url "${TRAINER_URL}/api/pose-signals/slot/${SLOT_NAME}/readings" \
     --post-interval-s 1.0 \
+    --audio \
     --analysis-socket "$ANALYSIS_SOCKET" \
     --sink-dir /run/tee/capture \
     --capture-bucket "" \

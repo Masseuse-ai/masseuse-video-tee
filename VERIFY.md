@@ -113,31 +113,56 @@ and additionally pins the slot's TLS key to the SPKI hash in the token.
 | digest | since | notes |
 | --- | --- | --- |
 | `sha256:4866753aef23fa5406a9be6c5ec5129c7268e4d26f0c08b089f479e21726612f` | 2026-09-09 | debug image (`confidential-space-debug`, `dbgstat=enabled`); not a production posture. `ubuntu:24.04` base, zstd layers, live streams decoded at a pinned geometry; adds the directly reachable external camera (`PUT /ingest/source`, an `rtsps://` link the phone names instead of its own camera). Signed. `tee-verify -allow-debug` passed every check on the pinned slot 2026-09-09 03:26 UTC. |
-| `sha256:e7c8008416574624885ac6211769352dfcaba4c5113cfb6b18d3264a3155dec2` | 2026-09-09 | debug image, same posture and base as `4866753a…`; adds the home-network camera connector's gateway: `masseuse-camlink-gateway` from the public [FemLed/masseuse-camlink](https://github.com/FemLed/masseuse-camlink) release `v0.1.0`, whose signed `checksums.txt` names the binary as `87ecd6822ae52f614815ad5d562a0a39bd8a6244b714953e591583b7f16ab068  masseuse-camlink-gateway_0.1.0_linux_amd64`; the image build reproduces it with `go install` at that tag and refuses any other bytes (`camlink.lock`). Signed. `tee-verify -allow-debug` with `-cosign` passed every check on the pinned slot 2026-09-09 14:01 UTC. |
+| `sha256:e7c8008416574624885ac6211769352dfcaba4c5113cfb6b18d3264a3155dec2` | 2026-09-09 | debug image, same posture and base as `4866753a…`; adds the home-network camera connector's gateway: `masseuse-camlink-gateway` from the public [FemLed/masseuse-camlink](https://github.com/FemLed/masseuse-camlink) release `v0.1.0`, whose signed `checksums.txt` names the binary as `87ecd6822ae52f614815ad5d562a0a39bd8a6244b714953e591583b7f16ab068  masseuse-camlink-gateway_0.1.0_linux_amd64`; the image build reproduces it with `go install` at that tag and refuses any other bytes (`camlink.lock`). Signed. `tee-verify -allow-debug` with `-cosign` passed every check on the pinned slot 2026-09-09 14:01 UTC. Built by Cloud Build from a tree that was not yet public; no provenance. |
+| `sha256:a1e224492978c5a90c3c1faad81b2ebd83dfd302675291db6373210b5d95331e` | 2026-09-09 | **`v0.1.0`**, the first image built from this repository: tag [`v0.1.0`](https://github.com/FemLed/masseuse-video-tee/releases/tag/v0.1.0) by [`release.yml`](.github/workflows/release.yml) run `34383875573`, SLSA provenance and a keyless signature on `ghcr.io/femled/masseuse-video-tee@sha256:a1e22449…` (same digest), promoted by digest into the registry above and signed there with the KMS key. Debug image, same posture and base as `e7c80084…`. The producer is split: the pixel path (`workload/pixel`, `workload/producer`) is this tree, and the analysis of its keypoints and descriptors is the pinned bundle `2026.09.09-1` (`analysis.lock`, SHA-256 `d5c53436…`), run under its own user behind the local socket (`analysis/protocol.md`). `tee-verify -allow-debug` with `-cosign` passed every check on the pinned slot 2026-09-09 18:11 UTC; `slsa-verifier verify-image` and `cosign verify` passed on the `ghcr.io` digest in the release's own `promote` job before the copy. |
 
 Retired, all debug images from the first days of the enclave (2026-09-08
 and 2026-09-09): `sha256:efe3d2b7…`, `sha256:3c3fa7f0…`,
-`sha256:80df7800…`, `sha256:c95761f4…`.
+`sha256:80df7800…`, `sha256:c95761f4…`, `sha256:4866753a…`.
 
 Production digests are appended here with the flip to the production
 Confidential Space image (`debug_mode = false`, `require_signed_image =
 true`); a digest is removed when its image is retired, and the trainer's
-policy (`/api/tee-policy`) mirrors this list.
+policy (`/api/tee-policy`) mirrors this list, with `imageSources` naming
+the release tag each digest was built from.
 
 ## How the image is built
 
-The digests above were built by Cloud Build in the enclave's project from a
-source tree that was not yet public: two Dockerfiles (an `ubuntu:24.04`
-base with Python, the pinned torch 2.14.0+cu130 set split into five layers
-and the model code; then the TEE layer with Caddy and MediaMTX by digest,
-the ACME and attestation tooling and the launch-policy labels), built with
-BuildKit through `buildx` so every layer is zstd and the push is a single
-OCI manifest, which is what a digest names. That source is landing in this
-repository under `workload/`, after which every published digest is built
-by GitHub Actions from a tagged commit here, with SLSA provenance and a
-keyless cosign signature, and promoted by digest into the registry the
-attestation names. Until a digest carries that provenance, what it does is
-only as verifiable as this document.
+From `v0.1.0` on, every published digest is built by GitHub Actions from a
+tagged commit of this repository ([`.github/workflows/release.yml`](.github/workflows/release.yml)):
+two Dockerfiles (an `ubuntu:24.04` base with Python, the pinned torch
+2.14.0+cu130 set split into five layers and the model code; then the TEE
+layer with Caddy and MediaMTX by digest, the ACME and attestation tooling
+and the launch-policy labels), built with BuildKit through `buildx` so every
+layer is zstd and the push is a single OCI manifest, which is what a digest
+names. The workflow pushes to `ghcr.io/femled/masseuse-video-tee`, signs the
+digest keyless with cosign (the certificate's identity is the workflow at
+the tag), attaches SLSA provenance with the
+[slsa-github-generator](https://github.com/slsa-framework/slsa-github-generator)
+container generator, and then a separate job copies the digest, unchanged,
+into the registry the attestation names and signs it there with the KMS key
+below, so the launcher's signature check is what it was. To check a digest
+against its source:
+
+```sh
+DIGEST=sha256:...   # from the attestation, the table above or /api/tee-policy
+slsa-verifier verify-image ghcr.io/femled/masseuse-video-tee@$DIGEST \
+    --source-uri github.com/FemLed/masseuse-video-tee --source-tag v0.1.0
+cosign verify ghcr.io/femled/masseuse-video-tee@$DIGEST \
+    --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+    --certificate-identity-regexp '^https://github.com/FemLed/masseuse-video-tee/.github/workflows/release.yml@refs/tags/v[0-9.]+$'
+```
+
+(`cosign` 3.x is needed: the signature is stored as a Sigstore bundle.
+The digest on `ghcr.io` and in `us-central1-docker.pkg.dev` is the same
+string, so the provenance verified on one is the provenance of the other.)
+The trainer's `/api/tee-policy` carries the same mapping as `imageSources`,
+which is what the home-camera connector reads to log the command for the
+digest your session attested.
+
+Digests before `v0.1.0` were built by Cloud Build in the enclave's project
+from a source tree that was not yet public, with the same Dockerfiles but
+no provenance; what they did is only as verifiable as this document.
 
 Since `e7c80084…` the image carries one binary that is not built from the
 workload tree: `masseuse-camlink-gateway`, the enclave half of the

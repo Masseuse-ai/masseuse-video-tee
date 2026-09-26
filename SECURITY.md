@@ -24,10 +24,11 @@ against production, and a check that should hold but does not is a report.
   image with debugging disabled since boot, on an Intel TDX VM with the GPU
   in confidential-computing mode. The operator cannot SSH into it, redirect
   its logs, read its memory, or change what runs without changing the digest.
-- It keeps nothing: frames live in memory for the duration of a decode and
-  are not written anywhere. The only data that leaves are the readings the
-  analysis derives (numbers, never frames) posted to the trainer, and the
-  annotated view streamed back to the same user's phone.
+- It keeps nothing: frames and audio samples live in memory for the duration
+  of a decode and are not written anywhere. The only data that leaves are
+  the readings the analysis derives (numbers, never frames or sound) posted
+  to the trainer, and the annotated view streamed back to the same user's
+  phone.
 - Its TLS key, its Ed25519 evidence key and its certificate are generated at
   boot and die with the VM. The attestation token names both keys, which
   is how a verifier knows the endpoint it reached is the enclave.

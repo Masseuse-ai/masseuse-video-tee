@@ -5,16 +5,18 @@ user's media:
 
 - the **producer** (`workload/producer/producer.py`): decodes the stream,
   runs person detection and keypoint detection, computes regional motion
-  descriptors, draws the annotated view. Every line that reads a frame or an
-  audio sample is in this repository.
-- the **analysis** process: receives keypoints and descriptors from the
-  producer over a local Unix socket and turns them into the readings the
-  trainer consumes. Its code is not published (it is the operator's
-  interpretation of those numbers), but its bytes are pinned: the enclave
-  fetches the bundle named in [`analysis.lock`](../analysis.lock) at boot and
-  refuses to start it unless its SHA-256 matches. The lock file is part of
-  the attested image, so the attestation digest covers which analysis bundle
-  ran.
+  descriptors, draws the annotated view, and, when the stream has an audio
+  track, classifies it into non-speech vocalization labels with level and
+  pitch (`workload/audio/`). Every line that reads a frame or an audio
+  sample is in this repository.
+- the **analysis** process: receives keypoints, descriptors and audio
+  measurements from the producer over a local Unix socket and turns them
+  into the readings the trainer consumes. Its code is not published (it is
+  the operator's interpretation of those numbers), but its bytes are pinned:
+  the enclave fetches the bundle named in [`analysis.lock`](../analysis.lock)
+  at boot and refuses to start it unless its SHA-256 matches. The lock file
+  is part of the attested image, so the attestation digest covers which
+  analysis bundle ran.
 
 The analysis process runs under its own OS user (`analysis`), starts with
 nothing but the socket, has no network access of its own (everything it
@@ -42,7 +44,8 @@ not cross it.
 
 ```json
 {"kind": "hello", "protocol": 1, "fps": 30.0, "poseFps": 6.0,
- "postIntervalS": 1.0, "run": null}
+ "postIntervalS": 1.0, "run": null,
+ "audio": true, "audioModel": "ced.cpp-abi1:ced-small-f16.gguf"}
 ```
 
 - `fps`: the decode cadence the `frame` messages arrive at.
@@ -50,6 +53,10 @@ not cross it.
 - `postIntervalS`: how often the analysis is expected to emit a `post`.
 - `run`: the operator's name for a captured test session, or `null` in
   production.
+- `audio`: whether the producer runs the audio stage for this session
+  (`audio` messages may follow and `classify` requests are answered).
+  `false` means the stream's sound is not read at all. `audioModel` names
+  the classifier build and weights (`null` without the stage).
 
 ### `pose`, every keypoint-model result, in order
 
@@ -102,6 +109,62 @@ A descriptor (`workload/pixel/motion.py`, `MotionSample.as_json`):
 Units: hip widths for positions, canonical pixels per frame for flow, grey
 levels for brightness. All of these are statistics over a warped region of
 the frame; none of them can be inverted into an image.
+
+### `audio`, every half second of the audio track
+
+```json
+{"kind": "audio", "atS": 12.5, "streamS": 12.63, "hopS": 0.5, "windowS": 2.0,
+ "scores": {"Wail, moan": 0.0021, "Groan": 0.0007, "Breathing": 0.31, "...": "..."},
+ "pitch": {"pitchHz": 142.3, "pitchConfidence": 0.61, "voicedFramePct": 38.2,
+           "loudnessDbfs": -31.4},
+ "frames": [[12.032, -47.2, null], [12.048, -41.9, 139.8], "..."]}
+```
+
+Sent only when the stream has an audio track (`workload/audio/audio_stage.py`).
+
+- `atS`: end of this hop on the audio clock (seconds of audio decoded since
+  the session's audio began); `streamS`: the producer's frame clock at the
+  moment the message was built, so the two can be lined up. `hopS` is the
+  hop's length, `windowS` the length of the trailing window the scores and
+  pitch summary were computed over (2 s once that much has been heard).
+- `scores`: the CED classifier's score per label, for the labels in
+  `workload/audio/ced.py` (`TARGET_LABELS`: the AudioSet classes Screaming;
+  Crying, sobbing; Whimper; Wail, moan; Sigh; Groan; Grunt; Breathing; Gasp;
+  Pant; and Speech, the last so that a voice in the room can be told apart
+  from the others). Each is a probability-like number in [0, 1]. No other
+  class of the model's 527 is sent.
+- `pitch`: over the same window, the median fundamental frequency in Hz of
+  the frames that had one (`null` if none did), the median periodicity
+  confidence of those frames, the percentage of frames that had a pitch,
+  and the RMS level in dBFS.
+- `frames`: the contour of the new samples, one entry per 16 ms frame
+  (64 ms window): `[time on the audio clock, level in dBFS, pitch in Hz or
+  null]`. Every frame is sent exactly once. A frame is about 40 bytes; a
+  second of audio becomes about 60 frames.
+
+Nothing in an `audio` message can be turned back into sound: a level and a
+pitch per 16 ms is not a waveform, and the labels are class scores.
+
+### `segment`, in reply to `classify`
+
+```json
+{"kind": "segment", "id": 17, "fromS": 11.62, "toS": 12.31,
+ "ced": {"topLabel": "Groan", "topScore": 0.412, "scores": {"...": "..."}},
+ "pitch": {"medianHz": 118.4, "p10Hz": 109.0, "p90Hz": 131.2,
+           "slopeHzPerS": -14.0, "voicedFraction": 0.72, "voicedFrames": 31,
+           "pitchReliable": true, "confidence": 0.7, "frames": 43},
+ "loudness": {"peakDbfs": -18.2, "meanDbfs": -26.9, "rmsDbfs": -25.1},
+ "spectral": {"centroidHz": 812.5, "rolloff85Hz": 1890.6}}
+```
+
+The same kind of measurements over one span the analysis asked about
+(`workload/audio/audio_features.py`): the classifier's scores over the span
+(centred in at least one second of surrounding audio, which the classifier
+needs), an F0 summary, a loudness summary, and the spectral centroid and 85%
+rolloff. The span is taken from the producer's 20 s rolling history of the
+audio; a span it no longer holds, or a malformed one, is answered with
+`{"kind": "segment", "id": 17, "error": "expired" | "span" | "empty" |
+"busy" | "closed" | "no-audio"}` instead.
 
 ### `stop`, once, last
 
@@ -174,6 +237,18 @@ Numbers for the producer's telemetry line and `/status` snapshot.
 
 Printed by the producer to its own log.
 
+### `classify`
+
+```json
+{"kind": "classify", "id": 17, "fromS": 11.62, "toS": 12.31}
+```
+
+A request to measure one span of the audio (at most 10 s long, on the audio
+clock), answered with a `segment`. This is how the analysis types a sound
+it noticed in the frame contour: it names the span, the producer measures
+it. The request carries two timestamps and an id; it cannot ask for
+samples, and the reply never contains any.
+
 ### `summary`, once, in reply to `stop`
 
 ```json
@@ -186,10 +261,12 @@ prints at exit. Keys the producer owns (`bootMs`, `counters`, `gauges`,
 
 ## What this means for a user
 
-Frames exist in the producer process and nowhere else. Between the
-producer and the analysis process travel keypoints (named points in pixel
-coordinates), the descriptors above (per-window statistics of brightness
-and optical flow in a body-carried frame), and the analysis's own numbers
+Frames and audio samples exist in the producer process and nowhere else.
+Between the producer and the analysis process travel keypoints (named
+points in pixel coordinates), the descriptors above (per-window statistics
+of brightness and optical flow in a body-carried frame), the audio
+measurements above (class scores, a level and a pitch per frame, and the
+same over spans the analysis asks about), and the analysis's own numbers
 coming back. The analysis bundle can be shown to be the one the lock names
 (its SHA-256 is checked before it starts, and the lock is inside the
 attested image) even though its source is not published.

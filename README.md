@@ -14,7 +14,7 @@ confidential-computing mode) in the dedicated project
 `prod-masseuse-video-tee`. This repository is that VM's infrastructure, the
 container image it runs, and the tools to verify both.
 
-## What happens to your video
+## What happens to your video and audio
 
 Inside the enclave, in code that is in this repository:
 
@@ -27,24 +27,33 @@ Inside the enclave, in code that is in this repository:
 - An annotated view (skeleton, boxes, a status line) is drawn on the frames
   and streamed back to the same device that sent the video, and to nothing
   else.
-- Frames are then discarded. Nothing is written to disk; the VM has no
-  persistent storage and no operator can read its memory.
+- When the stream carries an audio track (the phone's microphone travels
+  with its camera unless you turn it off with `?mic=0`; a network camera's
+  microphone, when it has one), the audio is decoded to 16 kHz mono and,
+  every half second, a two-second window is classified into non-speech
+  vocalization categories (the CED audio tagger, AudioSet labels such as
+  breathing, groan, gasp, sigh, and "speech" so that talk can be told apart
+  and set aside) along with its level and pitch. No speech recognition or
+  transcription runs; nothing identifies the voice.
+- Frames and audio are then discarded. Nothing is written to disk; the VM
+  has no persistent storage and no operator can read its memory.
 
-The keypoints and descriptors, which identify nobody, go to an analysis
-module that turns them into a few numbers per second for the trainer (the
-masseuse.ai service on Cloud Run). The analysis module runs inside the same
-enclave as a separate process, receives no frames, and its logic is not
-published; its exact version is pinned by hash in this repository so the
-attested image says which one is running. The numbers, never frames, are
-what leaves the enclave, over TLS to the trainer's address that is itself
-part of the attestation.
+The keypoints, descriptors and vocalization labels, which identify nobody,
+go to an analysis module that turns them into a few numbers per second for
+the trainer (the masseuse.ai service on Cloud Run). The analysis module
+runs inside the same enclave as a separate process, receives no frames and
+no audio, and its logic is not published; its exact version is pinned by
+hash in this repository so the attested image says which one is running.
+The numbers, never frames or sound, are what leaves the enclave, over TLS to
+the trainer's address that is itself part of the attestation.
 
 All of that is `workload/`: `pixel/` is the decode geometry, person
-detection, keypoint detection and motion descriptors; `producer/` is the
-session shell that runs them, draws the overlay and speaks to the analysis
-module over a local socket; `tee/` is the container image and its
-entrypoint. `analysis/protocol.md` names every field that crosses to the
-analysis module and every field that comes back.
+detection, keypoint detection and motion descriptors; `audio/` is the audio
+decode, the classifier binding and the level and pitch measurements;
+`producer/` is the session shell that runs them, draws the overlay and
+speaks to the analysis module over a local socket; `tee/` is the container
+image and its entrypoint. `analysis/protocol.md` names every field that
+crosses to the analysis module and every field that comes back.
 
 Every published image is built from a tagged commit of this repository by
 its release workflow (`.github/workflows/release.yml`) on GitHub Actions,
@@ -121,6 +130,7 @@ check that should hold and does not.
 | Path | What |
 | --- | --- |
 | `workload/pixel/` | Everything that reads frames: decode geometry and stream handling (`live_pose.py`), RT-DETRv4 person detection (`vendor/rtdetrv4/`, `pose_track.py`), Sapiens2-1B keypoints (`pose_rows.py`, `keypoints.py`), regional motion descriptors (`motion.py`) |
+| `workload/audio/` | Everything that reads sound: the audio track decoded to 16 kHz PCM (`audio_stage.py`), the CED non-speech vocalization classifier binding (`ced.py`; the library and weights are built into the image, `Dockerfile.tee`), level and pitch (`pitch.py`, `audio_features.py`) |
 | `workload/producer/` | The session shell (`producer.py`), the overlay drawn back to the phone, the WHIP/WHEP relay proxy with the capability and evidence checks, the external-camera and connector ingest, the enclave's boot helpers (attestation, ACME, weights and analysis bundle fetch), the socket client to the analysis module |
 | `workload/tee/` | The image: `Dockerfile` (base: Python, torch, ffmpeg), `Dockerfile.tee` (MediaMTX, Caddy, the connector gateway, the launch policy), `entrypoint.sh`, `Caddyfile`, `mediamtx.tee.yml` |
 | `workload/tests/` | The workload's tests, CPU only |
