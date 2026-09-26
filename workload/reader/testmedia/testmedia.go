@@ -35,9 +35,16 @@ func FFmpeg(t testing.TB) string {
 // delimiter starting each unit, and returns the units' NAL units.
 func H264Units(t testing.TB, frames, gop int) [][][]byte {
 	t.Helper()
+	return H264UnitsSized(t, Width, Height, frames, gop)
+}
+
+// H264UnitsSized is H264Units at a picture size of the caller's choosing:
+// two sizes in a row stand for a sender whose picture turned.
+func H264UnitsSized(t testing.TB, width, height, frames, gop int) [][][]byte {
+	t.Helper()
 	ffmpeg := FFmpeg(t)
 	cmd := exec.Command(ffmpeg, "-hide_banner", "-loglevel", "error", "-nostdin",
-		"-f", "lavfi", "-i", "testsrc=size=320x240:rate=30",
+		"-f", "lavfi", "-i", "testsrc=size="+itoa(width)+"x"+itoa(height)+":rate=30",
 		"-frames:v", itoa(frames), "-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency",
 		"-x264-params", "aud=1:keyint="+itoa(gop)+":min-keyint="+itoa(gop)+":scenecut=0:repeat-headers=1",
 		"-f", "h264", "-")

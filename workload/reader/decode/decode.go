@@ -276,13 +276,16 @@ func parseFrameLine(line string) (frameLine, bool) {
 }
 
 // readFrames reads fixed-size frames from ffmpeg's stdout and writes each
-// as a record with the unit its metadata line names.
+// as a record with the unit its metadata line names. Frames and lines are
+// one to one: every frame passes the print filter once. The line's own
+// frame counter is not relied on - when the sender's picture changes size
+// (a phone turned), ffmpeg rebuilds the filter graph and the counter
+// starts again from zero, while the PTS carries on.
 func (d *Decoder) readFrames(r io.Reader) {
 	defer d.finish()
 	length := record.FrameLength(d.opts.Width, d.opts.Height)
 	buf := make([]byte, record.Size+length)
 	br := bufio.NewReaderSize(r, 1<<20)
-	var index int64
 	for {
 		if _, err := io.ReadFull(br, buf[record.Size:]); err != nil {
 			if !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) {
@@ -294,9 +297,6 @@ func (d *Decoder) readFrames(r io.Reader) {
 		if !ok {
 			d.fail(errors.New("decode: metadata pipe closed before its frame"))
 			return
-		}
-		for ok && line.index < index {
-			line, ok = <-d.lines // should not happen; catch up
 		}
 		au := d.pair(line.pts)
 		h := record.Header{
@@ -326,7 +326,6 @@ func (d *Decoder) readFrames(r io.Reader) {
 			d.stats.Frames++
 			d.mu.Unlock()
 		}
-		index++
 	}
 }
 

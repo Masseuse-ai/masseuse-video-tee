@@ -163,6 +163,65 @@ func TestFramesArriveAsUnitsArePushed(t *testing.T) {
 	}
 }
 
+func TestAPictureThatTurnsKeepsItsFramesComing(t *testing.T) {
+	// The phone is turned: the sender's next keyframe has the other
+	// orientation. ffmpeg rebuilds its filter graph for the new size and
+	// starts its frame counter again from zero; the records must keep
+	// coming, paired by PTS, at the fixed record size. Before the pairing
+	// stopped relying on the counter, the reader waited for a counter that
+	// never caught up while ffmpeg blocked on a full pipe, and the view
+	// was gone for the rest of the session.
+	ffmpeg := testmedia.FFmpeg(t)
+	landscape := testmedia.H264UnitsSized(t, 320, 240, 20, 10)
+	portrait := testmedia.H264UnitsSized(t, 240, 320, 20, 10)
+	units := append(landscape, portrait...)
+	r, w := newPipe()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	dec, err := New(ctx, w, Options{FFmpeg: ffmpeg, Width: 160, Height: 120, Codec: source.H264, Logf: t.Logf,
+		LogLevel: "error"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer dec.Close()
+	length := record.Size + record.FrameLength(160, 120)
+	recs := r.records(length)
+	for i, nalus := range units {
+		au := &source.AccessUnit{Seq: uint32(i), NALUs: nalus, PTS: int64(i) * 3000, RTPTs: uint32(i) * 3000,
+			Keyframe: i%10 == 0}
+		if err := dec.Push(au); err != nil {
+			t.Fatalf("push %d: %v", i, err)
+		}
+		time.Sleep(33 * time.Millisecond)
+	}
+	dec.Flush(10 * time.Second)
+	var got []uint32
+	deadline := time.After(5 * time.Second)
+	for len(got) < len(units) {
+		select {
+		case rec := <-recs:
+			h, err := record.Unmarshal(rec)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if h.Width != 160 || h.Height != 120 {
+				t.Fatalf("record of %dx%d", h.Width, h.Height)
+			}
+			got = append(got, h.Seq)
+		case <-deadline:
+			t.Fatalf("%d of %d frames after the picture turned: %v", len(got), len(units), got)
+		}
+	}
+	for i, seq := range got {
+		if seq != uint32(i) {
+			t.Fatalf("frames out of order or mispaired: %v", got)
+		}
+	}
+	if st := dec.Stats(); st.Unpaired != 0 || st.Dropped != 0 {
+		t.Fatalf("stats %+v", st)
+	}
+}
+
 func TestParseFrameLine(t *testing.T) {
 	fl, ok := parseFrameLine("frame:12   pts:129000  pts_time:1.433333")
 	if !ok || fl.index != 12 || fl.pts != 129000 {
