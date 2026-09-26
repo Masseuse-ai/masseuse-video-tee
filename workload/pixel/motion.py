@@ -24,7 +24,10 @@ Three pieces:
                      support surface beside the body as a registration
                      control, dense optical flow (Farneback) runs between
                      consecutive strips, and the flow and brightness fields
-                     are reduced to per-window statistics. Two cadences,
+                     are reduced to per-window statistics; the valley the
+                     brightness profile has where the two halves meet is
+                     measured along an axis fitted once per session
+                     (MidlineTracker). Two cadences,
                      30 fps pairs and 6 fps pairs, because a statistic over a
                      0.033 s pair and one over a 0.167 s pair are different
                      measurements and the analysis wants both. The slow
@@ -512,6 +515,224 @@ def half_means(flow: np.ndarray, window: Window,
     )
 
 
+# ---------------------------------------------------------------------------
+# The midline valley: the dark groove between the two halves, as a width
+# ---------------------------------------------------------------------------
+#
+# The brightness profile across the strip has a valley where the two halves
+# of the region meet. Its width is a shape statistic of the surface that
+# the profile ranges above do not carry: how far apart the two halves sit.
+# The valley is located once per session - its axis fitted on the running
+# mean strip - and measured every frame along that axis: per row the floor
+# is re-found within VALLEY_HALF of the axis (registration wobble moves it a
+# few pixels), its depth is read against the surface VALLEY_SHOULDERS away
+# on either side, and the width is the contiguous run of columns darker
+# than half that depth. Width and darkness deficit area in hip widths,
+# depth and on-axis level as fractions of the shoulders' brightness.
+
+# Axial rows the axis is fitted and the valley measured over.
+VALLEY_ROWS = (-0.20, 0.50)
+
+# How far off the strip midline the axis may sit, in hip widths; an oblique
+# camera puts it well off centre and the fitted line tilts with the frame.
+VALLEY_SEARCH = 0.35
+
+# Per row and frame the valley floor is looked for within this of the axis.
+VALLEY_HALF = 0.08
+
+# The surface the valley is measured against: this far from the axis, either
+# side, in hip widths - past the valley's shoulders, inside the halves.
+VALLEY_SHOULDERS = (0.15, 0.35)
+
+# Half-width of the on-axis brightness sample, in hip widths.
+VALLEY_ON_AXIS = 0.03
+
+# The valley is measured on a lightly blurred strip: SMOOTH_HIP_WIDTHS is
+# sized to erase fine texture and would widen a 0.13-0.20 hip-width valley
+# by a third of itself.
+VALLEY_SHARP_HIP_WIDTHS = 0.015
+
+# A fitted axis is usable when the valley on the mean strip is at least this
+# deep, relative to its shoulders, and the per-row floors scatter no more
+# than this about the fitted line; a strip with no valley in view (a side
+# camera) fails both and the analysis ignores the measurement.
+VALLEY_MIN_DEPTH = 0.05
+VALLEY_MAX_SPREAD = 0.06
+
+# Streaming fit: the axis is first fitted after this many seconds of strips,
+# then re-fitted at this interval from a running mean whose time constant is
+# VALLEY_MEAN_TAU_S. The per-frame search absorbs a small axis error, so the
+# refit only has to follow a change of position, not every wobble.
+VALLEY_WARMUP_S = 3.0
+VALLEY_REFIT_S = 2.0
+VALLEY_MEAN_TAU_S = 20.0
+
+
+@dataclass(frozen=True)
+class MidlineAxis:
+    """Where the valley runs on this strip, fitted on the mean strip.
+
+    `column(row)` is the axis column at a canonical row; `offset` is that
+    column at axial +0.15 as hip widths off the strip midline, `slope` in
+    columns per row, `depth` the median relative valley depth along the
+    axis on the mean strip and `spread` the residual scatter of the per-row
+    floors about the line, in hip widths.
+    """
+
+    offset: float
+    slope: float
+    depth: float
+    spread: float
+
+    @property
+    def usable(self) -> bool:
+        return (np.isfinite(self.depth) and self.depth >= VALLEY_MIN_DEPTH
+                and np.isfinite(self.spread)
+                and self.spread <= VALLEY_MAX_SPREAD)
+
+    def column(self, row: float) -> float:
+        anchor = row_for(0.15)
+        return COLUMNS / 2 + self.offset * SCALE + self.slope * (row - anchor)
+
+    def as_json(self) -> dict:
+        return {"offset": self.offset, "slope": self.slope,
+                "depth": self.depth, "spread": self.spread}
+
+
+def _valley_rows(step: int = 1) -> range:
+    window = Window(*VALLEY_ROWS).rows()
+    return range(window.start, window.stop, step)
+
+
+def _shoulders(line: np.ndarray, centre: int) -> np.ndarray:
+    near = int(round(VALLEY_SHOULDERS[0] * SCALE))
+    far = int(round(VALLEY_SHOULDERS[1] * SCALE))
+    left = line[max(0, centre - far):max(0, centre - near)]
+    right = line[min(len(line), centre + near):min(len(line), centre + far)]
+    return np.concatenate([left, right])
+
+
+def fit_midline_axis(mean_strip: np.ndarray) -> MidlineAxis:
+    """The valley's axis on a mean strip: a Theil-Sen line through the
+    darkest column of each row, the search limited to VALLEY_SEARCH either
+    side of the midline. Robust to a few rows where something else is
+    darker than the valley."""
+    rows = np.array(list(_valley_rows()), dtype=float)
+    low = int(round(COLUMNS / 2 - VALLEY_SEARCH * SCALE))
+    high = int(round(COLUMNS / 2 + VALLEY_SEARCH * SCALE))
+    floors = np.array([
+        low + int(np.argmin(mean_strip[int(row), low:high])) for row in rows
+    ], dtype=float)
+    depths = []
+    for row, column in zip(rows, floors.astype(int)):
+        line = mean_strip[int(row)]
+        shoulders = _shoulders(line, column)
+        if not shoulders.size:
+            depths.append(0.0)
+            continue
+        base = float(np.median(shoulders))
+        depths.append((base - float(line[column])) / max(base, 1.0))
+    first, second = np.triu_indices(len(rows), 1)
+    slopes = (floors[second] - floors[first]) / (rows[second] - rows[first])
+    slope = float(np.median(slopes)) if slopes.size else 0.0
+    intercept = float(np.median(floors - slope * rows))
+    anchor = row_for(0.15)
+    offset = (slope * anchor + intercept - COLUMNS / 2) / SCALE
+    residual = floors - (slope * rows + intercept)
+    return MidlineAxis(offset=float(offset), slope=slope,
+                       depth=float(np.median(depths)) if depths else float("nan"),
+                       spread=float(residual.std() / SCALE))
+
+
+def midline_valley(sharp: np.ndarray, axis: MidlineAxis
+                   ) -> tuple[float, float, float, float] | None:
+    """(width, area, depth, level) of the valley on one frame along the axis.
+
+    Per row: the floor is the darkest column within VALLEY_HALF of the
+    axis; depth is the shoulders' median brightness minus the floor, as a
+    fraction of the shoulders; width is the contiguous run of columns
+    through the floor darker than half way down, in hip widths; area is the
+    darkness deficit summed across the shoulder span, in hip widths of
+    brightness fraction; level is the mean on the axis itself over the
+    shoulders' median. Rows whose shoulder span leaves the strip are
+    skipped; None if none remain.
+    """
+    half = int(round(VALLEY_HALF * SCALE))
+    far = int(round(VALLEY_SHOULDERS[1] * SCALE))
+    on = max(1, int(round(VALLEY_ON_AXIS * SCALE)))
+    widths, depths, areas, levels = [], [], [], []
+    for row in _valley_rows(2):
+        centre = int(round(axis.column(row)))
+        if centre - far < 0 or centre + far >= COLUMNS:
+            continue
+        line = sharp[row]
+        base = float(np.median(_shoulders(line, centre)))
+        segment = line[centre - half:centre + half + 1]
+        floor = centre - half + int(np.argmin(segment))
+        valley = float(line[floor])
+        depth = (base - valley) / max(base, 1.0)
+        threshold = base - 0.5 * (base - valley)
+        width = 1
+        index = floor - 1
+        while index > centre - far and line[index] < threshold:
+            width += 1
+            index -= 1
+        index = floor + 1
+        while index < centre + far and line[index] < threshold:
+            width += 1
+            index += 1
+        span = line[centre - far:centre + far]
+        widths.append(width / SCALE)
+        depths.append(depth)
+        areas.append(float(np.clip(base - span, 0.0, None).sum()
+                           / max(base, 1.0) / SCALE))
+        levels.append(float(line[centre - on:centre + on + 1].mean())
+                      / max(base, 1.0))
+    if not widths:
+        return None
+    return (float(np.mean(widths)), float(np.mean(areas)),
+            float(np.mean(depths)), float(np.mean(levels)))
+
+
+class MidlineTracker:
+    """The axis fitted on the running mean strip, the valley measured per
+    frame along it - held open across a stream, one per cadence.
+
+    `update` takes the blurred strip (what the axis is fitted on; the blur
+    makes the darkest column the valley rather than texture) and the sharp
+    strip the valley is measured on, and returns the measurement and the
+    axis in force, both None until `warmup_frames` strips have been seen.
+    The mean is a plain average through warm-up and an exponential one
+    afterwards; the axis is re-fitted every `refit_frames`.
+    """
+
+    def __init__(self, fps: float):
+        self.warmup_frames = max(1, int(round(VALLEY_WARMUP_S * fps)))
+        self.refit_frames = max(1, int(round(VALLEY_REFIT_S * fps)))
+        self.alpha = 1.0 - float(np.exp(-1.0 / max(VALLEY_MEAN_TAU_S * fps, 1.0)))
+        self.count = 0
+        self.mean: np.ndarray | None = None
+        self.axis: MidlineAxis | None = None
+
+    def update(self, blurred: np.ndarray, sharp: np.ndarray
+               ) -> tuple[tuple[float, float, float, float] | None,
+                          MidlineAxis | None]:
+        current = blurred.astype(np.float32)
+        if self.mean is None:
+            self.mean = current.copy()
+        elif self.count < self.warmup_frames:
+            self.mean += (current - self.mean) / (self.count + 1)
+        else:
+            self.mean += self.alpha * (current - self.mean)
+        self.count += 1
+        if self.count < self.warmup_frames:
+            return None, None
+        if (self.axis is None
+                or (self.count - self.warmup_frames) % self.refit_frames == 0):
+            self.axis = fit_midline_axis(self.mean)
+        return midline_valley(sharp, self.axis), self.axis
+
+
 @dataclass(frozen=True)
 class RigidMotion:
     """A flow field split into what a rigid patch could do and what is left.
@@ -603,6 +824,8 @@ class StripDescriptor:
     rigid: RigidMotion | None
     control_rigid: RigidMotion | None
     half_flow: tuple[tuple[float, float], tuple[float, float]] | None
+    midline_valley: tuple[float, float, float, float] | None = None
+    midline_axis: MidlineAxis | None = None
 
     def as_json(self) -> dict:
         """Full precision: the wire carries exactly what was measured."""
@@ -623,6 +846,10 @@ class StripDescriptor:
                              if self.control_rigid else None),
             "halfFlow": ([list(half) for half in self.half_flow]
                          if self.half_flow is not None else None),
+            "midlineValley": (list(self.midline_valley)
+                              if self.midline_valley is not None else None),
+            "midlineAxis": (self.midline_axis.as_json()
+                            if self.midline_axis is not None else None),
         }
 
 
@@ -630,14 +857,19 @@ def describe(patch: np.ndarray, previous: np.ndarray | None,
              control: np.ndarray | None = None,
              previous_control: np.ndarray | None = None,
              midline_offset: float = MIDLINE_OFFSET,
-             at_s: float = 0.0) -> StripDescriptor:
+             at_s: float = 0.0,
+             midline_valley: tuple[float, float, float, float] | None = None,
+             midline_axis: MidlineAxis | None = None) -> StripDescriptor:
     """Every strip statistic for one frame, from one warp.
 
     `previous` is the preceding frame's strip, or None when the pair is not
     consecutive: a dropped frame makes a flow field between two moments that
     are not one step apart, and its gradient would be scaled wrongly rather
     than merely noisy. `previous_control` exists so the rigid split has its
-    control computed through the identical arithmetic.
+    control computed through the identical arithmetic. `midline_valley` and
+    `midline_axis` come from a `MidlineTracker` fed the same strip and its
+    sharp counterpart; they are carried, not computed here, because the axis
+    is a running property of the stream rather than of one frame.
     """
     left, right = halves(midline_offset)
     values = {
@@ -677,7 +909,9 @@ def describe(patch: np.ndarray, previous: np.ndarray | None,
                                         midline_offset)
     return StripDescriptor(at_s=at_s, profile_range=values, control=controls,
                            axial_strain=strain, rigid=rigid,
-                           control_rigid=control_rigid, half_flow=half_flow)
+                           control_rigid=control_rigid, half_flow=half_flow,
+                           midline_valley=midline_valley,
+                           midline_axis=midline_axis)
 
 
 # ---------------------------------------------------------------------------
@@ -699,11 +933,14 @@ class MotionSample:
 
 
 class _PairState:
-    def __init__(self):
+    def __init__(self, fps: float):
         self.frame: int = -(10 ** 9)
         self.patch = None
         self.strip = None
         self.control = None
+        # The valley's axis is a property of the session at this cadence,
+        # fitted on the running mean strip; it outlives dropped frames.
+        self.midline = MidlineTracker(fps)
 
 
 class DescriptorWorker:
@@ -716,8 +953,8 @@ class DescriptorWorker:
     """
 
     def __init__(self):
-        self.fast = _PairState()
-        self.slow = _PairState()
+        self.fast = _PairState(30.0)
+        self.slow = _PairState(30.0 / FRAMES_PER_POSE)
 
     @staticmethod
     def _measure(state: _PairState, row: dict, image: np.ndarray,
@@ -729,6 +966,9 @@ class DescriptorWorker:
             return None
         patch = region_patch(image, frame)
         current = strip(image, frame)
+        # The same strip lightly blurred, for the valley between the halves.
+        sharp = strip(image, frame, smooth_hip_widths=VALLEY_SHARP_HIP_WIDTHS)
+        valley, axis = state.midline.update(current, sharp)
         control = strip(image, frame, lateral_offset=CONTROL_LATERAL)
         sample = None
         if state.patch is not None and row["frame"] == state.frame + stride:
@@ -741,6 +981,7 @@ class DescriptorWorker:
                     current, state.strip, control=control,
                     previous_control=state.control,
                     at_s=float(row["atS"]),
+                    midline_valley=valley, midline_axis=axis,
                 ),
                 region_axial_flow=float(registered[..., 1].mean()),
             )

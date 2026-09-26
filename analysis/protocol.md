@@ -147,6 +147,8 @@ A descriptor (`workload/pixel/motion.py`, `MotionSample.as_json`):
 | `rigid` | least-squares similarity fit of the same flow: `translation` `[lateral, axial]`, `omega`, `scale`, and `deform` `[left, right]` (RMS residual per half), or `null` |
 | `controlRigid` | the same fit on the control strip's flow, or `null` |
 | `halfFlow` | `[[lateral, axial], [lateral, axial]]` mean flow per half, or `null` |
+| `midlineValley` | `[width, area, depth, level]` of the dark valley the brightness profile has where the two halves meet, measured along a per-session axis: half-depth width and darkness-deficit area in hip widths, depth and on-axis level as fractions of the surface brightness beside it; `null` until the axis is fitted (the first 3 s of a stream) |
+| `midlineAxis` | the fitted axis the valley is measured along: `offset` (hip widths off the strip midline), `slope` (columns per row), `depth` and `spread` (its median relative depth and the scatter of the per-row floors about the line, in hip widths, on the running mean strip: the analysis ignores the valley when the axis is not credible); `null` with `midlineValley` |
 | `regionAxialFlow` | mean axial optical flow over the square hip-region patch |
 
 Units: hip widths for positions, canonical pixels per frame for flow, grey
