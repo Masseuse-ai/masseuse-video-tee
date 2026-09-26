@@ -2,7 +2,7 @@
 
 These summarise a segment the analysis process asked about (a sound it
 proposed from the frame levels it was streamed, see `audio_stage.py`) into
-a handful of numbers: an F0 summary, a loudness summary and two spectral
+a handful of numbers: an F0 summary, a loudness summary and four spectral
 shape statistics. They are computed here, in the process that holds the
 samples, and only the numbers cross the socket.
 """
@@ -76,21 +76,37 @@ def loudness_stats(segment: np.ndarray) -> dict:
     }
 
 
+# Power below this frequency is where a machine's or a massager's hum sits;
+# its share of the segment's power says how much of the sound is that.
+LOW_BAND_HZ = 300.0
+
+_NO_SPECTRUM = {"centroidHz": None, "rolloff85Hz": None, "flatness": None, "lowShare300": None}
+
+
 def spectral_stats(segment: np.ndarray) -> dict:
-    """Centroid and 85% rolloff: breathy versus voiced, in two numbers."""
+    """Centroid and 85% rolloff (breathy versus voiced), the spectral
+    flatness of the power spectrum (0 for a pure tone, 1 for white noise)
+    and the share of power under LOW_BAND_HZ (a hum against a voice)."""
     if segment.size < 256:
-        return {"centroidHz": None, "rolloff85Hz": None}
+        return dict(_NO_SPECTRUM)
     window = np.hanning(segment.size).astype(np.float64)
     spectrum = np.abs(np.fft.rfft(segment.astype(np.float64) * window))
     freqs = np.fft.rfftfreq(segment.size, 1.0 / SAMPLE_RATE)
     total = float(spectrum.sum())
     if total <= 1e-12:
-        return {"centroidHz": None, "rolloff85Hz": None}
+        return dict(_NO_SPECTRUM)
     centroid = float((freqs * spectrum).sum() / total)
     cumulative = np.cumsum(spectrum)
     index = int(np.searchsorted(cumulative, 0.85 * total))
     rolloff = float(freqs[min(index, len(freqs) - 1)])
+    power = spectrum ** 2
+    power_total = float(power.sum())
+    geometric = float(np.exp(np.mean(np.log(power + 1e-20))))
+    flatness = geometric / (power_total / len(power))
+    low_share = float(power[freqs < LOW_BAND_HZ].sum() / power_total)
     return {
         "centroidHz": round(centroid, 1),
         "rolloff85Hz": round(rolloff, 1),
+        "flatness": round(flatness, 4),
+        "lowShare300": round(low_share, 4),
     }

@@ -77,7 +77,11 @@ import torch, torchvision, torchvision.ops, transformers, cv2, scipy, numpy, PIL
 import pose_track, live_pose, motion, tee_mode, tee_models, tee_eab, relay_proxy, analysis_link, camlink_gateway, external_source, share, egress, overlay, sinks; \\
 import audio_stage, audio_features, pitch, ced; \\
 engine = ced.CedEngine(); scores = engine.classify(numpy.zeros(16000, dtype=numpy.float32)); \\
-assert set(scores) == set(ced.TARGET_LABELS), scores; print('ced', engine.version, len(engine.labels), 'labels'); \\
+assert set(scores) == set(ced.TARGET_LABELS), scores; \\
+table = engine.classify_all(numpy.zeros(16000, dtype=numpy.float32)); \\
+assert len(table) == len(engine.labels) == engine.class_count, len(table); \\
+assert engine.target_scores(table) == scores, 'table and target scores disagree'; \\
+print('ced', engine.version, len(engine.labels), 'labels'); \\
 print('torch', torch.__version__, 'torchvision', torchvision.__version__, 'transformers', transformers.__version__, 'cuda', torch.version.cuda)" \\
  && python3 /app/workload/producer/producer.py --help > /dev/null \\
  && python3 /app/workload/producer/tee_models.py --help > /dev/null \\

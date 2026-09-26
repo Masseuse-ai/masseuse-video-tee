@@ -8,8 +8,10 @@ it into numbers for the analysis process (analysis/protocol.md):
 
 - every `HOP_S`, an `audio` message: the classifier's scores for the
   non-speech vocalization labels (`ced.TARGET_LABELS`) over the trailing
-  `WINDOW_S` window, a pitch and level summary of the same window, and the
-  per-frame level and pitch contour of the new samples;
+  `WINDOW_S` window, the whole class table over the same window (`all`, one
+  score per class in the model's order, so the analysis can read the room:
+  music, a fan, rain, a machine's hum), a pitch and level summary of the
+  window, and the per-frame level and pitch contour of the new samples;
 - on request (`classify`, from the analysis), a `segment` message: the
   same measurements over one short span the analysis names, taken from the
   history, so that a sound it proposed from the frame contour can be typed
@@ -198,11 +200,30 @@ def _round_scores(raw: dict) -> dict[str, float]:
     return {label: round(float(raw.get(label, 0.0)), 6) for label in TARGET_LABELS}
 
 
+# The whole class table is rounded to this many decimals: 527 scores a hop
+# stay near 3 KB of JSON, and a fourth decimal of a class probability is
+# below anything the analysis reads.
+ALL_SCORES_DECIMALS = 4
+
+
+def classify_scores(classifier, wav: np.ndarray) -> tuple[dict[str, float], list[float] | None]:
+    """One classifier call: the TARGET_LABELS scores, and the whole table
+    when the classifier has one (`classify_all` and `target_scores`, as
+    ced.CedEngine; a stand-in with only `classify` gives no table)."""
+    classify_all = getattr(classifier, "classify_all", None)
+    if classify_all is None:
+        return _round_scores(classifier.classify(wav)), None
+    vector = classify_all(wav)
+    scores = _round_scores(classifier.target_scores(vector))
+    return scores, [round(float(value), ALL_SCORES_DECIMALS) for value in vector]
+
+
 class AudioStage(threading.Thread):
     """Consumes PCM chunks, emits `audio` messages, answers `classify`.
 
     `classifier` has `classify(wav) -> {label: score}` (ced.CedEngine, or a
-    stand-in); `emit` receives every outgoing message; `stream_clock` returns
+    stand-in) and, when it can, `classify_all(wav)` for the whole class
+    table; `emit` receives every outgoing message; `stream_clock` returns
     the producer's current stream time so the analysis can line the audio
     clock up with the frames.
     """
@@ -277,7 +298,7 @@ class AudioStage(threading.Thread):
         # to half real time and the pre-current baseline minute took two.
         with self.telemetry.time_stage("audio"):
             with self.telemetry.time_stage("audioClassify"):
-                scores = _round_scores(self.classifier.classify(window))
+                scores, table = classify_scores(self.classifier, window)
             with self.telemetry.time_stage("audioPitch"):
                 pitch = self.pitch_estimator(window, SAMPLE_RATE)
             with self.telemetry.time_stage("audioFrames"):
@@ -291,7 +312,7 @@ class AudioStage(threading.Thread):
         stream_s = self.stream_clock()
         if stream_s is not None:
             self.telemetry.gauge("audioLagS", float(stream_s) - end_s)
-        self.emit({
+        message = {
             "kind": "audio",
             "atS": round(end_s, 3),
             "streamS": round(float(stream_s), 3) if stream_s is not None else None,
@@ -305,7 +326,10 @@ class AudioStage(threading.Thread):
                 "loudnessDbfs": pitch.get("loudnessDbfs"),
             },
             "frames": frames,
-        })
+        }
+        if table is not None:
+            message["all"] = table
+        self.emit(message)
 
     def _fresh_frames(self, start_s: float, end_s: float) -> list[list]:
         """The frame contour of the new samples: `[time, dBFS, Hz | null]`
@@ -385,14 +409,17 @@ class AudioStage(threading.Thread):
                                  - history_start_s) * SAMPLE_RATE))
             ced_segment = self.history[pad_lo:pad_lo + min_samples]
         with self.telemetry.time_stage("audioSegment"):
-            scores = _round_scores(self.classifier.classify(ced_segment))
+            scores, table = classify_scores(self.classifier, ced_segment)
             top = max(scores.items(), key=lambda kv: kv[1])
+            ced = {"topLabel": top[0], "topScore": top[1], "scores": scores}
+            if table is not None:
+                ced["all"] = table
             measured = {
                 "kind": "segment",
                 "id": request_id,
                 "fromS": round(from_s, 3),
                 "toS": round(to_s, 3),
-                "ced": {"topLabel": top[0], "topScore": top[1], "scores": scores},
+                "ced": ced,
                 "pitch": pitch_stats(segment),
                 "loudness": loudness_stats(segment),
                 "spectral": spectral_stats(segment),

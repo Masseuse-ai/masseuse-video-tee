@@ -4,12 +4,14 @@ CED (Consistent Ensemble Distillation, Xiaomi's `mispeech/ced-small`) is an
 AudioSet tagger: given a few seconds of 16 kHz mono audio it scores each of
 the 527 AudioSet classes. The enclave runs the GGUF conversion of the small
 model through ced.cpp (`workload/tee/Dockerfile.tee` builds the library and
-pins the weights by SHA-256), and keeps only the scores for the labels
+pins the weights by SHA-256). `classify` keeps the scores for the labels
 below: the non-speech vocalization classes the analysis is about, plus
 `Speech` so that a voice in the room (the massage guidance playing out of
-the phone, a person talking) can be told apart from them. Nothing else about
-the audio leaves this module: the input is samples, the output is one float
-per label.
+the phone, a person talking) can be told apart from them. `classify_all`
+returns the whole table, one score per class in the model's own order, so
+that the analysis can also read the room (music, a fan, rain, a machine's
+hum) and tell it from the person. Nothing else about the audio leaves this
+module: the input is samples, the output is floats, one per label.
 """
 
 from __future__ import annotations
@@ -108,8 +110,9 @@ class CedEngine:
     def version(self) -> str:
         return f"ced.cpp-abi1:{self.model_path.name}"
 
-    def classify(self, wav: np.ndarray, sample_rate: int = 16_000) -> dict[str, float]:
-        """Scores for TARGET_LABELS over `wav` (float32 mono in [-1, 1])."""
+    def classify_all(self, wav: np.ndarray, sample_rate: int = 16_000) -> np.ndarray:
+        """Every class's score over `wav` (float32 mono in [-1, 1]), as a
+        float32 vector in the order of `labels`."""
         contiguous = np.ascontiguousarray(wav, dtype=np.float32)
         count = self.library.ced_capi_classify_pcm(
             self.context,
@@ -124,12 +127,18 @@ class CedEngine:
                 errors="replace"
             )
             raise RuntimeError(f"CED classification failed: {error}")
-        scores = {}
+        vector = np.zeros(self.class_count, dtype=np.float32)
         for tag in self._output[:count]:
-            label = self.labels[tag.index]
-            if label in self.target_indices:
-                scores[label] = float(tag.score)
-        return scores
+            vector[tag.index] = tag.score
+        return vector
+
+    def target_scores(self, vector: np.ndarray) -> dict[str, float]:
+        """The TARGET_LABELS entries of a `classify_all` vector."""
+        return {label: float(vector[index]) for label, index in self.target_indices.items()}
+
+    def classify(self, wav: np.ndarray, sample_rate: int = 16_000) -> dict[str, float]:
+        """Scores for TARGET_LABELS over `wav` (float32 mono in [-1, 1])."""
+        return self.target_scores(self.classify_all(wav, sample_rate))
 
     def close(self) -> None:
         if getattr(self, "context", None):

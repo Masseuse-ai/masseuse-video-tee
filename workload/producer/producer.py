@@ -1043,6 +1043,10 @@ class Session:
             audio=self.audio_classifier is not None,
             audioModel=(self.audio_classifier.version
                         if self.audio_classifier is not None else None),
+            # The classifier's whole label table, once, in the order the
+            # `all` vectors of the audio and segment messages follow.
+            audioLabels=(list(getattr(self.audio_classifier, "labels", ()))
+                         if self.audio_classifier is not None else None),
             views=(["body", "face"] if self.face_stream else ["body"]),
             facePoseFps=(self.face_pose_fps if self.face_stream else None),
             faceView=(("connector" if self.face_view_stream else "phone")

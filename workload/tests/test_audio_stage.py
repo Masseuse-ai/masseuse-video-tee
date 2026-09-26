@@ -46,6 +46,31 @@ class ScriptedClassifier:
         return scores
 
 
+TABLE_LABELS = tuple(TARGET_LABELS) + tuple(
+    f"Room class {n}" for n in range(20 - len(TARGET_LABELS)))
+
+
+class TableClassifier(ScriptedClassifier):
+    """A stand-in with a label table, as ced.CedEngine has: `classify_all`
+    gives every class's score in the table's order, `target_scores` picks
+    the TARGET_LABELS out of such a vector. Twenty classes stand for the
+    model's 527; the loud window's `Wail, moan` and a room class ride in."""
+
+    labels = TABLE_LABELS
+    target_indices = {label: TABLE_LABELS.index(label) for label in TARGET_LABELS}
+
+    def classify_all(self, wav):
+        scores = self.classify(wav)
+        vector = np.zeros(len(self.labels), dtype=np.float32)
+        for label, score in scores.items():
+            vector[self.labels.index(label)] = score
+        vector[self.labels.index("Room class 3")] = 0.123456
+        return vector
+
+    def target_scores(self, vector):
+        return {label: float(vector[index]) for label, index in self.target_indices.items()}
+
+
 class ListSource:
     def __init__(self, chunks):
         self._chunks = list(chunks)
@@ -118,6 +143,43 @@ def test_every_hop_emits_one_audio_message_of_numbers_only():
     assert audio[0]["pitch"]["pitchHz"] is None
     assert telemetry.snapshot()["counters"]["audioHops"] == 6
     assert stage.hops == 6
+
+
+def test_whole_class_table_rides_beside_the_target_scores():
+    """With a classifier that has a label table, every `audio` message and
+    every `segment` carry `all`: one rounded score per class in the
+    table's order, the TARGET_LABELS scores unchanged beside it. A
+    classifier without a table (the scripted one above) sends no `all`."""
+    telemetry = Telemetry()
+    classifier = TableClassifier()
+    sent: list[dict] = []
+    stage = AudioStage(ListSource([]), classifier, sent.append, telemetry)
+    for chunk in hops(silence(1.0), tone(1.0)):
+        stage.feed(chunk)
+    audio = [m for m in sent if m["kind"] == "audio"]
+    assert len(audio) == 4
+    for message in audio:
+        assert len(message["all"]) == len(classifier.labels)
+        assert set(message["scores"]) == set(TARGET_LABELS)
+        # The table and the target dict agree, class by class.
+        for label, score in message["scores"].items():
+            assert message["all"][classifier.labels.index(label)] == pytest.approx(score, abs=1e-4)
+        assert message["all"][classifier.labels.index("Room class 3")] == 0.1235
+    assert audio[-1]["all"][classifier.labels.index("Wail, moan")] == 0.9
+    assert audio[0]["all"][classifier.labels.index("Breathing")] == 0.4
+    # One classifier call per hop, not two.
+    assert len(classifier.calls) == 4
+    answer = stage.segment({"id": 5, "fromS": 1.0, "toS": 1.6})
+    assert len(answer["ced"]["all"]) == len(classifier.labels)
+    assert answer["ced"]["all"][classifier.labels.index("Wail, moan")] == 0.9
+    assert answer["ced"]["topLabel"] == "Wail, moan"
+    # Numbers only, and small: a 527-class table at four decimals is
+    # about 3 KB a hop.
+    text = json.dumps(sent)
+    assert len(text) < 20_000
+    # The scripted classifier has no table: no `all` anywhere.
+    _, plain, _, _ = run_stage(hops(silence(1.0)))
+    assert all("all" not in m for m in plain)
 
 
 def test_frame_contour_is_sent_once_and_in_order():
@@ -376,5 +438,14 @@ def test_segment_features_on_a_breath_and_a_tone():
     noise = spectral_stats(breath)
     pure = spectral_stats(tone(0.5, hz=150.0))
     assert noise["centroidHz"] > pure["centroidHz"]
+    # Flatness: white noise near 1, a pure tone near 0. The low share: a
+    # 150 Hz tone is all under 300 Hz, a 1 kHz tone none of it, noise a
+    # little under the band's share of the spectrum (300 of 8000 Hz).
+    assert set(pure) == {"centroidHz", "rolloff85Hz", "flatness", "lowShare300"}
+    assert noise["flatness"] > 0.5 > pure["flatness"]
+    assert pure["lowShare300"] > 0.99
+    assert spectral_stats(tone(0.5, hz=1000.0))["lowShare300"] < 0.01
+    assert 0.02 < noise["lowShare300"] < 0.08
     assert spectral_stats(np.zeros(100, dtype=np.float32)) == {
-        "centroidHz": None, "rolloff85Hz": None}
+        "centroidHz": None, "rolloff85Hz": None, "flatness": None, "lowShare300": None}
+    assert spectral_stats(np.zeros(4000, dtype=np.float32))["flatness"] is None

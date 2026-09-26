@@ -52,7 +52,8 @@ not cross it.
 ```json
 {"kind": "hello", "protocol": 1, "fps": 30.0, "poseFps": 9.0,
  "postIntervalS": 1.0, "run": null, "sessionId": "4ce25466-...",
- "audio": true, "audioModel": "ced.cpp-abi1:ced-small-f16.gguf"}
+ "audio": true, "audioModel": "ced.cpp-abi1:ced-small-f16.gguf",
+ "audioLabels": ["Speech", "Male speech, man speaking", "..."]}
 ```
 
 - `fps`: the decode cadence the `frame` messages arrive at.
@@ -80,6 +81,9 @@ not cross it.
   (`audio` messages may follow and `classify` requests are answered).
   `false` means the stream's sound is not read at all. `audioModel` names
   the classifier build and weights (`null` without the stage).
+  `audioLabels` (absent in older producers) is the classifier's whole
+  label table, the 527 AudioSet class names in the model's own order: the
+  order the `all` vectors in `audio` and `segment` messages follow.
 - `views` (absent in older producers, then `["body"]`): the camera views
   the session reads. `["body"]` is one camera. `["body", "face"]` is a
   fixed camera behind the user as the body view - everything below that
@@ -178,6 +182,7 @@ the frame; none of them can be inverted into an image.
 ```json
 {"kind": "audio", "atS": 12.5, "streamS": 12.63, "hopS": 0.5, "windowS": 2.0,
  "scores": {"Wail, moan": 0.0021, "Groan": 0.0007, "Breathing": 0.31, "...": "..."},
+ "all": [0.0142, 0.0003, "..."],
  "pitch": {"pitchHz": 142.3, "pitchConfidence": 0.61, "voicedFramePct": 38.2,
            "loudnessDbfs": -31.4},
  "frames": [[12.032, -47.2, null], [12.048, -41.9, 139.8], "..."]}
@@ -194,8 +199,13 @@ Sent only when the stream has an audio track (`workload/audio/audio_stage.py`).
   `workload/audio/ced.py` (`TARGET_LABELS`: the AudioSet classes Screaming;
   Crying, sobbing; Whimper; Wail, moan; Sigh; Groan; Grunt; Breathing; Gasp;
   Pant; and Speech, the last so that a voice in the room can be told apart
-  from the others). Each is a probability-like number in [0, 1]. No other
-  class of the model's 527 is sent.
+  from the others). Each is a probability-like number in [0, 1].
+- `all` (absent in older producers): the same classifier's score for every
+  one of its 527 classes over the same window, rounded to four decimals,
+  in the order of `hello.audioLabels`. The room's sounds are in it (music,
+  a fan, rain, a machine's hum, a television), which is how the analysis
+  tells a person's sound over a background from the background itself.
+  Class scores are all it is: no class is a word, a voice or a sample.
 - `pitch`: over the same window, the median fundamental frequency in Hz of
   the frames that had one (`null` if none did), the median periodicity
   confidence of those frames, the percentage of frames that had a pitch,
@@ -212,19 +222,25 @@ pitch per 16 ms is not a waveform, and the labels are class scores.
 
 ```json
 {"kind": "segment", "id": 17, "fromS": 11.62, "toS": 12.31,
- "ced": {"topLabel": "Groan", "topScore": 0.412, "scores": {"...": "..."}},
+ "ced": {"topLabel": "Groan", "topScore": 0.412, "scores": {"...": "..."},
+         "all": [0.0142, 0.0003, "..."]},
  "pitch": {"medianHz": 118.4, "p10Hz": 109.0, "p90Hz": 131.2,
            "slopeHzPerS": -14.0, "voicedFraction": 0.72, "voicedFrames": 31,
            "pitchReliable": true, "confidence": 0.7, "frames": 43},
  "loudness": {"peakDbfs": -18.2, "meanDbfs": -26.9, "rmsDbfs": -25.1},
- "spectral": {"centroidHz": 812.5, "rolloff85Hz": 1890.6}}
+ "spectral": {"centroidHz": 812.5, "rolloff85Hz": 1890.6,
+              "flatness": 0.0731, "lowShare300": 0.2145}}
 ```
 
 The same kind of measurements over one span the analysis asked about
 (`workload/audio/audio_features.py`): the classifier's scores over the span
 (centred in at least one second of surrounding audio, which the classifier
-needs), an F0 summary, a loudness summary, and the spectral centroid and 85%
-rolloff. The span is taken from the producer's 20 s rolling history of the
+needs; `all` is the whole table as in `audio`, absent in older producers),
+an F0 summary, a loudness summary, and four spectral shape statistics: the
+centroid, the 85% rolloff, the spectral flatness of the power spectrum (0
+for a pure tone, 1 for white noise) and the share of power under 300 Hz
+(where a machine's hum sits; the last two absent in older producers). The
+span is taken from the producer's 20 s rolling history of the
 audio; a span it no longer holds, or a malformed one, is answered with
 `{"kind": "segment", "id": 17, "error": "expired" | "span" | "empty" |
 "busy" | "closed" | "no-audio"}` instead.
@@ -252,7 +268,13 @@ older bundles, then `false`) is whether this connection took up a parked
 session (`hello.resume`) rather than starting one. `vocal`, when present, is
 the constants the `vocal` rows below are judged against (thresholds, the
 labels' names, the bundle's vocal version): numbers and names, kept in the
-session record's `hello.json` so a row can be read back years later.
+session record's `hello.json` so a row can be read back years later. From
+bundle 2026.09.25-1 it also carries `head`: the version, threshold, feature
+count and type classes of the fixed classifier that judges each measured
+span from the `segment` and the trailing `audio.all` tables (`null` when
+the producer sent no `audioLabels`, and the classifier's top label decides
+as before), and `contextGroups`, the label groups the trailing background
+is read as.
 `face`, when present (a bundle from 2026.09.18-1 on), is the same for what
 the readings carry about a `face` view: the keypoint indices and thresholds
 it is computed from, the names of its channels, and that part of the
@@ -336,9 +358,13 @@ is `activation` (a classifier activation opened or closed a span),
 `decision` (a span was judged, with the scores, level, pitch and duration
 it was judged on and the verdict), `segment_error` (a `classify` it asked
 for was not answered) or `baseline` (the reference level or pitch it
-compares against changed). Everything in `row` is a number, a label name or
-a timestamp, derived from the `audio` and `segment` messages above; no
-sample is anywhere near it. The producer appends each row to the session
+compares against changed). A `decision` from bundle 2026.09.25-1 on also
+carries the head's score for the span (`headScore`), the head's version,
+the type it named (`type`, beside the classifier's `topLabel`) and its
+probability per type class (`typeProbs`); `rejected` joins the verdicts
+(the head scored the span under its threshold). Everything in `row` is a
+number, a label name or a timestamp, derived from the `audio` and
+`segment` messages above; no sample is anywhere near it. The producer appends each row to the session
 record's `vocal/` stream (`workload/producer/record.py`) and does not emit
 it on the session's event stream or send it anywhere else.
 

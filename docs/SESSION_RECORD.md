@@ -120,8 +120,8 @@ One JSON object per line, `wallS` first. The rows are the messages of
 | stream | one row per | fields |
 | --- | --- | --- |
 | `frames/` | decoded frame with a final pose decision (30 fps) | `frame`, `atS`, `keypoints` (the 21 body points by name, `[x, y, score]`, interpolated across the pose cadence; null where the person was absent), `fast`, `slow` (the regional motion descriptors, protocol.md `frame`) |
-| `audio/` | half second of the audio track | `atS`, `streamS` and the measurements of protocol.md `audio`: the classifier's scores per label over the trailing window, `pitch` (pitch in Hz with its confidence, voiced share, loudness in dBFS), `frames` (a level and a pitch per 16 ms frame of the hop) |
-| `segments/` | span the analysis asked to have typed | `id`, `fromS`, `toS`, the span's scores, level, pitch and duration, or `error` (`expired`, `span`, `empty`, `closed`, `no-audio`) |
+| `audio/` | half second of the audio track | `atS`, `streamS` and the measurements of protocol.md `audio`: the classifier's scores per target label over the trailing window, `all` (its score for every one of its 527 classes, four decimals, in the order `hello.json`'s `audioLabels` gives; about 3 KB a row, so an hour of audio is some 20 MB before gzip), `pitch` (pitch in Hz with its confidence, voiced share, loudness in dBFS), `frames` (a level and a pitch per 16 ms frame of the hop) |
+| `segments/` | span the analysis asked to have typed | `id`, `fromS`, `toS`, the span's scores (target labels and the whole table), level, pitch, spectral shape and duration, or `error` (`expired`, `span`, `empty`, `closed`, `no-audio`) |
 | `vocal/` | judgement of the analysis's vocal side | `kind` (`activation`, `decision`, `segment_error`, `baseline`), `atS`, and the numbers it judged on (protocol.md `vocal`) |
 | `onsets/` | onset the analysis found | `atS` |
 | `events/` | paired event | `fromS`, `toS` |
@@ -151,7 +151,7 @@ One per production run, written once its analysis process has answered
 | --- | --- |
 | `sessionId`, `runId`, `run`, `startedWallS` | the record's session, the run's id (its start, UTC), the trainer's name for the run, and its start |
 | `producer` | the image's release stamp and the slot, as in `hello.json` |
-| `hello` | what the producer told the analysis: `fps`, `poseFps`, `facePoseFps`, `views`, `audio`, `audioModel`, `postIntervalS` |
+| `hello` | what the producer told the analysis: `fps`, `poseFps`, `facePoseFps`, `views`, `audio`, `audioModel`, `audioLabels` (the classifier's 527 class names, the order of the `all` vectors in `audio/` and `segments/`), `postIntervalS` |
 | `ready` | the analysis's answer: `protocol`, `version` (the bundle in `analysis.lock`), `modelVersion`, `vocal` (the constants its `vocal` rows are judged against) |
 | `sources` | which picture each view is (`poses`, `faces`, `audio`): the view's path on the enclave's own loopback relay (`rtsp://127.0.0.1:8554/…`, so a reader can tell the phone's camera from an external one) and the pose cadence; never a camera's address or link |
 

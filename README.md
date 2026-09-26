@@ -72,11 +72,15 @@ Inside the enclave, in code that is in this repository:
 - When the stream carries an audio track (the phone's microphone travels
   with its camera unless you turn it off with `?mic=0`; a network camera's
   microphone, when it has one), the audio is decoded to 16 kHz mono and,
-  every half second, a two-second window is classified into non-speech
-  vocalization categories (the CED audio tagger, AudioSet labels such as
-  breathing, groan, gasp, sigh, and "speech" so that talk can be told apart
-  and set aside) along with its level and pitch. No speech recognition or
-  transcription runs; nothing identifies the voice.
+  every half second, a two-second window is scored by the CED audio tagger
+  against its 527 AudioSet sound classes: the non-speech vocalization
+  labels the analysis is about (breathing, groan, gasp, sigh and the like),
+  "speech" so that talk can be told apart and set aside, and the room's
+  own sounds (music, a fan, rain, a machine's hum) so that a person's sound
+  over a background can be told from the background. The window's level
+  and pitch go with the scores. No speech recognition or transcription
+  runs; a class score is not a word or a voice, and nothing identifies the
+  voice.
 - Frames and audio are then discarded. Nothing of them is written to disk;
   the VM has no persistent storage and nobody at masseuse.ai can read its
   memory.
@@ -297,7 +301,7 @@ What the enclave writes (`workload/producer/record.py`):
 | --- | --- | --- |
 | `poses/`, `faces/` | Every keypoint-model result of the body and face views: all 308 keypoints with scores, the person box, the frame size, the flags (`dropped`, `error`, `identityUnresolved`); one row per pose step, keypoint-less rows where a step had none | Parquet (zstd), one file per window |
 | `frames/` | The assembler's 21-point rows at the frame rate with the regional motion descriptors (the `frame` message of `analysis/protocol.md`) | gzipped JSONL |
-| `audio/`, `segments/` | The audio stage's half-second measurements (class scores, level, pitch) and the spans the analysis asked it to type | gzipped JSONL |
+| `audio/`, `segments/` | The audio stage's half-second measurements (the classifier's scores for all its classes, level, pitch) and the spans the analysis asked it to type | gzipped JSONL |
 | `vocal/` | The analysis module's vocalization judgements, one row each | gzipped JSONL |
 | `onsets/`, `events/`, `payloads/`, `posts/` | What the analysis decided, and the readings it posted | gzipped JSONL |
 | `telemetry/` | The process's counters and gauges once a second | gzipped JSONL |
