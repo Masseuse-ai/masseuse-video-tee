@@ -108,7 +108,7 @@ nine a second while they climb. A frozen picture (a paused camera) shows
 as the deferred counters stopping while the submitted ones go on: the
 cadence is kept with repeats after one slot's wait.
 
-The annotated view is published in four renditions by one encoder
+The view returned to the phone is published in four renditions by one encoder
 process (`--overlay-renditions hi,half,small,lean` in `tee/entrypoint.sh`;
 `workload/producer/overlay.py`, `RENDITIONS`): `hi` is the canvas at 30
 fps and 6M on the relay path `overlay`, `half` the canvas at 15 fps and 3M
@@ -205,8 +205,8 @@ running between sessions.
   requires. It holds no other permission in this project. During the boot
   the phone runs an on-device skeleton. There is no Cloud Run fallback:
   video is processed in the attested enclave or on the phone, nowhere else
-  (a user who opens a live stream sends the enclave's annotated view on to
-  the destination they named; the processing is still the enclave's, README
+  (a user who opens a live stream sends the enclave's view on to the
+  destination they named; the processing is still the enclave's, README
   "The live stream").
 - **Stop, part one: the enclave decides.** The producer's idle watchdog
   exits 0 when no lease is held and nothing is working for `TEE_IDLE_EXIT_S`

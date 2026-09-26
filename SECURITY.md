@@ -27,8 +27,9 @@ against production, and a check that should hold but does not is a report.
 - It keeps no media: frames and audio samples live in memory for the
   duration of a decode and are not written anywhere. The data that leaves
   are the readings the analysis derives (numbers, never frames or sound)
-  posted to the trainer, the annotated view streamed back to the same
-  user's phone, the same view (with the microphone, when asked) to the one
+  posted to the trainer, the view streamed back to the same user's phone
+  (the picture, with the keypoints drawn on it only when that user asks),
+  the same view (with the microphone, when asked) to the one
   live-streaming destination the user names from their phone when they
   open a live stream (README, "The live stream"; the destination and its
   key reach the enclave alone, and the trainer may only stop the stream),

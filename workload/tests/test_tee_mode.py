@@ -221,6 +221,14 @@ class Slot:
                         overlay_relay_webrtc=self.relay.base,
                         overlay_relay_api=self.relay.base),
             Telemetry(), tee=self.tee, external=self.external, egress=self.egress)
+        # The process exits a slot may ask for (a `/teardown?mode=now`, the
+        # idle exit) are recorded here, never taken: taken, os._exit(0)
+        # ends the test runner half way with a clean exit code and no
+        # summary, and every test after it silently never runs.
+        self.exits: list[int] = []
+        self.server.teardown.exit_impl = self.exits.append
+        if self.server.idle_exit is not None:
+            self.server.idle_exit.exit_impl = self.exits.append
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
         self.port = self.server.server_address[1]
@@ -1131,44 +1139,64 @@ def test_a_produce_on_the_external_stream_is_landscape_and_unmirrored():
 
 def test_the_phone_sets_how_its_own_picture_is_drawn_as_the_inset():
     """/ingest/view: the phone's capability sets the face inset's mirror
-    for the running session and the next; anything else is refused."""
+    and what is drawn over the pictures (`overlay`: clean until the phone
+    asks for the keypoints) for the running session and the next;
+    anything else is refused."""
     json_type = {"Content-Type": "application/json"}
     with Slot() as slot:
         cap = slot.lease("sess-1")
-        # Read before set: the slot's default, no session to show it on.
+        # Read before set: the slot's defaults, no session to show them on.
         code, headers, body = slot.as_phone(cap, "GET", "/ingest/view")
-        assert code == 200 and json.loads(body) == {"mirror": False, "view": None}
+        assert code == 200 and json.loads(body) == {"mirror": False, "overlay": "clean", "view": None}
         assert headers["Access-Control-Allow-Origin"] == ORIGIN
         # Preflight is answered here.
         code, headers, _ = slot.request("OPTIONS", "/ingest/view", b"", {"Origin": ORIGIN})
         assert code == 204 and headers["Access-Control-Allow-Origin"] == ORIGIN
         # A running session's overlay is told at once...
-        told = []
+        told, layers = [], []
         slot.server.current["session"] = argparse.Namespace(
             overlay=argparse.Namespace(
                 snapshot=lambda: {"view": {"layout": "inset", "mirror": True}},
-                set_mirror=told.append),
+                set_mirror=told.append, set_overlay=layers.append),
             run_name="sess-1")
         code, _, body = slot.as_phone(cap, "PUT", "/ingest/view",
                                       b'{"mirror": true}', json_type)
         assert code == 200
-        assert json.loads(body) == {"mirror": True,
+        assert json.loads(body) == {"mirror": True, "overlay": "clean",
                                     "view": {"layout": "inset", "mirror": True}}
-        assert told == [True]
-        # ...and the next session starts with it (the /produce handler
-        # copies the slot's preference into its args).
+        assert told == [True] and layers == []
+        # The keypoints, asked for on their own: the mirror stands.
+        code, _, body = slot.as_phone(cap, "PUT", "/ingest/view",
+                                      b'{"overlay": "keypoints"}', json_type)
+        assert code == 200 and json.loads(body)["overlay"] == "keypoints"
+        assert json.loads(body)["mirror"] is True
+        assert layers == ["keypoints"] and told == [True]
+        # Both at once.
+        code, _, body = slot.as_phone(cap, "PUT", "/ingest/view",
+                                      b'{"mirror": false, "overlay": "clean"}', json_type)
+        assert code == 200 and json.loads(body)["overlay"] == "clean"
+        assert told == [True, False] and layers == ["keypoints", "clean"]
+        slot.as_phone(cap, "PUT", "/ingest/view", b'{"mirror": true, "overlay": "keypoints"}', json_type)
+        # ...and the next session starts with them (the /produce handler
+        # copies the slot's preferences into its args).
         slot.server.current["session"] = None
         code, _, body = slot.as_phone(cap, "GET", "/ingest/view")
-        assert json.loads(body) == {"mirror": True, "view": None}
-        # Not a boolean, not JSON, not the phone: refused, nothing changed.
-        assert slot.as_phone(cap, "PUT", "/ingest/view", b'{"mirror": "yes"}', json_type)[0] == 400
-        assert slot.as_phone(cap, "PUT", "/ingest/view", b'nope', json_type)[0] == 400
+        assert json.loads(body) == {"mirror": True, "overlay": "keypoints", "view": None}
+        # The trainer reads them beside the camera in /ingest/status.
+        code, _, body = slot.as_trainer("GET", "/ingest/status")
+        assert code == 200 and json.loads(body)["view"] == {"mirror": True, "overlay": "keypoints"}
+        # Not a boolean, not a layer, neither key, not JSON, not the phone:
+        # refused, nothing changed.
+        for bad in (b'{"mirror": "yes"}', b'{"overlay": "boxes"}', b'{"overlay": 1}',
+                    b'{"overlay": "keypoints", "mirror": "yes"}', b'{}', b'{"other": 1}', b'nope'):
+            assert slot.as_phone(cap, "PUT", "/ingest/view", bad, json_type)[0] == 400, bad
         assert slot.request("PUT", "/ingest/view", b'{"mirror": false}',
                             {**json_type, "Origin": ORIGIN})[0] == 401
         assert slot.as_phone(cap, "DELETE", "/ingest/view")[0] == 405
-        assert json.loads(slot.as_phone(cap, "GET", "/ingest/view")[2])["mirror"] is True
+        assert json.loads(slot.as_phone(cap, "GET", "/ingest/view")[2]) == {
+            "mirror": True, "overlay": "keypoints", "view": None}
         # The trainer's token is not the phone's capability.
-        assert slot.as_trainer("PUT", "/ingest/view", b'{"mirror": false}', json_type)[0] == 401
+        assert slot.as_trainer("PUT", "/ingest/view", b'{"overlay": "clean"}', json_type)[0] == 401
 
 
 def test_tee_mode_refuses_capture_configuration(monkeypatch, capsys):
@@ -1289,6 +1317,12 @@ def test_the_phone_opens_a_live_stream_with_its_capability_and_the_trainer_may_o
         assert code == 200
         assert slot.egress.active is False
         assert slot.egress_procs[2].returncode == -15
+        # The teardown asks the process to exit half a second later; the
+        # harness records the ask instead of taking it.
+        deadline = time.time() + 3.0
+        while not slot.exits and time.time() < deadline:
+            time.sleep(0.05)
+        assert slot.exits == [0]
 
 
 def test_a_lease_for_another_session_takes_the_live_stream_with_it():

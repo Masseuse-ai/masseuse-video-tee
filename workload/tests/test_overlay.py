@@ -1,8 +1,11 @@
-"""The live annotated view draws each frame with the pose detected on it.
+"""The live view is the picture, with the pose detected on each frame drawn
+over it when the phone asks.
 
-Locked down here: the view runs `delay_s` behind the decode head and holds
-its cadence by duplicating on a stall and skipping through a burst; a frame
-between two detections is drawn with the joints lerped and the scores taken
+Locked down here: the view is the picture alone until the `keypoints`
+layer is asked for (no box, no lettering, ever), and the layer flips live;
+the view runs `delay_s` behind the decode head and holds its cadence by
+duplicating on a stall and skipping through a burst; a frame between two
+detections is drawn with the joints lerped and the scores taken
 pessimistically (as `motion.pose_between` does), a frame past the last
 detection is drawn stale and says so, and one after a "nobody" detection is
 drawn bare; keypoints land where the downscale put the body; the frame
@@ -224,9 +227,10 @@ def test_frame_store_caps_and_counts_evictions_and_finds_the_nearest():
 
 
 def renderer(publisher, clock, telemetry=None, delay_s=1.0,
-             size=(320, 180)) -> OverlayRenderer:
+             size=(320, 180), overlay="clean") -> OverlayRenderer:
     return OverlayRenderer(publisher, telemetry, size=size, fps=15.0,
-                           delay_s=delay_s, source_fps=FPS, clock=clock)
+                           delay_s=delay_s, source_fps=FPS, clock=clock,
+                           overlay=overlay)
 
 
 def test_the_view_runs_delay_behind_the_head_and_holds_cadence_on_a_stall():
@@ -277,9 +281,71 @@ def test_the_frame_store_holds_what_the_delay_needs_or_says_it_missed():
     assert telemetry.snapshot()["counters"]["overlayTargetMissed"] == 1
 
 
-def test_keypoints_are_painted_where_the_downscale_put_the_body():
+def test_the_view_is_the_picture_alone_until_the_phone_asks_for_the_keypoints():
+    """Clean is the default: a frame with a person, a box and 308 confident
+    points comes out as the fitted picture and nothing else, pixel for
+    pixel. `set_overlay("keypoints")` draws them from the next tick; a name
+    that is not a layer is refused and changes nothing."""
     clock, publisher = Clock(), FakePublisher()
     view = renderer(publisher, clock, Telemetry(), delay_s=0.0, size=(320, 180))
+    assert view.snapshot()["overlay"] == "clean"
+    width, height = 640, 360
+    frame = gray_frame(width, height, value=40)
+    frame[:height, :width // 3] = 200
+    points = full_points(width, height)
+    scores = np.full(308, 0.95, np.float32)
+    view.offer_frame(0, 0.0, frame)
+    view.offer_pose(0, 0.0, points, scores, [100, 50, 400, 250], 0.9, 1, False)
+    assert view.tick() == "emitted"
+    picture = downscale_i420(frame, fit_geometry(width, height, 320, 180))
+    assert np.array_equal(publisher.frames[0], picture)
+    assert view.snapshot()["lastState"] == "exact"  # the pose was there, just not drawn
+    with pytest.raises(ValueError):
+        view.set_overlay("boxes")
+    assert view.snapshot()["overlay"] == "clean"
+    assert view.set_overlay("keypoints") == "keypoints"
+    view.offer_frame(1, 1 / FPS, frame)
+    view.offer_pose(1, 1 / FPS, points, scores, [100, 50, 400, 250], 0.9, 1, False)
+    assert view.tick() == "emitted"
+    drawn = publisher.frames[1]
+    assert view.snapshot()["overlay"] == "keypoints"
+    assert not np.array_equal(drawn, picture)
+    x, y = (points[NOSE] / 2).round().astype(int)
+    assert drawn[max(0, y - 3):y + 4, max(0, x - 3):x + 4].max() > picture[y, x].max()
+    # And back to the picture alone.
+    view.set_overlay("clean")
+    view.offer_frame(2, 2 / FPS, frame)
+    assert view.tick() == "emitted"
+    assert np.array_equal(publisher.frames[2], picture)
+
+
+def test_the_painter_draws_no_box_and_no_lettering():
+    """A pose with a person box and its score, points on or off: the box
+    is never drawn and no letters are, in either orientation."""
+    geometry = fit_geometry(640, 360, 320, 180)  # scale 0.5, no letterbox
+    points = full_points(640, 360)
+    scores = np.full(308, 0.95, np.float32)
+    boxed = PoseAt("exact", box=[40.0, 80.0, 200.0, 200.0], box_score=0.9)
+    for mirror in (False, True):
+        canvas = np.zeros((180, 320, 3), np.uint8)
+        KeypointPainter(geometry, mirror=mirror).paint(canvas, boxed, keypoints=True)
+        assert canvas.max() == 0  # nothing to draw but a box: nothing drawn
+        posed = PoseAt("exact", points, scores, [40.0, 80.0, 200.0, 200.0], 0.9, 1, False)
+        KeypointPainter(geometry, mirror=mirror).paint(canvas, posed, keypoints=False)
+        assert canvas.max() == 0  # keypoints off: the picture is left alone
+        KeypointPainter(geometry, mirror=mirror).paint(canvas, posed, keypoints=True)
+        assert canvas.max() > 0
+        # Only points and edges: full_points keeps to the middle 60 % of the
+        # frame, so the top band where the status lines were once drawn,
+        # and the box's own top edge (row 40), stay black.
+        assert canvas[:12].max() == 0
+        assert canvas[40, 20:36].max() == 0 or mirror  # left of the leftmost point
+
+
+def test_keypoints_are_painted_where_the_downscale_put_the_body():
+    clock, publisher = Clock(), FakePublisher()
+    view = renderer(publisher, clock, Telemetry(), delay_s=0.0, size=(320, 180),
+                    overlay="keypoints")
     width, height = 640, 360
     frame = gray_frame(width, height, value=0)
     points = full_points(width, height)
@@ -294,19 +360,22 @@ def test_keypoints_are_painted_where_the_downscale_put_the_body():
         x, y = (points[index] / 2).round().astype(int)
         patch = canvas[max(0, y - 3):y + 4, max(0, x - 3):x + 4]
         assert patch.max() > 0, f"keypoint {KEYPOINT_NAMES[index]} not drawn"
-    # And the picture stays the frame elsewhere: the bottom-right corner,
-    # outside the box and the HUD, is untouched black.
+    # And the picture stays the frame elsewhere: the bottom-right corner
+    # holds no keypoint (full_points keeps to the middle 60 %), and the top
+    # band, where status lines were once drawn, is untouched black too.
     assert canvas[170:, 300:].max() == 0
+    assert canvas[:12, :].max() == 0
     assert view.snapshot()["lastState"] == "exact"
 
 
-def test_a_mirrored_view_flips_picture_and_skeleton_but_letters_read_forward():
+def test_a_mirrored_view_flips_picture_and_skeleton():
     clock = Clock()
     plain, selfie = FakePublisher(), FakePublisher()
-    straight = renderer(plain, clock, Telemetry(), delay_s=0.0, size=(320, 180))
+    straight = renderer(plain, clock, Telemetry(), delay_s=0.0, size=(320, 180),
+                        overlay="keypoints")
     mirrored = OverlayRenderer(selfie, Telemetry(), size=(320, 180), fps=15.0,
                                delay_s=0.0, source_fps=FPS, clock=clock,
-                               mirror=True)
+                               mirror=True, overlay="keypoints")
     width, height = 640, 360
     # A frame that is bright on its left third only, so the flip is visible.
     frame = gray_frame(width, height, value=0)
@@ -328,32 +397,22 @@ def test_a_mirrored_view_flips_picture_and_skeleton_but_letters_read_forward():
         mx = b.shape[1] - 1 - x
         assert b[max(0, y - 3):y + 4, max(0, mx - 3):mx + 4].max() > 0, \
             f"keypoint {KEYPOINT_NAMES[index]} not at its mirrored spot"
-    # The HUD is lettering drawn after the flip: identical pixels in both
-    # views where the picture under it is the same (the dark middle).
-    hud_a, hud_b = a[:12, 120:200], b[:12, 120:200]
-    assert hud_a.max() > 0 and np.array_equal(hud_a, hud_b)
-
-
-def test_the_mirrored_box_label_sits_over_the_box_as_displayed():
-    geometry = fit_geometry(640, 360, 320, 180)  # scale 0.5, no letterbox
-    pose = PoseAt("exact", box=[40.0, 80.0, 200.0, 200.0], box_score=0.9)
-    plain, selfie = np.zeros((180, 320, 3), np.uint8), np.zeros((180, 320, 3), np.uint8)
-    KeypointPainter(geometry).paint(plain, pose, [])
-    KeypointPainter(geometry, mirror=True).paint(selfie, pose, [])
-    # The box: x 20..120 plain, 199..299 mirrored (y 40..140 in both).
-    assert plain[40, 20:120].max() > 0 and plain[40, 199:299].max() == 0
-    assert selfie[40, 199:299].max() > 0 and selfie[40, 20:120].max() == 0
-    # The label is the only thing above the box (rows 24..37), and it
-    # starts at the displayed left edge of the box in each view.
-    assert plain[24:37, 20:110].max() > 0 and plain[24:37, 199:].max() == 0
-    assert selfie[24:37, 199:290].max() > 0 and selfie[24:37, :120].max() == 0
-    # Same glyphs in both: the label reads forward in the mirrored view.
-    assert np.array_equal(plain[24:37, 20:110], selfie[24:37, 199:289])
+    # No lettering in either: the dark middle of the top band is black.
+    assert a[:12, 120:200].max() == 0 and b[:12, 120:200].max() == 0
+    # And the mirror alone, keypoints off, is the flipped picture exactly.
+    clean = OverlayRenderer(FakePublisher(), Telemetry(), size=(320, 180), fps=15.0,
+                            delay_s=0.0, source_fps=FPS, clock=clock, mirror=True)
+    clean.offer_frame(0, 0.0, frame)
+    clean.offer_pose(0, 0.0, points, scores, box, 0.9, 1, False)
+    assert clean.tick() == "emitted"
+    picture = downscale_i420(frame, fit_geometry(width, height, 320, 180))
+    assert np.array_equal(clean.publisher.frames[0], picture[:, ::-1])
 
 
 def test_an_interpolated_frame_draws_hollow_body_points():
     clock, publisher = Clock(), FakePublisher()
-    view = renderer(publisher, clock, Telemetry(), delay_s=0.0, size=(640, 360))
+    view = renderer(publisher, clock, Telemetry(), delay_s=0.0, size=(640, 360),
+                    overlay="keypoints")
     frame = gray_frame(640, 360)
     points = np.full((308, 2), 320.0, np.float32)
     points[NOSE] = (200.0, 200.0)
@@ -375,22 +434,19 @@ def test_an_interpolated_frame_draws_hollow_body_points():
     assert canvas[190:211, 190:211].max() > 0
 
 
-def test_context_reaches_the_hud_without_breaking_a_frame():
-    """The analysis process's `hud` lines are drawn verbatim under the pose
-    lines; anything that is not a non-empty string is skipped, and no other
-    context kind reaches the HUD."""
+def test_context_is_reported_not_drawn():
+    """Session context (`timing`, and whatever else is offered, the old
+    `hud` lines included) reaches the snapshot and never the picture."""
     clock, publisher = Clock(), FakePublisher()
-    view = renderer(publisher, clock, Telemetry(), delay_s=0.0)
-    view.offer_context("hud", ["calibration ready", "rate 12.0/min", "", 7, None])
-    view.offer_context("payload", {"calibrationReady": True})  # not a HUD kind
-    view.offer_frame(0, 0.0, gray_frame(64, 36))
-    frame = view.frames.nearest(0.0)
-    pose = view.track.at(0.0, 0)
-    lines = view._hud(frame, pose, dict(view._context), 0.0)
-    assert [text for text, _ in lines[-2:]] == ["calibration ready", "rate 12.0/min"]
-    assert len(lines) == 4  # the two status lines and the two HUD lines
+    view = renderer(publisher, clock, Telemetry(), delay_s=0.0, size=(64, 36))
+    view.offer_context("timing", "sender")
+    view.offer_context("hud", ["calibration ready", "rate 12.0/min"])
+    frame = gray_frame(64, 36, value=90)
+    view.offer_frame(0, 0.0, frame)
     assert view.tick() == "emitted"
-    assert publisher.frames[0][:8, :8].max() >= 0  # the HUD bar is drawn
+    assert view.snapshot()["timing"] == "sender"
+    assert np.array_equal(publisher.frames[0],
+                          downscale_i420(frame, fit_geometry(64, 36, 64, 36)))
 
 
 def test_a_write_the_publisher_refuses_is_counted_not_raised():
@@ -679,6 +735,18 @@ def test_build_renderer_is_off_without_a_publish_url_and_probes_for_auto():
         argparse.Namespace(overlay_publish="rtsp://r/overlay"), Telemetry())
     assert bare.fps == overlay.DEFAULT_FPS == 30.0
     assert bare.publisher.fps == 30.0 and bare.publisher.bitrate == "6M"
+    # The layer drawn to begin with: clean unless the args say keypoints.
+    assert bare.overlay == "clean" and bare.snapshot()["overlay"] == "clean"
+    keyed = overlay.build_renderer(
+        argparse.Namespace(overlay_publish="rtsp://r/overlay", overlay_layers="keypoints"),
+        Telemetry())
+    assert keyed.overlay == "keypoints"
+    with pytest.raises(ValueError):
+        overlay.build_renderer(
+            argparse.Namespace(overlay_publish="rtsp://r/overlay", overlay_layers="boxes"),
+            Telemetry())
+    assert overlay.parse_overlay(None) == overlay.parse_overlay("") == "clean"
+    assert overlay.parse_overlay(" Keypoints ") == "keypoints"
 
 
 # -- the tap in live_pose --------------------------------------------------------
@@ -738,7 +806,7 @@ from sync import ViewSync  # noqa: E402
 
 
 def dual_renderer(publisher, clock, telemetry=None, size=(1280, 720),
-                  face_mirror=False):
+                  face_mirror=False, overlay="clean"):
     """A two-camera view whose clocks are anchored: the face view's
     timeline starts 2 s after the body's on the senders' clock."""
     sync = ViewSync(clock=clock)
@@ -746,7 +814,7 @@ def dual_renderer(publisher, clock, telemetry=None, size=(1280, 720),
     sync.face.anchor(1_002.0)
     view = OverlayRenderer(publisher, telemetry, size=size, fps=15.0,
                            delay_s=0.0, source_fps=FPS, clock=clock,
-                           sync=sync, face_mirror=face_mirror)
+                           sync=sync, face_mirror=face_mirror, overlay=overlay)
     return view, sync
 
 
@@ -801,7 +869,7 @@ def test_the_crop_follows_the_head_and_falls_back_to_the_middle():
 
 def test_the_inset_shows_the_face_frame_at_the_same_moment_with_its_keypoints():
     clock, publisher, telemetry = Clock(), FakePublisher(), Telemetry()
-    view, sync = dual_renderer(publisher, clock, telemetry)
+    view, sync = dual_renderer(publisher, clock, telemetry, overlay="keypoints")
     body = gray_frame(640, 360, value=0)
     fw, fh = 360, 640
     face_a = face_frame(fw, fh)              # at face time 1.0 = body time 3.0
@@ -832,6 +900,16 @@ def test_the_inset_shows_the_face_frame_at_the_same_moment_with_its_keypoints():
     assert snap["layout"] == "inset" and snap["faceState"] == "exact"
     assert snap["skewMs"] == 2000 and snap["mirror"] is False and snap["timing"] == "ntp"
     assert "overlayFaceUnpaired" not in telemetry.snapshot()["counters"]
+    # The clean layer leaves the inset as the face picture too: the same
+    # tick with keypoints off puts no coloured mark on it, and the crop is
+    # the same one (the crop follows the face whether or not it is drawn).
+    view.set_overlay("clean")
+    view.offer_frame(91, 3.0 + 1 / FPS, body)
+    assert view.tick() == "emitted"
+    inset2 = publisher.frames[1][y:y + h, x:x + w]
+    patch2 = inset2[max(0, py - 3):py + 4, max(0, px - 3):px + 4]
+    assert (patch2[..., 0] == patch2[..., 2]).all()  # grey: the picture alone
+    assert inset2[h // 2:, :w // 4].mean() > 150 and inset2[h // 2:, 3 * w // 4:].mean() < 60
 
 
 def test_no_face_frame_within_the_tolerance_leaves_the_inset_out():

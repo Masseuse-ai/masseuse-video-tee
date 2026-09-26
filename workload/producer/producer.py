@@ -18,8 +18,9 @@ stream's audio track as 16 kHz mono PCM for the audio stage
 (workload/audio/audio_stage.py), which classifies it into non-speech
 vocalization labels with level and pitch and sends those numbers over the
 same socket. Frames go no further than this file and the overlay renderer,
-which draws the annotated view returned to the same user's phone; samples
-go no further than the audio stage.
+which draws the view returned to the same user's phone (the picture, with
+the keypoints when the phone asks); samples go no further than the audio
+stage.
 
 Two run shapes, one binary:
 
@@ -79,7 +80,8 @@ from external_source import ExternalSource, SourceError  # noqa: E402
 from hud_card import HudCard  # noqa: E402
 from live_pose import GpuPose, SideloadPose, prefetch_model_store  # noqa: E402
 from motion import FRAMES_PER_POSE, DescriptorWorker, RowAssembler  # noqa: E402
-from overlay import build_renderer, parse_renditions  # noqa: E402
+from overlay import (DEFAULT_OVERLAY, OVERLAYS, build_renderer,  # noqa: E402
+                     parse_overlay, parse_renditions)
 from record import DEFAULT_PART_S, Record, RecordKeeper  # noqa: E402
 from relay_proxy import (RelayProxy, location_secret,  # noqa: E402
                          route as relay_route)
@@ -917,7 +919,7 @@ class Session:
     With `args.face_stream` (a fixed camera behind the user as the stream,
     the phone's own camera as the face stream) the session reads both: the
     body view is everything a session was - pose, descriptors, the analysis
-    messages, the annotated view - and the face view is decoded beside it,
+    messages, the returned view - and the face view is decoded beside it,
     posed at the face cadence (the body's, or --face-pose-fps) through the
     same model, drawn as an inset over the view (overlay.py) and sent to
     the analysis as `facePose` rows; the two are lined up on one clock
@@ -990,10 +992,9 @@ class Session:
         self.post_interval_s = float(
             getattr(args, "post_interval_s", 1.0) or 1.0)
         self.stopping = threading.Event()
-        # The live annotated view (overlay.py): None unless a publish URL is
+        # The live view (overlay.py): None unless a publish URL is
         # configured, in which case it runs on its own thread and taps the
-        # decode, the full pose result and the analysis's HUD lines through
-        # offer_*.
+        # decode and the full pose result through offer_*.
         record = (self.capture.directory / "overlay.mp4"
                   if getattr(args, "overlay_record", False) else None)
         self.overlay = build_renderer(args, telemetry, source_fps=FPS,
@@ -1094,8 +1095,9 @@ class Session:
     def _on_analysis(self, message: dict) -> None:
         """One message from the analysis process, on the link's reader
         thread. Records go to the capture and the session's event stream,
-        readings also to the trainer; HUD text to the overlay; gauges to the
-        telemetry. Nothing here looks inside the bodies."""
+        readings also to the trainer; gauges to the telemetry; `hud` text
+        is accepted and dropped (the view carries no lettering). Nothing
+        here looks inside the bodies."""
         kind = message.get("kind")
         if kind == "post":
             body = message.get("body")
@@ -1123,10 +1125,10 @@ class Session:
                 self.telemetry.emit("payload", payload)
                 self.telemetry.count("payloads")
         elif kind == "hud":
-            lines = message.get("lines")
-            if self.overlay is not None and isinstance(lines, list):
-                self.overlay.offer_context(
-                    "hud", [str(line) for line in lines][:8])
+            # Accepted and not drawn: the view carries no lettering any
+            # more (overlay.py); the message stays in the protocol until
+            # the analysis module stops sending it (analysis/protocol.md).
+            pass
         elif kind == "gauges":
             values = message.get("values")
             if isinstance(values, dict):
@@ -1849,7 +1851,7 @@ def stop_session(holder: dict, busy: threading.Lock | None = None,
 
 def serve(args, telemetry: Telemetry) -> int:
     """Cloud session mode: /healthz, /statz, /warmup, /teardown, /stop,
-    /produce, and /overlay/* when the annotated view is configured.
+    /produce, and /overlay/* when the returned view is configured.
 
     With --tee (a Confidential Space slot, tee_mode.py) the control routes
     take the trainer's OIDC token, the signalling routes take the phone's
@@ -1973,9 +1975,12 @@ def build_server(args, telemetry: Telemetry,
     # The session behind the busy lock, for /stop; set and cleared by the
     # /produce handler while it holds the lock.
     current: dict = {"session": None}
-    # How the phone's picture is drawn as the face inset (/ingest/view):
-    # kept for the slot, so it outlives the session it was set in.
-    view_prefs: dict = {"mirror": False}
+    # How the view is drawn for the phone (/ingest/view): `mirror`, whether
+    # its picture is a mirror as the face inset; `overlay`, what is drawn
+    # over the pictures (overlay.OVERLAYS: clean until the phone asks for
+    # the keypoints). Kept for the slot, so it outlives the session it was
+    # set in.
+    view_prefs: dict = {"mirror": False, "overlay": DEFAULT_OVERLAY}
     warmup: dict = {"thread": None, "error": None}
     # The slot's open session records (record.RecordKeeper): a lease's
     # record is shared by its production runs and closed when the lease
@@ -2379,13 +2384,17 @@ def build_server(args, telemetry: Telemetry,
             self._json(200, answer, cors)
 
         def _view(self) -> None:
-            """/ingest/view: how the phone's own picture is drawn while an
-            external camera is the session's - the face inset's
-            `mirror` (the phone says whether its camera faces the user, so
-            the inset reads as a mirror the way its own preview did). PUT
-            {mirror} sets it for the running session and the next; GET
-            reads it back. Gated by the phone's capability like WHIP: the
-            picture is the phone's to arrange.
+            """/ingest/view: how the view is drawn for the phone. `mirror`:
+            how its own picture is drawn while an external camera is the
+            session's - the face inset's (the phone says whether its
+            camera faces the user, so the inset reads as a mirror the way
+            its own preview did). `overlay`: what is drawn over the
+            pictures (overlay.OVERLAYS) - `clean`, the picture alone, the
+            default; `keypoints`, the skeleton and points on both views.
+            PUT {mirror?, overlay?} (at least one) sets them for the
+            running session and the next; GET reads them back. Gated by
+            the phone's capability like WHIP: the picture is the phone's
+            to arrange.
             """
             cors = self._cors()
             if self.command == "OPTIONS":
@@ -2408,23 +2417,41 @@ def build_server(args, telemetry: Telemetry,
                     return
                 try:
                     body = json.loads(self.rfile.read(length) or b"{}")
-                    if not isinstance(body, dict) or not isinstance(
-                            body.get("mirror"), bool):
-                        raise ValueError("expected {\"mirror\": true|false}")
+                    if not isinstance(body, dict):
+                        raise ValueError("expected an object")
+                    given = {k: body[k] for k in ("mirror", "overlay") if k in body}
+                    if not given:
+                        raise ValueError(
+                            "expected {\"mirror\": true|false} and/or "
+                            f"{{\"overlay\": {'|'.join(OVERLAYS)}}}")
+                    if "mirror" in given and not isinstance(given["mirror"], bool):
+                        raise ValueError("mirror must be true or false")
+                    if "overlay" in given:
+                        if not isinstance(given["overlay"], str):
+                            raise ValueError(f"overlay must be one of {'|'.join(OVERLAYS)}")
+                        given["overlay"] = parse_overlay(given["overlay"])
                 except ValueError as error:
                     self._json(400, {"error": f"invalid body: {error}"}, cors)
                     return
-                view_prefs["mirror"] = body["mirror"]
                 session = current["session"]
                 overlay = getattr(session, "overlay", None) if session else None
-                set_mirror = getattr(overlay, "set_mirror", None)
-                if callable(set_mirror):
-                    set_mirror(body["mirror"])
-                telemetry.count("viewMirrorSet")
+                if "mirror" in given:
+                    view_prefs["mirror"] = given["mirror"]
+                    set_mirror = getattr(overlay, "set_mirror", None)
+                    if callable(set_mirror):
+                        set_mirror(given["mirror"])
+                    telemetry.count("viewMirrorSet")
+                if "overlay" in given:
+                    view_prefs["overlay"] = given["overlay"]
+                    set_overlay = getattr(overlay, "set_overlay", None)
+                    if callable(set_overlay):
+                        set_overlay(given["overlay"])
+                    telemetry.count("viewOverlaySet")
             session = current["session"]
             overlay = getattr(session, "overlay", None) if session else None
             snapshot = overlay.snapshot() if overlay is not None else None
             self._json(200, {"mirror": view_prefs["mirror"],
+                             "overlay": view_prefs["overlay"],
                              "view": (snapshot or {}).get("view")},
                        cors + [("Cache-Control", "no-store")])
 
@@ -2598,7 +2625,7 @@ def build_server(args, telemetry: Telemetry,
                 if not self._control_gate():
                     return True
                 code, body = (relay.status(current["session"])
-                              if kind == "status" else relay.ingest_status(external, egress))
+                              if kind == "status" else relay.ingest_status(external, egress, view_prefs))
                 self._json(code, body)
                 return True
             leg = "whip" if kind == "whip" else "whep"
@@ -2897,16 +2924,18 @@ def build_server(args, telemetry: Telemetry,
                     self.wfile.write(
                         b"run must match [A-Za-z0-9][A-Za-z0-9._-]{0,63}\n")
                     return
-                # overlay_record=1 tees the annotated view to overlay.mp4 in
-                # the capture (and so into the run's bucket prefix): the
-                # offline check that the drawn skeleton sits on the body.
+                # overlay_record=1 tees the view to overlay.mp4 in the
+                # capture (and so into the run's bucket prefix): the offline
+                # check that the drawn skeleton sits on the body (with
+                # --overlay-layers keypoints; a clean view records the
+                # picture alone).
                 session_args.overlay_record = params.get(
                     "overlay_record",
                     ["1" if getattr(args, "overlay_record", False) else "0"]
                 )[0].lower() in ("1", "true", "yes")
                 if tee is not None:
                     # A TEE run leaves no production-capture evidence by
-                    # design: no annotated recording, whatever was asked.
+                    # design: no recording of the view, whatever was asked.
                     session_args.overlay_record = False
                     # What it does leave is the session's record, when the
                     # lease named one (tee_mode.Lease.record_for).
@@ -2914,6 +2943,9 @@ def build_server(args, telemetry: Telemetry,
                     tee.lease.note_run()
                 if external_view_args(session_args, external):
                     session_args.face_mirror = view_prefs["mirror"]
+                # What the view draws over the pictures is the phone's
+                # standing choice (/ingest/view), whatever the layout.
+                session_args.overlay_layers = view_prefs["overlay"]
                 self.send_response(200)
                 self.send_header("Content-Type", "text/event-stream")
                 self.send_header("Cache-Control", "no-cache")
@@ -2990,6 +3022,10 @@ def build_server(args, telemetry: Telemetry,
     server.current = current  # type: ignore[attr-defined]
     # TEE: the watchdog serve() starts (None outside TEE mode).
     server.idle_exit = idle_exit  # type: ignore[attr-defined]
+    # The /teardown state machine, for tests: its `exit_impl` is the
+    # process exit a test must intercept (a `mode=now` teardown would
+    # otherwise take the test runner down with it, quietly, exit code 0).
+    server.teardown = teardown  # type: ignore[attr-defined]
     # TEE: the external camera and its home connector's gateway, for tests
     # and /statz.
     server.external = external  # type: ignore[attr-defined]
@@ -3047,8 +3083,8 @@ def build_parser() -> argparse.ArgumentParser:
                              "needs CED_LIBRARY_PATH and CED_MODEL_PATH")
     parser.add_argument("--face-stream", default="",
                         help="a second stream, decoded beside --stream and "
-                             "drawn as an inset over the annotated view with "
-                             "its own keypoints: the phone's camera while "
+                             "drawn as an inset over the view (with its own "
+                             "keypoints when they are on): the phone's camera while "
                              "--stream is a fixed camera behind the user. In "
                              "TEE mode it is set for a /produce on the "
                              "external camera's path. Needs --pose gpu")
@@ -3062,18 +3098,19 @@ def build_parser() -> argparse.ArgumentParser:
                              "no frames for this many seconds (a camera that "
                              "left the relay and did not come back); 0 = "
                              "keep reconnecting for the whole duration")
-    # The live annotated view (overlay.py, relay_proxy.py). Off unless a
-    # publish URL is given; then every session paints the full Sapiens2
-    # result on the frame it was detected on and publishes it to the relay,
-    # and /overlay/whep on this port signals WebRTC subscribers to it.
+    # The live view returned to the phone (overlay.py, relay_proxy.py). Off
+    # unless a publish URL is given; then every session publishes the
+    # picture to the relay - the full Sapiens2 result painted on the frame
+    # it was detected on when the phone asks for the keypoints - and
+    # /overlay/whep on this port signals WebRTC subscribers to it.
     parser.add_argument("--overlay-publish", default="",
-                        help="RTSP URL the annotated view is published to "
+                        help="RTSP URL the view is published to "
                              "(the relay sidecar's overlay path, e.g. "
                              "rtsp://127.0.0.1:8554/overlay); empty = off")
     parser.add_argument("--overlay-size", default="1280x720",
-                        help="annotated view size, WxH, even")
+                        help="view size, WxH, even")
     parser.add_argument("--overlay-fps", type=float, default=30.0,
-                        help="annotated view cadence; frames are duplicated "
+                        help="view cadence; frames are duplicated "
                              "or skipped to hold it. 30 shows every frame "
                              "of the 30 fps grid; 15 every other one; a "
                              "rate that does not divide 30 steps unevenly")
@@ -3082,22 +3119,28 @@ def build_parser() -> argparse.ArgumentParser:
                              "each frame is drawn with the pose detected on "
                              "it (pose latency + one pose interval)")
     parser.add_argument("--overlay-mirror", action="store_true",
-                        help="publish the annotated view as a selfie: picture "
-                             "and skeleton flipped left-to-right, lettering "
-                             "still readable, so a phone showing its own "
-                             "camera mirrored can switch to it seamlessly")
+                        help="publish the view as a selfie: picture and "
+                             "skeleton flipped left-to-right, so a phone "
+                             "showing its own camera mirrored can switch to "
+                             "it seamlessly")
+    parser.add_argument("--overlay-layers", choices=OVERLAYS, default=DEFAULT_OVERLAY,
+                        help="what the view draws over the picture to begin "
+                             "with: clean (nothing: the picture alone, the "
+                             "default) or keypoints (the Sapiens2 skeleton "
+                             "and points on both views); the phone changes "
+                             "it live through PUT /ingest/view")
     parser.add_argument("--overlay-encoder", choices=("x264", "nvenc", "auto"),
                         default="x264",
                         help="H.264 encoder: x264 ultrafast (default, needs "
                              "nothing from the driver), nvenc, or auto "
                              "(nvenc if a probe succeeds)")
     parser.add_argument("--overlay-bitrate", default="6M",
-                        help="the annotated view's H.264 bit rate (CBR, a "
+                        help="the view's H.264 bit rate (CBR, a "
                              "one-second buffer): 6M at 30 fps is the same "
                              "200 kbit per frame 3M was at 15 fps, so a "
                              "frame's quality holds as the cadence doubles")
     parser.add_argument("--overlay-record", action="store_true",
-                        help="also write the annotated view to overlay.mp4 "
+                        help="also write the view to overlay.mp4 "
                              "in the capture directory (uploaded with the "
                              "run). /produce takes overlay_record=1")
     parser.add_argument("--overlay-renditions", default="hi",

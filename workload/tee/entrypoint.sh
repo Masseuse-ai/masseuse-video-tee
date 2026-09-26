@@ -187,6 +187,8 @@ else
     log "no TEE_CAPTURE_BUCKET: sessions keep no record; a lease asking for one is refused"
 fi
 log "producer --tee for $SLOT_NAME -> $TRAINER_URL (idle exit ${TEE_IDLE_EXIT_S}s, boot idle ${TEE_BOOT_IDLE_S}s)"
+# No --overlay-layers: the view starts as the picture alone (clean) and the
+# phone switches the keypoints on and off through PUT /ingest/view.
 python3 /app/workload/producer/producer.py \
     --tee \
     --pose gpu \

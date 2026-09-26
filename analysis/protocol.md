@@ -5,7 +5,7 @@ user's media:
 
 - the **producer** (`workload/producer/producer.py`): decodes the stream,
   runs person detection and keypoint detection, computes regional motion
-  descriptors, draws the annotated view, and, when the stream has an audio
+  descriptors, draws the view returned to the user, and, when the stream has an audio
   track, classifies it into non-speech vocalization labels with level and
   pitch (`workload/audio/`). Every line that reads a frame or an audio
   sample is in this repository.
@@ -310,11 +310,12 @@ it on the session's event stream or send it anywhere else.
 {"kind": "hud", "lines": ["...", "..."]}
 ```
 
-Text lines for the annotated view. The overlay draws whatever it is given
-under its own status lines; the producer does not interpret them. The
-annotated view is returned only to the user whose camera it came from,
-and, when that user opens a live stream (README, "The live stream"), to
-the one destination they named.
+Accepted and not drawn. The view returned to the user carries no
+lettering any more (`workload/producer/overlay.py`: the picture, with the
+keypoints when the user asks), so the producer takes this message and
+drops it; it stays in the protocol so an analysis bundle that still sends
+it needs no change, and will be removed once none does. Nothing the
+analysis says reaches the picture.
 
 ### `gauges`
 

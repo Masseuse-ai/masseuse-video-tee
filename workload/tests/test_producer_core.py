@@ -354,6 +354,24 @@ def test_classify_requests_reach_the_audio_stage_or_are_refused():
     assert len(session.analysis.items) == 1
 
 
+def test_hud_lines_from_the_analysis_are_accepted_and_not_drawn():
+    """The `hud` message stays in the protocol (analysis/protocol.md) but
+    the view carries no lettering any more: the overlay is never told."""
+    class Overlay:
+        def __init__(self):
+            self.context = []
+
+        def offer_context(self, kind, body):
+            self.context.append((kind, body))
+
+    session = Session.__new__(Session)
+    session.overlay = Overlay()
+    session._on_analysis({"kind": "hud", "lines": ["calibration ready", "rate 12.0/min"]})
+    session._on_analysis({"kind": "hud", "lines": "not a list"})
+    session._on_analysis({"kind": "hud"})
+    assert session.overlay.context == []
+
+
 def test_a_request_may_only_name_files_under_the_mount():
     """/produce takes a `track` path from the query; it must not reach
     anything but the bucket mount, however it is spelled."""

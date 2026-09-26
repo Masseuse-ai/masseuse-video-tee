@@ -615,7 +615,11 @@ def test_the_handler_takes_a_camera_over_whip_with_no_session_at_all():
             "path": "cam", "streamUrl": "rtsp://127.0.0.1:8554/cam",
             "source": {"kind": "phone", "path": "cam", "ready": False, "tracks": [],
                        "type": None, "since": None},
-            "phone": {"ready": False, "tracks": []}, "whip": "/ingest/whip"}
+            "phone": {"ready": False, "tracks": []}, "whip": "/ingest/whip",
+            # How the view is drawn, the slot's defaults: a mirror only
+            # when the phone says so, the picture alone until it asks for
+            # the keypoints (/ingest/view).
+            "view": {"mirror": False, "overlay": "clean"}}
         # The external camera is a Confidential Space feature: outside --tee
         # the route does not exist.
         assert request(port, "PUT", "/ingest/source", b'{"url":"rtsps://c.example/x"}',

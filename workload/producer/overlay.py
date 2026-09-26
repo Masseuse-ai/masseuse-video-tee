@@ -1,5 +1,13 @@
-"""The live annotated view: every Sapiens2 keypoint drawn on the frame it
-was detected on, encoded and published in real time.
+"""The live view: the picture the camera sent, fitted to the canvas, encoded
+and published in real time - and, when the user asks for them, every
+Sapiens2 keypoint drawn on the frame it was detected on.
+
+The view has two layers to choose from (OVERLAYS): `clean`, the default,
+is the picture alone (with the face inset in the two-camera layout), what
+a user who runs the picture through their own tools needs; `keypoints`
+adds the skeleton and the points. Nothing else is ever drawn: no boxes,
+no lettering, no status lines. The choice is the phone's (producer.py
+`PUT /ingest/view`), taken live through `OverlayRenderer.set_overlay`.
 
 The producer's rows keep 21 body points (`pose_rows.row_for`); the model
 emits 308. The renderer taps the full result through `GpuPose.on_full`,
@@ -16,7 +24,9 @@ Three real-time decisions live here:
                        skeleton drawn on the frame it was detected on is
                        what makes the video read as "this is what Sapiens2
                        sees"; the latest pose over a live frame misaligns
-                       by up to that much motion.
+                       by up to that much motion. The clean layer keeps the
+                       same delay, so a switch between the two never moves
+                       the picture in time.
   fixed cadence        Frames go to the encoder on a fixed tick whatever
                        the source does: a decode stall repeats the last
                        picture, a burst is skipped through (the target is
@@ -80,10 +90,22 @@ COLOR_LEFT_HAND = (0, 160, 255)
 COLOR_RIGHT_HAND = (255, 80, 255)
 COLOR_FACE = (60, 230, 255)
 COLOR_FAINT = (120, 120, 120)
-COLOR_BOX = (255, 255, 255)
-COLOR_TEXT = (240, 240, 240)
-COLOR_WARN = (0, 165, 255)
-COLOR_BAD = (60, 60, 255)
+COLOR_RING = (255, 255, 255)
+
+# What is drawn over the picture: nothing (`clean`), or the keypoints. The
+# phone chooses (producer.py /ingest/view); `clean` until it does.
+OVERLAYS = ("clean", "keypoints")
+DEFAULT_OVERLAY = "clean"
+
+
+def parse_overlay(text: str | None) -> str:
+    """One of OVERLAYS, from `--overlay-layers` or the phone's `overlay`;
+    None or empty is the default."""
+    name = (text or DEFAULT_OVERLAY).strip().lower()
+    if name not in OVERLAYS:
+        raise ValueError(f"unknown overlay {text!r}; known: {list(OVERLAYS)}")
+    return name
+
 
 FAINT_SCORE = 0.15
 # Two detections further apart than this are not bridged; the frames
@@ -102,7 +124,7 @@ DEFAULT_BITRATE = "6M"
 
 @dataclass(frozen=True)
 class Rendition:
-    """One encoding of the annotated view (RENDITIONS).
+    """One encoding of the view (RENDITIONS).
 
     `scale` is of the canvas; `fps` and `bitrate` None mean the canvas
     cadence and the publisher's own bit rate (the `hi` rung, today's
@@ -345,10 +367,6 @@ class PoseTrack:
                       before.box_score, before.people, before.unresolved,
                       age_s=age)
 
-    def rate_per_s(self, now_wall: float, window_s: float = 3.0) -> float:
-        recent = sum(1 for d in self.detections if now_wall - d.wall <= window_s)
-        return recent / window_s
-
     def __len__(self) -> int:
         return len(self.detections)
 
@@ -528,12 +546,17 @@ def group_radius(index: int) -> int:
 
 
 class KeypointPainter:
-    """Draws one PoseAt and the HUD onto a canvas, in place.
+    """Draws one PoseAt's keypoints onto a canvas, in place, when asked.
+
+    `paint` with keypoints=False leaves the picture as it is (the clean
+    layer); with keypoints=True it draws the skeleton's edges and every
+    point the model was at all sure of. Nothing else is drawn: the person
+    box and the status lines the view once carried are gone for good, so
+    a user who runs the picture through their own tools gets the picture.
 
     With mirror=True the view is a selfie: picture and skeleton are flipped
     left-to-right (the phone shows its own camera that way, so the trainer's
-    view takes over without the body jumping sides) and the lettering is
-    drawn after the flip so it still reads left to right."""
+    view takes over without the body jumping sides)."""
 
     def __init__(self, geometry: Geometry, threshold: float = MIN_KEYPOINT_SCORE,
                  faint: float = FAINT_SCORE, mirror: bool = False):
@@ -542,35 +565,12 @@ class KeypointPainter:
         self.faint = faint
         self.mirror = mirror
 
-    def paint(self, canvas: np.ndarray, pose: PoseAt, hud: list[tuple[str, tuple]]) -> None:
-        if pose.box is not None:
-            self._box(canvas, pose)
-        if pose.points is not None and pose.scores is not None:
+    def paint(self, canvas: np.ndarray, pose: PoseAt, *, keypoints: bool) -> None:
+        if keypoints and pose.points is not None and pose.scores is not None:
             self._edges(canvas, pose)
             self._points(canvas, pose)
         if self.mirror:
             canvas[:] = canvas[:, ::-1]  # numpy copies first: overlap-safe
-        if pose.box is not None and pose.box_score is not None:
-            self._box_label(canvas, pose)
-        self._hud(canvas, hud)
-
-    def _box(self, canvas, pose: PoseAt) -> None:
-        x, y, w, h = pose.box
-        p0 = self.geometry.point(x, y)
-        p1 = self.geometry.point(x + w, y + h)
-        cv2.rectangle(canvas, p0, p1, COLOR_BOX, 1, cv2.LINE_AA)
-
-    def _box_label(self, canvas, pose: PoseAt) -> None:
-        # Above the box's top-left corner as displayed: after the flip that
-        # corner is where the top-right one was.
-        x, y, w, h = pose.box
-        p0 = self.geometry.point(x, y)
-        left = p0[0]
-        if self.mirror:
-            left = canvas.shape[1] - 1 - self.geometry.point(x + w, y + h)[0]
-        cv2.putText(canvas, f"RT-DETRv4 {pose.box_score:.2f}",
-                    (max(0, left), max(12, p0[1] - 4)), cv2.FONT_HERSHEY_SIMPLEX,
-                    0.4, COLOR_BOX, 1, cv2.LINE_AA)
 
     def _edges(self, canvas, pose: PoseAt) -> None:
         points, scores = pose.points, pose.scores
@@ -596,23 +596,9 @@ class KeypointPainter:
                 continue
             radius = group_radius(index)
             if index in BODY:
-                cv2.circle(canvas, center, radius + 2, COLOR_BOX, 1, cv2.LINE_AA)
+                cv2.circle(canvas, center, radius + 2, COLOR_RING, 1, cv2.LINE_AA)
             cv2.circle(canvas, center, radius, group_color(index),
                        1 if (hollow and index in BODY) else -1, cv2.LINE_AA)
-
-    def _hud(self, canvas, lines: list[tuple[str, tuple]]) -> None:
-        if not lines:
-            return
-        scale, line_h = 0.52, 21
-        height = 9 + line_h * len(lines)
-        width = min(canvas.shape[1], 12 + max(
-            cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, scale, 1)[0][0]
-            for text, _ in lines))
-        roi = canvas[0:height, 0:width]
-        cv2.addWeighted(roi, 0.35, np.zeros_like(roi), 0.65, 0, roi)
-        for row, (text, color) in enumerate(lines):
-            cv2.putText(canvas, text, (6, 16 + row * line_h),
-                        cv2.FONT_HERSHEY_SIMPLEX, scale, color, 1, cv2.LINE_AA)
 
 
 # -- the encoder ---------------------------------------------------------------
@@ -871,13 +857,19 @@ class OverlayRenderer(threading.Thread):
     inset's crop follows the face (face_crop_target) and is mirrored when
     `face_mirror` says the phone's camera faces the user (set_mirror); the
     body picture is never mirrored in this layout.
+
+    `overlay` (OVERLAYS) is what is drawn over the pictures, both views'
+    alike: `clean`, nothing; `keypoints`, the skeleton and points. It
+    starts as given (`--overlay-layers`, clean by default) and follows the
+    phone through `set_overlay`.
     """
 
     def __init__(self, publisher: OverlayPublisher, telemetry,
                  size: tuple[int, int] = (1280, 720), fps: float = DEFAULT_FPS,
                  delay_s: float = 1.0, source_fps: float = 30.0,
                  clock=time.monotonic, capacity: int | None = None,
-                 mirror: bool = False, sync=None, face_mirror: bool = False):
+                 mirror: bool = False, sync=None, face_mirror: bool = False,
+                 overlay: str = DEFAULT_OVERLAY):
         super().__init__(daemon=True, name="overlay")
         self.publisher = publisher
         self.telemetry = telemetry
@@ -887,6 +879,7 @@ class OverlayRenderer(threading.Thread):
         self.source_fps = source_fps
         self.sync = sync
         self.mirror = mirror and sync is None
+        self.overlay = parse_overlay(overlay)
         self.clock = clock
         # Enough decoded frames to still hold the one `delay_s` behind the
         # head after a tick's worth of jitter; at 4K each is ~12 MB.
@@ -912,8 +905,6 @@ class OverlayRenderer(threading.Thread):
         self._last_index = -1
         self._last_canvas: np.ndarray | None = None
         self._last_state = "none"
-        self._stats: dict = {}
-        self._stats_at = float("-inf")
 
     # -- inputs, from other threads ---------------------------------------------
 
@@ -965,9 +956,18 @@ class OverlayRenderer(threading.Thread):
         with self._lock:
             self.face_mirror = bool(mirror)
 
+    def set_overlay(self, overlay: str) -> str:
+        """What is drawn over the pictures (OVERLAYS), for both views. Takes
+        effect on the next tick; raises ValueError on a name that is not
+        one. Returns the name in force."""
+        name = parse_overlay(overlay)
+        with self._lock:
+            self.overlay = name
+        return name
+
     def offer_context(self, kind: str, body) -> None:
-        """Session context for the HUD: `hud` is the analysis process's list
-        of text lines (analysis/protocol.md)."""
+        """Session context the snapshot reports: `timing` is how the decoder
+        timed the frames (producer.Decoder). Nothing here is drawn."""
         with self._lock:
             self._context[kind] = body
 
@@ -982,8 +982,7 @@ class OverlayRenderer(threading.Thread):
             target = head - self.delay_s
             frame = self.frames.nearest(target)
             pose = self.track.at(frame.at_s, frame.index)
-            context = dict(self._context)
-            pose_rate = self.track.rate_per_s(self.clock())
+            keypoints = self.overlay == "keypoints"
         if target >= 0 and abs(frame.at_s - target) > 1.0 / self.source_fps:
             # The window did not hold the frame the view wanted: it was
             # evicted (store too small for the delay) or never decoded.
@@ -995,7 +994,7 @@ class OverlayRenderer(threading.Thread):
                 self._count("overlayDuplicated")
             return "duplicate"
         with self.telemetry.time_stage("overlayRender") if self.telemetry else _Null():
-            canvas = self._paint(frame, pose, context, pose_rate)
+            canvas = self._paint(frame, pose, keypoints)
         with self.telemetry.time_stage("overlayWrite") if self.telemetry else _Null():
             written = self.publisher.write(canvas)
         self._last_index = frame.index
@@ -1012,8 +1011,9 @@ class OverlayRenderer(threading.Thread):
         if self.telemetry is not None:
             self.telemetry.count(name)
 
-    def _paint(self, frame: Frame, pose: PoseAt, context: dict,
-               pose_rate: float) -> np.ndarray:
+    def _paint(self, frame: Frame, pose: PoseAt, keypoints: bool) -> np.ndarray:
+        """The canvas for one frame: the picture fitted, the face inset in
+        the two-camera layout, and the keypoints of both when asked."""
         width = frame.yuv.shape[1]
         height = frame.yuv.shape[0] * 2 // 3
         if (self._geometry is None or self._geometry.src_w != width
@@ -1022,9 +1022,8 @@ class OverlayRenderer(threading.Thread):
             self._painter = KeypointPainter(self._geometry, mirror=self.mirror)
         canvas = downscale_i420(frame.yuv, self._geometry)
         if self.sync is not None:
-            # The inset goes on before the HUD, so the HUD is never under it.
-            self._paint_inset(canvas, frame)
-        self._painter.paint(canvas, pose, self._hud(frame, pose, context, pose_rate))
+            self._paint_inset(canvas, frame, keypoints)
+        self._painter.paint(canvas, pose, keypoints=keypoints)
         return canvas
 
     # -- the face inset ---------------------------------------------------------
@@ -1047,7 +1046,8 @@ class OverlayRenderer(threading.Thread):
         self._face_age_s = face_frame.at_s - face_at
         return face_frame, face_pose, face_pose.state, mirror
 
-    def _paint_inset(self, canvas: np.ndarray, body_frame: Frame) -> None:
+    def _paint_inset(self, canvas: np.ndarray, body_frame: Frame,
+                     keypoints: bool) -> None:
         face_frame, face_pose, state, mirror = self._face_for(body_frame)
         self._face_state = state
         if face_frame is None:
@@ -1067,7 +1067,7 @@ class OverlayRenderer(threading.Thread):
         fit = fit_geometry(box[2], box[3], w, h)
         inset = downscale_i420(crop_i420(face_frame.yuv, box), fit)
         painter = KeypointPainter(CropGeometry(fit, box[0], box[1]), mirror=mirror)
-        painter.paint(inset, face_pose, [])
+        painter.paint(inset, face_pose, keypoints=keypoints)
         if state == "stale":
             self._count("overlayFaceStale")
         # A border, then the inset over the body picture.
@@ -1076,76 +1076,6 @@ class OverlayRenderer(threading.Thread):
         x0, x1 = max(0, x - b), min(canvas.shape[1], x + w + b)
         canvas[y0:y1, x0:x1] = COLOR_INSET_BORDER
         canvas[y:y + h, x:x + w] = inset
-
-    def _hud(self, frame: Frame, pose: PoseAt, context: dict,
-             pose_rate: float) -> list[tuple[str, tuple]]:
-        now = self.clock()
-        if self.telemetry is not None and now - self._stats_at >= 0.5:
-            snap = self.telemetry.snapshot()
-            self._stats = {
-                "poseP50": snap["stagesMs"].get("pose", {}).get("p50"),
-                "dropped": snap["counters"].get("poseDropped", 0),
-                "e2eLagS": snap["gauges"].get("e2eLagS"),
-            }
-            self._stats_at = now
-        stats = self._stats
-        p50 = stats.get("poseP50")
-        lines: list[tuple[str, tuple]] = []
-        # `timing` is how the decoder timed the frames (producer.Decoder):
-        # the sender's clock, or arrival here.
-        timing = context.get("timing")
-        lines.append((
-            f"t {frame.at_s:7.1f}s   pose {pose_rate:.1f}/s"
-            + (f" p50 {p50:.0f}ms" if p50 is not None else "")
-            + f" drops {stats.get('dropped', 0)}"
-            + f"   view {self.delay_s:.1f}s behind decode, aligned"
-            + (f"   clock {timing}" if isinstance(timing, str) and timing else ""),
-            COLOR_TEXT))
-        if pose.points is not None and pose.scores is not None:
-            confident = int((pose.scores >= MIN_KEYPOINT_SCORE).sum())
-            detail = (f"Sapiens2 {confident}/{len(pose.scores)} kp >= "
-                      f"{MIN_KEYPOINT_SCORE:.2f}")
-            if pose.box_score is not None:
-                detail += f"   RT-DETRv4 {pose.box_score:.2f}"
-            detail += f"   people {pose.people}"
-            if pose.unresolved:
-                detail += " (identity unresolved)"
-            if pose.state == "interpolated":
-                detail += "   interpolated"
-            elif pose.state == "stale":
-                detail += f"   POSE LAGGING +{pose.age_s * 1000:.0f}ms"
-            lines.append((detail, COLOR_WARN if pose.state == "stale" else COLOR_TEXT))
-        elif pose.state == "missing":
-            lines.append((f"NO PERSON  (detector saw {pose.people})", COLOR_BAD))
-        else:
-            lines.append(("waiting for the first pose", COLOR_WARN))
-        if self.sync is not None:
-            lines.append(self._face_hud_line())
-        # Whatever the analysis process last said about the session
-        # (analysis/protocol.md `hud`), drawn verbatim under the pose lines:
-        # this renderer knows nothing about what the lines mean.
-        for text in context.get("hud") or ():
-            if isinstance(text, str) and text:
-                lines.append((text, COLOR_TEXT))
-        return lines
-
-    def _face_hud_line(self) -> tuple[str, tuple]:
-        """The inset's line: what it shows, how the two views stand."""
-        state = self._face_state
-        skew = self.sync.skew_s()
-        stand = (f"skew {skew * 1000:+.0f}ms" if skew is not None else "clocks apart")
-        if state == "waiting":
-            return f"face: waiting for the phone's camera   {stand}", COLOR_WARN
-        if state == "unpaired":
-            return f"face: no frame at this moment   {stand}", COLOR_WARN
-        if state == "none":
-            return f"face: waiting for the first pose   {stand}", COLOR_WARN
-        if state == "missing":
-            return f"face: NO PERSON   {stand}", COLOR_BAD
-        pairing = (f" paired {self._face_age_s * 1000:+.0f}ms"
-                   if self._face_age_s is not None else "")
-        color = COLOR_WARN if state == "stale" else COLOR_TEXT
-        return f"face: {state}{pairing}   {stand}   {self.sync.timing}", color
 
     # -- the thread -------------------------------------------------------------
 
@@ -1178,6 +1108,7 @@ class OverlayRenderer(threading.Thread):
             face_stored, face_detections = len(self.face_frames), len(self.face_track)
             timing = self._context.get("timing")
             face_mirror = self.face_mirror
+            overlay = self.overlay
         skew = self.sync.skew_s() if self.sync is not None else None
         return {
             "publishUrl": self.publisher.url,
@@ -1185,6 +1116,8 @@ class OverlayRenderer(threading.Thread):
             "size": f"{self.size[0]}x{self.size[1]}",
             "fps": self.fps,
             "delayS": self.delay_s,
+            # What is drawn over the pictures (OVERLAYS): the phone's choice.
+            "overlay": overlay,
             "publisherAlive": self.publisher.alive,
             "publisherSpawns": self.publisher.spawns,
             "recordPath": (str(self.publisher.record_path)
@@ -1227,7 +1160,8 @@ def build_renderer(args, telemetry, source_fps: float = 30.0,
     """The renderer for a session's args, or None when no publish URL is
     configured (the default: zero overhead). `sync` (sync.ViewSync) makes
     it the two-camera layout, the face inset mirrored as `args.face_mirror`
-    says to begin with."""
+    says to begin with; `args.overlay_layers` (OVERLAYS) is what is drawn
+    to begin with, clean when unsaid."""
     url = getattr(args, "overlay_publish", "") or ""
     if not url:
         return None
@@ -1247,4 +1181,5 @@ def build_renderer(args, telemetry, source_fps: float = 30.0,
         delay_s=float(getattr(args, "overlay_delay_s", 1.0) or 1.0),
         source_fps=source_fps,
         mirror=bool(getattr(args, "overlay_mirror", False)),
-        sync=sync, face_mirror=bool(getattr(args, "face_mirror", False)))
+        sync=sync, face_mirror=bool(getattr(args, "face_mirror", False)),
+        overlay=parse_overlay(getattr(args, "overlay_layers", None)))

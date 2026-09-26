@@ -25,12 +25,17 @@ Inside the enclave, in code that is in this repository:
 - Regional motion descriptors are computed from the pixels around a few
   keypoint-anchored regions (optical-flow statistics: how much, how fast, in
   which direction a region moves).
-- An annotated view (skeleton, boxes, a status line) is drawn on the frames
-  and streamed back to the same device that sent the video, and to nothing
-  else unless the user opens a live stream (below, "The live stream"): then
-  the same view, with a HUD card drawn over it and with the microphone when
-  asked, also goes to the one streaming destination the user named from
-  their device. It is encoded in four renditions at once, from the one picture:
+- The view is streamed back to the same device that sent the video, and
+  to nothing else unless the user opens a live stream (below, "The live
+  stream"): then the same view, with a HUD card drawn over it and with the
+  microphone when asked, also goes to the one streaming destination the
+  user named from their device. The view is the picture: nothing is drawn
+  on it - no boxes, no status lines - unless the user asks for the
+  keypoints (`PUT /ingest/view {overlay: "keypoints"}`, the device's
+  capability), when the skeleton and points are drawn on the frame they
+  were detected on, and taken off again the same way; a user who runs the
+  picture through their own tools gets the picture. It is encoded in four
+  renditions at once, from the one picture:
   the full view at 30 fps, the full view at 15 fps, and three quarters of
   its size at 15 fps at two bit rates. They give things up in that order -
   frame rate first, then resolution, then bits - and the device picks one
@@ -48,8 +53,8 @@ Inside the enclave, in code that is in this repository:
   stays live too. The fixed camera's picture is the session's: the body
   view, which everything above runs on. The phone's picture is decoded
   beside it, its person and keypoints found by the same detectors at the
-  same cadence, and drawn as an inset in the top-right corner of the
-  annotated view with those keypoints, cropped to follow the face and
+  same cadence, and drawn as an inset in the top-right corner of the view
+  (with its keypoints when they are on), cropped to follow the face and
   mirrored the way the phone's own preview was when its camera faces the
   user (the phone says which, `PUT /ingest/view`). The two pictures are
   lined up by the time each frame was taken - both senders time their
@@ -95,8 +100,8 @@ is in it and how its destination is bound.
 All of that is `workload/`: `pixel/` is the decode geometry, person
 detection, keypoint detection and motion descriptors; `audio/` is the audio
 decode, the classifier binding and the level and pitch measurements;
-`producer/` is the session shell that runs them, draws the overlay and
-speaks to the analysis module over a local socket; `tee/` is the container
+`producer/` is the session shell that runs them, draws the view returned
+to the phone and speaks to the analysis module over a local socket; `tee/` is the container
 image and its entrypoint. `analysis/protocol.md` names every field that
 crosses to the analysis module and every field that comes back.
 
@@ -195,16 +200,17 @@ slot over WHIP as before, and the two pictures meet only inside this
 image: the fixed camera's as the body view, the phone's as the face inset
 drawn over it, both returned over the one WHEP leg to the same phone. The
 phone's capability is what opens `PUT /ingest/view`, the one control over
-how its picture is drawn (mirrored or not); the masseuse learns the layout
-and the inset's place from the slot's status (`overlay.view`) and nothing
-of either picture.
+how the view is drawn (its picture mirrored or not; the keypoints on or
+off); the masseuse learns the layout and the inset's place from the slot's
+status (`overlay.view`), what is drawn from `/ingest/status` (`view`), and
+nothing of either picture.
 
 **One session per slot.** A slot serves one session at a time: the lease
 holds a single capability hash, and the publish and overlay routes accept
 only that capability as a bearer, so a second person cannot join a slot
 that is someone else's.
 
-**The live stream (opt-in).** A user may send the annotated view on to a
+**The live stream (opt-in).** A user may send the view on to a
 live-streaming service of their choosing, the way a creator streams a
 show: the page hands the enclave the service's `rtmps://` address, stream
 key included (`PUT /ingest/egress {url, audio?, hud?}`, the same

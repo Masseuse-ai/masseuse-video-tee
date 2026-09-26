@@ -1,7 +1,8 @@
-"""The live stream: the annotated view sent on to one destination the user
-names, from their phone, for one session.
+"""The live stream: the returned view (overlay.py: the picture, with the
+keypoints when the phone asks) sent on to one destination the user names,
+from their phone, for one session.
 
-By default the annotated view goes back to the device that sent the
+By default the view goes back to the device that sent the
 video and nowhere else (README). This module is the one exception, and
 it is the user's to open: the page hands the enclave a live-streaming
 destination (`PUT /ingest/egress`, capability bearer, over the slot's own

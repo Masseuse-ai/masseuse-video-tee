@@ -58,7 +58,7 @@ WHEP_SECRET = re.compile(r"^[A-Za-z0-9-]{1,64}$")
 WHEP_METHODS = frozenset({"OPTIONS", "POST", "PATCH", "DELETE"})
 # The two legs this proxy carries: (route prefix, relay verb).
 LEGS = {"whep": "whep", "whip": "whip"}
-# The annotated view's renditions by name and relay path suffix
+# The returned view's renditions by name and relay path suffix
 # (overlay.RENDITIONS, kept in step by test_relay_proxy): each is its own
 # relay path, `overlay` for `hi` and `overlay-<name>` for the rest.
 RENDITION_SUFFIXES = {"hi": "", "half": "-half", "small": "-small", "lean": "-lean"}
@@ -104,7 +104,7 @@ def route(path: str) -> Route | None:
     ('ingest-status', None)            GET  /ingest/status
     ('whip', None|secret)              /ingest/whip[/<secret>]
     ('source', None)                   PUT/GET/DELETE /ingest/source
-    ('view', None)                     PUT/GET /ingest/view
+    ('view', None)                     PUT/GET /ingest/view           (mirror, overlay: the phone's)
     ('egress', None)                   PUT/GET/DELETE /ingest/egress  (the live stream, the phone's)
     ('egress-stop', None)              POST /egress/stop              (the trainer's)
     ('hud', None)                      PUT /overlay/hud               (the trainer's HUD card state)
@@ -360,12 +360,15 @@ class RelayProxy:
             return 503, body
         return 200, body
 
-    def ingest_status(self, external=None, egress=None) -> tuple[int, dict]:
+    def ingest_status(self, external=None, egress=None, view=None) -> tuple[int, dict]:
         """(status code, body) for GET /ingest/status: the relay's view of
         the session's camera, flattened so `ready` and `tracks` sit at the
         top, plus which camera that is, plus the live stream (`egress`:
         egress.Egress.status, on a slot that has one) so the trainer knows
-        a stream is on and to which host, never where exactly.
+        a stream is on and to which host, never where exactly, plus how
+        the view is drawn (`view`: the phone's standing `mirror` and
+        `overlay` from /ingest/view, producer.view_prefs) so the trainer
+        can show what the slot draws.
 
         The camera is the phone's (`cam`) unless `external` (an
         external_source.ExternalSource) is active, in which case the top
@@ -409,4 +412,7 @@ class RelayProxy:
         body["whip"] = "/ingest/whip"
         if egress is not None:
             body["egress"] = egress.status()
+        if view is not None:
+            body["view"] = {"mirror": bool(view.get("mirror", False)),
+                            "overlay": str(view.get("overlay", "clean"))}
         return 200, body
