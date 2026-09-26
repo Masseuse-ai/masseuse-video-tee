@@ -2700,9 +2700,9 @@ def build_server(args, telemetry: Telemetry,
 
         def _egress(self) -> None:
             """/ingest/egress: the live stream the phone opens (egress.py).
-            PUT {url, audio?, hud?} starts it to the rtmps:// destination
-            named, GET says whether one is on (and to which host, never
-            more), DELETE stops it. Gated by the phone's capability like
+            PUT {url, audio?, hud?} starts it to the rtmp:// or rtmps://
+            destination named, GET says whether one is on (and to which
+            host, never more), DELETE stops it. Gated by the phone's capability like
             WHIP: the destination carries the stream key, so it goes to
             the enclave and nowhere in front of it, and nothing about it
             beyond the host is logged.

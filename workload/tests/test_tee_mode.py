@@ -1292,9 +1292,9 @@ def test_the_phone_opens_a_live_stream_with_its_capability_and_the_trainer_may_o
         assert code == 200 and json.loads(body)["active"] is False
         assert headers["Cache-Control"] == "no-store"
         assert slot.as_phone(cap, "PATCH", "/ingest/egress")[0] == 405
-        # A plain rtmp address, a private host, not JSON: each says why, and nothing starts.
-        code, _, body = slot.as_phone(cap, "PUT", "/ingest/egress", b'{"url": "rtmp://live.example.com/app/k"}', json_type)
-        assert code == 400 and json.loads(body) == {"status": "failed", "reason": "not-rtmps",
+        # A web page's address, not JSON, too long: each says why, and nothing starts.
+        code, _, body = slot.as_phone(cap, "PUT", "/ingest/egress", b'{"url": "https://live.example.com/my/settings"}', json_type)
+        assert code == 400 and json.loads(body) == {"status": "failed", "reason": "bad-scheme",
                                                      "error": json.loads(body)["error"]}
         code, _, body = slot.as_phone(cap, "PUT", "/ingest/egress", b"not json", json_type)
         assert code == 400 and json.loads(body)["reason"] == "bad-url"

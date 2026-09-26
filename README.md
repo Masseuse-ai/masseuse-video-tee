@@ -257,20 +257,29 @@ that is someone else's.
 
 **The live stream (opt-in).** A user may send the view on to a
 live-streaming service of their choosing, the way a creator streams a
-show: the page hands the enclave the service's `rtmps://` address, stream
-key included (`PUT /ingest/egress {url, audio?, hud?}`, the same
-capability bearer as WHIP, over the slot's own TLS, after the attestation
-check), and one `ffmpeg` inside the image reads the view back from the
-relay's loopback path and pushes it there, with the microphone as AAC
-when `audio` is asked for and, when `hud` is (the default), a HUD card
-composited over the view at the bottom-left. The card's words come from
-the trainer (`PUT /overlay/hud`, the trainer's identity; a few tiles, a
-row for the unit, a count of viewers), bounded and drawn as given; the
-producer interprets none of them. The destination is checked the way a
-camera link is: `rtmps://` only (a plain `rtmp://` address would carry
-the view across the internet in the clear), a host that resolves to a
+show: the page hands the enclave the service's `rtmp://` or `rtmps://`
+address, stream key included (`PUT /ingest/egress {url, audio?, hud?}`,
+the same capability bearer as WHIP, over the slot's own TLS, after the
+attestation check), and one `ffmpeg` inside the image reads the view back
+from the relay's loopback path and pushes it there, with the microphone
+as AAC when `audio` is asked for and, when `hud` is (the default), a HUD
+card composited over the view at the bottom-left. The card's words come
+from the trainer (`PUT /overlay/hud`, the trainer's identity; a few tiles
+and a row for the unit), bounded and drawn as given; the producer
+interprets none of them. The destination is checked the way a camera
+link is: the two schemes a service's ingest speaks and no other (a web
+page's `https://` is refused as `bad-scheme`), a host that resolves to a
 public address and not this VM's; nothing about it beyond its host is
-logged or reported, and the key stays inside the process. `GET` says
+logged or reported, and the key stays inside the process. The transit to
+the service is encrypted only when its address is `rtmps://`; most
+creator platforms publish a plain `rtmp://` ingest (OnlyFans among them,
+`rtmp://cloudbetastreaming.onlyfans.com/live` in OBS's service list),
+which is the service's own design for every broadcasting program and the
+user's choice of destination. With the card on, the re-encode runs at
+4500 kbps, or at the ceiling a service publishes for its ingest when
+`PLATFORM_LIMITS` in `egress.py` names its host (OnlyFans: 2500 kbps);
+with the card off the view's own encode is copied and cannot be capped.
+`GET` says
 whether a stream is on and to which host, `DELETE` stops it; the trainer
 sees the same in `/ingest/status` (`egress`) and may stop the stream
 (`POST /egress/stop`), never start one or name where it goes. The stream

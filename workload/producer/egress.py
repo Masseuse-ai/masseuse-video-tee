@@ -16,13 +16,22 @@ stream key rides in the URL's path and stays inside the process.
 
 What the enclave checks before it connects:
 
-  scheme      rtmps:// only. A plain rtmp:// destination would carry the
-              view across the internet in the clear.
+  scheme      rtmp:// or rtmps://, the two a streaming service's ingest
+              speaks (anything else, a web page's https:// above all, is
+              refused as `bad-scheme`). The transit to the service is
+              encrypted only when its address is rtmps://; most creator
+              platforms publish a plain rtmp:// ingest (OnlyFans among
+              them), which is the service's own design for every
+              broadcasting program, and the user's choice of destination.
   address     the host must resolve to a public address (the same rule as
               a camera link: RFC 1918, loopback, link-local, multicast and
               the VM's own address are refused with a reason the page can
               show). A stream goes to a service on the internet, never
               into the enclave's own network.
+  bitrate     the re-encode (the card on) runs at DEFAULT_VIDEO_KBPS, or
+              at the service's published ceiling when PLATFORM_LIMITS
+              names its host (OnlyFans: 2500 kbps). The copy path (the
+              card off) carries the view's own encode and cannot cap.
 
 Then one ffmpeg: the view read back from the relay's loopback RTSP path
 (`overlay`, the same H.264 the phone's WHEP leg carries), copied without
@@ -51,11 +60,27 @@ from urllib.parse import urlsplit
 from external_source import _refused_address
 
 URL_CAP = 2048
-DEFAULT_RTMPS_PORT = 443
-ALLOWED_SCHEMES = ("rtmps",)
+ALLOWED_SCHEMES = ("rtmp", "rtmps")
+DEFAULT_PORTS = {"rtmp": 1935, "rtmps": 443}
 BACKOFF_S = (1.0, 2.0, 4.0, 8.0, 15.0)
 HUD_FPS = 2.0
 STOP_WAIT_S = 3.0
+# The re-encode's video bitrate (kbps): the default, and the ceiling a
+# service publishes for its ingest, by the destination host's suffix
+# (OBS's service list gives OnlyFans a 2500 kbps maximum).
+DEFAULT_VIDEO_KBPS = 4500
+PLATFORM_LIMITS = {"onlyfans.com": 2500}
+
+
+def video_kbps_for(host: str | None) -> int:
+    """The video bitrate for a destination: the service's ceiling when
+    PLATFORM_LIMITS names its host (the host itself or a subdomain of it),
+    else the default."""
+    name = (host or "").lower().rstrip(".")
+    for suffix, kbps in PLATFORM_LIMITS.items():
+        if name == suffix or name.endswith("." + suffix):
+            return kbps
+    return DEFAULT_VIDEO_KBPS
 
 
 class EgressError(Exception):
@@ -74,10 +99,12 @@ class EgressError(Exception):
 
 def parse_destination(url) -> tuple[str, str, int]:
     """(the destination, stripped; its host; its port) for anything shaped
-    like a live-streaming service's rtmps:// address, or an EgressError
-    saying what is wrong with it. Nothing here touches the network."""
+    like a live-streaming service's rtmp:// or rtmps:// address, or an
+    EgressError saying what is wrong with it. Nothing here touches the
+    network."""
     if not isinstance(url, str) or not url.strip():
-        raise EgressError("bad-url", "paste the service's rtmps:// address, stream key included")
+        raise EgressError("bad-url", "paste the address your streaming service gives you, "
+                          "rtmp:// or rtmps://, with your stream key")
     url = url.strip()
     if len(url) > URL_CAP:
         raise EgressError("bad-url", f"the address is longer than {URL_CAP} characters")
@@ -89,15 +116,15 @@ def parse_destination(url) -> tuple[str, str, int]:
         port = parts.port
     except ValueError as error:
         raise EgressError("bad-url", f"that is not a valid address ({error})") from None
-    if parts.scheme.lower() not in ALLOWED_SCHEMES:
-        raise EgressError("not-rtmps", "only rtmps:// addresses are accepted: a plain "
-                          "rtmp:// address would send the view across the internet "
-                          "unencrypted")
+    scheme = parts.scheme.lower()
+    if scheme not in ALLOWED_SCHEMES:
+        raise EgressError("bad-scheme", "only rtmp:// and rtmps:// addresses are accepted: "
+                          "the address of a web page is not a stream's")
     if not host:
         raise EgressError("bad-url", "the address names no host")
     if not parts.path or parts.path == "/":
         raise EgressError("bad-url", "the address needs the service's application path and your stream key")
-    return url, host, int(port or DEFAULT_RTMPS_PORT)
+    return url, host, int(port or DEFAULT_PORTS[scheme])
 
 
 def resolve_public(host: str, port: int, own_ip: str = "",
@@ -141,14 +168,15 @@ class EgressPublisher:
     a second from a thread of this publisher's."""
 
     def __init__(self, destination: str, view_url: str, *, audio_url: str | None = None,
-                 hud=None, encoder: str = "x264", telemetry=None,
-                 popen=subprocess.Popen, clock=time.monotonic, sleep=time.sleep,
-                 log=print):
+                 hud=None, encoder: str = "x264", video_kbps: int = DEFAULT_VIDEO_KBPS,
+                 telemetry=None, popen=subprocess.Popen, clock=time.monotonic,
+                 sleep=time.sleep, log=print):
         self.destination = destination
         self.view_url = view_url
         self.audio_url = audio_url
         self.hud = hud
         self.encoder = encoder
+        self.video_kbps = int(video_kbps)
         self.telemetry = telemetry
         self.popen = popen
         self.clock = clock
@@ -189,8 +217,9 @@ class EgressPublisher:
                 argv += ["-c:v", "h264_nvenc", "-preset", "p1", "-tune", "ll", "-zerolatency", "1", "-rc", "cbr"]
             else:
                 argv += ["-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency"]
+            kbps = self.video_kbps
             argv += ["-profile:v", "main", "-pix_fmt", "yuv420p", "-g", "60", "-bf", "0",
-                     "-b:v", "4500k", "-maxrate", "4500k", "-bufsize", "9000k"]
+                     "-b:v", f"{kbps}k", "-maxrate", f"{kbps}k", "-bufsize", f"{2 * kbps}k"]
         if audio_index is not None:
             argv += ["-map", f"{audio_index}:a", "-c:a", "aac", "-b:a", "128k", "-ar", "48000"]
         else:
@@ -365,7 +394,8 @@ class Egress:
                 destination, self.view_url,
                 audio_url=self.audio_url if audio else None,
                 hud=self.hud_card if hud and self.hud_card is not None else None,
-                encoder=self.encoder, telemetry=self.telemetry, popen=self.popen,
+                encoder=self.encoder, video_kbps=video_kbps_for(host),
+                telemetry=self.telemetry, popen=self.popen,
                 clock=self.monotonic, log=self.log)
             publisher.start()
             self.publisher = publisher

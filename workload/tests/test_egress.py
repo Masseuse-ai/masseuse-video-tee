@@ -13,10 +13,11 @@ import time
 import pytest
 
 import egress as egress_module
-from egress import Egress, EgressError, EgressPublisher, parse_destination, resolve_public
+from egress import Egress, EgressError, EgressPublisher, parse_destination, resolve_public, video_kbps_for
 from hud_card import CARD_SIZE, HudCard, sanitize_state
 
 DESTINATION = "rtmps://live.example.com/app/sk_live_secret_key_1234"
+PLAIN_DESTINATION = "rtmp://ingest.example.net/live/sk_live_secret_key_5678"
 
 
 def resolver_for(address: str):
@@ -28,18 +29,24 @@ def resolver_for(address: str):
 # -- the destination ------------------------------------------------------------------
 
 
-def test_a_destination_is_rtmps_with_a_path_and_no_more():
+def test_a_destination_is_rtmp_or_rtmps_with_a_path_and_no_more():
     url, host, port = parse_destination(f"  {DESTINATION}  ")
     assert (url, host, port) == (DESTINATION, "live.example.com", 443)
     assert parse_destination("rtmps://live.example.com:1935/app/key")[2] == 1935
+    # A service's plain rtmp:// ingest (OnlyFans, and most of OBS's list) is
+    # taken as it is given, on RTMP's own port when none is named.
+    assert parse_destination(PLAIN_DESTINATION) == (PLAIN_DESTINATION, "ingest.example.net", 1935)
+    assert parse_destination("RTMP://ingest.example.net:1936/live/key")[2] == 1936
     for bad, reason in (
         (None, "bad-url"), ("", "bad-url"), ("x" * 3000, "bad-url"),
         ("rtmps://live.example.com/app/k ey", "bad-url"),
-        ("rtmp://live.example.com/app/key", "not-rtmps"),
-        ("https://live.example.com/app/key", "not-rtmps"),
+        ("https://live.example.com/app/key", "bad-scheme"),
+        ("rtsp://live.example.com/app/key", "bad-scheme"),
+        ("srt://live.example.com:9000/app/key", "bad-scheme"),
         ("rtmps:///app/key", "bad-url"),
         ("rtmps://live.example.com", "bad-url"),
         ("rtmps://live.example.com/", "bad-url"),
+        ("rtmp://ingest.example.net/", "bad-url"),
         ("rtmps://[::1/app/key", "bad-url"),
     ):
         with pytest.raises(EgressError) as raised:
@@ -47,6 +54,24 @@ def test_a_destination_is_rtmps_with_a_path_and_no_more():
         assert raised.value.reason == reason, bad
         assert raised.value.status == 400
         assert raised.value.body()["status"] == "failed"
+
+
+def test_the_video_bitrate_is_the_services_ceiling_when_it_publishes_one():
+    assert video_kbps_for("cloudbetastreaming.onlyfans.com") == 2500
+    assert video_kbps_for("onlyfans.com") == 2500
+    assert video_kbps_for("ONLYFANS.COM.") == 2500
+    assert video_kbps_for("notonlyfans.com") == egress_module.DEFAULT_VIDEO_KBPS
+    assert video_kbps_for("live.example.com") == egress_module.DEFAULT_VIDEO_KBPS
+    assert video_kbps_for(None) == egress_module.DEFAULT_VIDEO_KBPS
+    card = HudCard()
+    capped = EgressPublisher("rtmp://cloudbetastreaming.onlyfans.com/live/key", "rtsp://127.0.0.1:8554/overlay",
+                             hud=card, video_kbps=video_kbps_for("cloudbetastreaming.onlyfans.com")).argv()
+    assert capped[capped.index("-b:v") + 1] == "2500k"
+    assert capped[capped.index("-maxrate") + 1] == "2500k"
+    assert capped[capped.index("-bufsize") + 1] == "5000k"
+    default = EgressPublisher(DESTINATION, "rtsp://127.0.0.1:8554/overlay", hud=card).argv()
+    assert default[default.index("-b:v") + 1] == "4500k"
+    assert default[default.index("-bufsize") + 1] == "9000k"
 
 
 def test_the_host_must_resolve_to_a_public_address_that_is_not_our_own():
@@ -235,8 +260,8 @@ def test_egress_starts_replaces_and_clears_a_stream_and_says_only_the_host():
                                "error": None, "restarts": 0, "alive": False, "card": {"held": False, "ageS": None}}
 
     with pytest.raises(EgressError) as raised:
-        stream.connect({"url": "rtmp://live.example.com/app/key"}, "sess-1")
-    assert raised.value.reason == "not-rtmps"
+        stream.connect({"url": "https://live.example.com/my/settings"}, "sess-1")
+    assert raised.value.reason == "bad-scheme"
     assert stream.active is False
 
     answer = stream.connect({"url": DESTINATION, "audio": True}, "sess-1")
@@ -250,13 +275,22 @@ def test_egress_starts_replaces_and_clears_a_stream_and_says_only_the_host():
     assert all("sk_live" not in line for line in logged), logged
     assert counts["egressStarted"] == 1
 
-    # A second destination replaces the first; the card may be left off.
-    stream.connect({"url": "rtmps://other.example.net/live/key2", "hud": False}, "sess-1")
+    # A second destination replaces the first; the card may be left off; a
+    # service's plain rtmp:// ingest is taken, and capped at its ceiling
+    # when the card is on.
+    stream.connect({"url": "rtmp://cloudbetastreaming.onlyfans.com/live/key2"}, "sess-1")
     wait_for(lambda: len(procs) == 2)
     assert procs[0].returncode == -15
+    assert stream.status()["host"] == "cloudbetastreaming.onlyfans.com"
+    assert procs[1].argv[-1] == "rtmp://cloudbetastreaming.onlyfans.com/live/key2"
+    assert procs[1].argv[procs[1].argv.index("-b:v") + 1] == "2500k"
+    assert all("key2" not in line for line in logged), logged
+    stream.connect({"url": "rtmps://other.example.net/live/key3", "hud": False}, "sess-1")
+    wait_for(lambda: len(procs) == 3)
+    assert procs[1].returncode == -15
     assert stream.status()["host"] == "other.example.net"
     assert stream.status()["hud"] is False and stream.status()["audio"] is False
-    assert "pipe:0" not in procs[1].argv and procs[1].argv[procs[1].argv.index("-c:v") + 1] == "copy"
+    assert "pipe:0" not in procs[2].argv and procs[2].argv[procs[2].argv.index("-c:v") + 1] == "copy"
 
     # The card's state comes from the trainer, bounded.
     state = stream.set_hud_state({"tiles": [{"key": "clench", "label": "Clench rate", "value": "36", "unit": "/min"}]})
@@ -264,7 +298,7 @@ def test_egress_starts_replaces_and_clears_a_stream_and_says_only_the_host():
     assert stream.status()["card"]["held"] is True
 
     assert stream.clear("the phone asked") is True
-    assert procs[1].returncode == -15
+    assert procs[2].returncode == -15
     assert stream.active is False and stream.status()["host"] is None
     assert stream.clear("again") is False
     assert counts["egressStopped"] == 1
@@ -290,7 +324,7 @@ def test_the_card_bounds_the_trainers_words_and_paints_them():
     assert len(state["tiles"]) == 4, "at most four tiles"
     assert state["tiles"][1]["detail"] == "+14 dB"
     assert state["unit"] == {"name": "MK-312BT", "detail": "Stroke", "tone": "live", "level": 35, "max": 70}
-    assert state["fans"] == {"watching": 12, "controlling": 3}
+    assert "fans" not in state, "the card draws no audience; an older trainer's count is left out"
     long = sanitize_state({"tiles": [{"label": "x" * 100, "value": "y" * 100, "unit": "z" * 20}]})
     assert len(long["tiles"][0]["label"]) == 24 and len(long["tiles"][0]["value"]) == 40 and len(long["tiles"][0]["unit"]) == 8
     assert sanitize_state({"unit": {"level": True, "max": 0}})["unit"] == {"name": "", "detail": "", "tone": "neutral", "level": None, "max": None}
@@ -302,9 +336,7 @@ def test_the_card_bounds_the_trainers_words_and_paints_them():
     card = HudCard(clock=lambda: clock["now"])
     empty = card.render()
     assert len(empty) == CARD_SIZE[0] * CARD_SIZE[1] * 4
-    card.set_state({
-        "tiles": state["tiles"], "unit": state["unit"], "fans": state["fans"],
-    })
+    card.set_state({"tiles": state["tiles"], "unit": state["unit"]})
     painted = card.render()
     assert len(painted) == len(empty)
     assert painted != empty, "the words are drawn"
