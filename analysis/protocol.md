@@ -362,7 +362,9 @@ compares against changed). A `decision` from bundle 2026.09.25-1 on also
 carries the head's score for the span (`headScore`), the head's version,
 the type it named (`type`, beside the classifier's `topLabel`) and its
 probability per type class (`typeProbs`); `rejected` joins the verdicts
-(the head scored the span under its threshold). Everything in `row` is a
+(the head scored the span under its threshold and neither the type head
+nor the classifier's top label called it breath; a span under the
+threshold that is breath by either stays `breathing`). Everything in `row` is a
 number, a label name or a timestamp, derived from the `audio` and
 `segment` messages above; no sample is anywhere near it. The producer appends each row to the session
 record's `vocal/` stream (`workload/producer/record.py`) and does not emit
