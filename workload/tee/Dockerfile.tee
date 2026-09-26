@@ -77,15 +77,13 @@ RUN test -n "${CAMLINK_VERSION}" && test -n "${CAMLINK_SHA256}" \
 # revision and checked against its SHA-256. Both live in the image rather
 # than the weights bucket: together they are a few megabytes, and the
 # attested digest then covers exactly which classifier heard the audio.
+# (The pins are declared inside the stage: an ARG between two FROMs belongs
+# to the stage above it, not to the build.)
+FROM ubuntu:24.04 AS ced
 ARG CED_CPP_COMMIT=c04ac14b7992d00584d9e812c9bb6268598a6ce7
 ARG CED_GGUF_REVISION=b5e9a4aad6438763c8da16079d77563fbed35c65
 ARG CED_MODEL_FILE=ced-small-f16.gguf
 ARG CED_MODEL_SHA256=c391ed8697a1b08d7c1a463e4940a5c3a2f670e0544ab0d8ee23b544583602a8
-FROM ubuntu:24.04 AS ced
-ARG CED_CPP_COMMIT
-ARG CED_GGUF_REVISION
-ARG CED_MODEL_FILE
-ARG CED_MODEL_SHA256
 RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential ca-certificates cmake curl git \
     && rm -rf /var/lib/apt/lists/*
