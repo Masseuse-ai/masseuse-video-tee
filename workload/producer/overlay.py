@@ -93,6 +93,27 @@ FAINT_SCORE = 0.15
 BRIDGE_S = 1.0
 SIZE_RE = re.compile(r"^(\d{2,5})x(\d{2,5})$")
 
+# The face inset: the phone's view drawn over the fixed camera's, in the
+# top-right corner, portrait 3:4 at this fraction of the canvas height,
+# this far from the edges, with a border.
+INSET_ASPECT = (3, 4)
+INSET_HEIGHT_FRACTION = 0.40
+INSET_MARGIN = 16
+INSET_BORDER = 2
+COLOR_INSET_BORDER = (255, 255, 255)
+# The inset's crop of the phone's frame follows the face: the box around
+# the confident face keypoints, grown to this many times its size, never
+# smaller than this fraction of the frame's height, moved this far toward
+# each new position per frame (an exponential smoothing, so the crop does
+# not shake with the keypoints). Without a face it is the middle of the
+# frame.
+INSET_FACE_GROW = 2.6
+INSET_MIN_HEIGHT_FRACTION = 0.3
+INSET_SMOOTH = 0.15
+# The head's keypoints: the face block, and the body's nose, eyes and ears.
+HEAD_KEYPOINTS = (NOSE, LEFT_EYE, RIGHT_EYE, LEFT_EAR, RIGHT_EAR) + tuple(
+    range(FACE_START, SAPIENS2_KEYPOINTS))
+
 
 def parse_size(text: str) -> tuple[int, int]:
     """`WxH`, both even and at least 64: what yuv420p encoders accept."""
@@ -328,6 +349,88 @@ def downscale_i420(yuv: np.ndarray, geometry: Geometry) -> np.ndarray:
     canvas[geometry.oy:geometry.oy + fit_h,
            geometry.ox:geometry.ox + fit_w] = bgr
     return canvas
+
+
+def inset_rect(out_w: int, out_h: int) -> tuple[int, int, int, int]:
+    """Where the face inset sits on a canvas of this size: x, y, w, h, the
+    sides even (an I420 fit lands in it), in the top-right corner."""
+    height = max(8, int(out_h * INSET_HEIGHT_FRACTION) // 4 * 4)
+    width = max(8, int(height * INSET_ASPECT[0] / INSET_ASPECT[1]) // 4 * 4)
+    return out_w - width - INSET_MARGIN, INSET_MARGIN, width, height
+
+
+def face_crop_target(points: np.ndarray | None, scores: np.ndarray | None,
+                     frame_w: int, frame_h: int,
+                     threshold: float = MIN_KEYPOINT_SCORE
+                     ) -> tuple[float, float, float]:
+    """The crop of a frame the inset should show, as centre x, centre y and
+    height in frame pixels (the width follows INSET_ASPECT): around the
+    confident head keypoints when there are any, else the frame's middle.
+    Clamped so the crop lies within the frame."""
+    aspect = INSET_ASPECT[0] / INSET_ASPECT[1]
+    max_h = min(float(frame_h), frame_w / aspect)
+    cx, cy, height = frame_w / 2.0, frame_h / 2.0, max_h
+    if points is not None and scores is not None:
+        head = [i for i in HEAD_KEYPOINTS
+                if i < len(points) and scores[i] >= threshold]
+        if len(head) >= 3:
+            xs, ys = points[head, 0], points[head, 1]
+            box_w = float(xs.max() - xs.min())
+            box_h = float(ys.max() - ys.min())
+            cx = float((xs.max() + xs.min()) / 2)
+            cy = float((ys.max() + ys.min()) / 2)
+            height = max(box_h, box_w / aspect) * INSET_FACE_GROW
+            height = max(height, frame_h * INSET_MIN_HEIGHT_FRACTION)
+            height = min(height, max_h)
+    width = height * aspect
+    cx = min(max(cx, width / 2), frame_w - width / 2)
+    cy = min(max(cy, height / 2), frame_h - height / 2)
+    return cx, cy, height
+
+
+def crop_box(cx: float, cy: float, height: float, frame_w: int,
+             frame_h: int) -> tuple[int, int, int, int]:
+    """A centre-and-height crop as integer x, y, w, h: origin even and sides
+    multiples of four (whole I420 chroma rows), inside the frame."""
+    aspect = INSET_ASPECT[0] / INSET_ASPECT[1]
+    h = max(8, min(int(height) // 4 * 4, frame_h // 4 * 4))
+    w = max(8, min(int(h * aspect) // 4 * 4, frame_w // 4 * 4))
+    x = int(round(cx - w / 2)) // 2 * 2
+    y = int(round(cy - h / 2)) // 2 * 2
+    x = min(max(0, x), frame_w - w)
+    y = min(max(0, y), frame_h - h)
+    return x, y, w, h
+
+
+def crop_i420(yuv: np.ndarray, box: tuple[int, int, int, int]) -> np.ndarray:
+    """The I420 frame's `box` (x, y, w, h as crop_box makes them) as an
+    I420 frame of its own, without converting the rest."""
+    x, y, w, h = box
+    height = yuv.shape[0] * 2 // 3
+    width = yuv.shape[1]
+    y_plane = yuv[:height]
+    u_plane = yuv[height:height + height // 4].reshape(height // 2, width // 2)
+    v_plane = yuv[height + height // 4:].reshape(height // 2, width // 2)
+    out = np.empty((h * 3 // 2, w), np.uint8)
+    out[:h] = y_plane[y:y + h, x:x + w]
+    out[h:h + h // 4] = u_plane[y // 2:y // 2 + h // 2,
+                                x // 2:x // 2 + w // 2].reshape(h // 4, w)
+    out[h + h // 4:] = v_plane[y // 2:y // 2 + h // 2,
+                               x // 2:x // 2 + w // 2].reshape(h // 4, w)
+    return out
+
+
+class CropGeometry:
+    """A Geometry for keypoints in a frame of which only a crop is shown:
+    the crop's origin is taken off, then the fit applies."""
+
+    def __init__(self, fit: Geometry, x0: int, y0: int):
+        self.fit = fit
+        self.x0 = x0
+        self.y0 = y0
+
+    def point(self, x: float, y: float) -> tuple[int, int]:
+        return self.fit.point(x - self.x0, y - self.y0)
 
 
 def group_color(index: int) -> tuple[int, int, int]:
@@ -604,13 +707,26 @@ class OverlayPublisher:
 
 class OverlayRenderer(threading.Thread):
     """Frames and detections in from the pipeline's threads, painted frames
-    out to the publisher on a fixed tick."""
+    out to the publisher on a fixed tick.
+
+    With `sync` (sync.ViewSync) the view is two cameras': the frames and
+    detections offered through `offer_frame`/`offer_pose` are the body
+    view's and fill the canvas, and those through `offer_face_frame`/
+    `offer_face_pose` are the face view's, drawn as an inset in the
+    top-right corner (INSET_*) with its own keypoints. Each tick pairs the
+    body frame it draws with the face frame at the same moment on the
+    shared clock; a face frame further than the pairing tolerance leaves
+    the inset out for that tick rather than show the wrong moment. The
+    inset's crop follows the face (face_crop_target) and is mirrored when
+    `face_mirror` says the phone's camera faces the user (set_mirror); the
+    body picture is never mirrored in this layout.
+    """
 
     def __init__(self, publisher: OverlayPublisher, telemetry,
                  size: tuple[int, int] = (1280, 720), fps: float = 15.0,
                  delay_s: float = 1.0, source_fps: float = 30.0,
                  clock=time.monotonic, capacity: int | None = None,
-                 mirror: bool = False):
+                 mirror: bool = False, sync=None, face_mirror: bool = False):
         super().__init__(daemon=True, name="overlay")
         self.publisher = publisher
         self.telemetry = telemetry
@@ -618,17 +734,30 @@ class OverlayRenderer(threading.Thread):
         self.fps = fps
         self.delay_s = delay_s
         self.source_fps = source_fps
-        self.mirror = mirror
+        self.sync = sync
+        self.mirror = mirror and sync is None
         self.clock = clock
         # Enough decoded frames to still hold the one `delay_s` behind the
         # head after a tick's worth of jitter; at 4K each is ~12 MB.
-        self.frames = FrameStore(capacity or int((delay_s + 0.5) * source_fps) + 8)
+        window = capacity or int((delay_s + 0.5) * source_fps) + 8
+        self.frames = FrameStore(window)
         self.track = PoseTrack(frame_s=1.0 / source_fps)
+        # The face view's, when there is one: the same window, plus the
+        # pairing tolerance either way.
+        self.face_frames = FrameStore(
+            window + (int(2 * sync.tolerance_s * source_fps) if sync else 0))
+        self.face_track = PoseTrack(frame_s=1.0 / source_fps)
+        self.face_mirror = bool(face_mirror)
         self.stopping = threading.Event()
         self._lock = threading.Lock()
         self._context: dict[str, object] = {}
         self._geometry: Geometry | None = None
         self._painter: KeypointPainter | None = None
+        self._inset = inset_rect(*size) if sync is not None else None
+        self._crop: tuple[float, float, float] | None = None  # cx, cy, h, smoothed
+        self._crop_frame: tuple[int, int] | None = None
+        self._face_state = "none"
+        self._face_age_s: float | None = None
         self._last_index = -1
         self._last_canvas: np.ndarray | None = None
         self._last_state = "none"
@@ -657,6 +786,31 @@ class OverlayRenderer(threading.Thread):
         )
         with self._lock:
             self.track.offer(detection)
+
+    def offer_face_frame(self, index: int, at_s: float, yuv: np.ndarray) -> None:
+        """A decoded frame of the face view, on its own media time."""
+        frame = Frame(index, at_s, yuv, self.clock())
+        with self._lock:
+            self.face_frames.offer(frame)
+
+    def offer_face_pose(self, index: int, at_s: float, keypoints, scores, box,
+                        box_score, people: int, unresolved: bool) -> None:
+        """The face view's full pose result, as offer_pose for the body."""
+        detection = Detection(
+            index=index, at_s=at_s,
+            points=to_array(keypoints, 2), scores=to_array(scores, 1),
+            box=[float(v) for v in box] if box is not None else None,
+            box_score=float(box_score) if box_score is not None else None,
+            people=int(people), unresolved=bool(unresolved), wall=self.clock(),
+        )
+        with self._lock:
+            self.face_track.offer(detection)
+
+    def set_mirror(self, mirror: bool) -> None:
+        """Whether the face inset is drawn as a mirror (the phone's camera
+        faces the user). Takes effect on the next tick."""
+        with self._lock:
+            self.face_mirror = bool(mirror)
 
     def offer_context(self, kind: str, body) -> None:
         """Session context for the HUD: `hud` is the analysis process's list
@@ -714,8 +868,61 @@ class OverlayRenderer(threading.Thread):
             self._geometry = fit_geometry(width, height, *self.size)
             self._painter = KeypointPainter(self._geometry, mirror=self.mirror)
         canvas = downscale_i420(frame.yuv, self._geometry)
+        if self.sync is not None:
+            # The inset goes on before the HUD, so the HUD is never under it.
+            self._paint_inset(canvas, frame)
         self._painter.paint(canvas, pose, self._hud(frame, pose, context, pose_rate))
         return canvas
+
+    # -- the face inset ---------------------------------------------------------
+
+    def _face_for(self, body_frame: Frame
+                  ) -> tuple[Frame | None, PoseAt | None, str, bool]:
+        """The face frame at the body frame's moment, its pose, why there
+        is none - `waiting` (the clocks are not both placed yet),
+        `unpaired` (no face frame within the tolerance) - or the pose's
+        state, and whether the inset is a mirror."""
+        face_at = self.sync.face_at_s(body_frame.at_s)
+        if face_at is None:
+            return None, None, "waiting", False
+        with self._lock:
+            face_frame = self.face_frames.nearest(face_at)
+            if face_frame is None or not self.sync.paired(face_at, face_frame.at_s):
+                return None, None, "unpaired", False
+            face_pose = self.face_track.at(face_frame.at_s, face_frame.index)
+            mirror = self.face_mirror
+        self._face_age_s = face_frame.at_s - face_at
+        return face_frame, face_pose, face_pose.state, mirror
+
+    def _paint_inset(self, canvas: np.ndarray, body_frame: Frame) -> None:
+        face_frame, face_pose, state, mirror = self._face_for(body_frame)
+        self._face_state = state
+        if face_frame is None:
+            self._count("overlayFaceWaiting" if state == "waiting" else "overlayFaceUnpaired")
+            return
+        frame_w = face_frame.yuv.shape[1]
+        frame_h = face_frame.yuv.shape[0] * 2 // 3
+        target = face_crop_target(face_pose.points, face_pose.scores, frame_w, frame_h)
+        if self._crop is None or self._crop_frame != (frame_w, frame_h):
+            self._crop = target
+            self._crop_frame = (frame_w, frame_h)
+        else:
+            self._crop = tuple(
+                old + (new - old) * INSET_SMOOTH for old, new in zip(self._crop, target))
+        box = crop_box(*self._crop, frame_w, frame_h)
+        x, y, w, h = self._inset
+        fit = fit_geometry(box[2], box[3], w, h)
+        inset = downscale_i420(crop_i420(face_frame.yuv, box), fit)
+        painter = KeypointPainter(CropGeometry(fit, box[0], box[1]), mirror=mirror)
+        painter.paint(inset, face_pose, [])
+        if state == "stale":
+            self._count("overlayFaceStale")
+        # A border, then the inset over the body picture.
+        b = INSET_BORDER
+        y0, y1 = max(0, y - b), min(canvas.shape[0], y + h + b)
+        x0, x1 = max(0, x - b), min(canvas.shape[1], x + w + b)
+        canvas[y0:y1, x0:x1] = COLOR_INSET_BORDER
+        canvas[y:y + h, x:x + w] = inset
 
     def _hud(self, frame: Frame, pose: PoseAt, context: dict,
              pose_rate: float) -> list[tuple[str, tuple]]:
@@ -731,11 +938,15 @@ class OverlayRenderer(threading.Thread):
         stats = self._stats
         p50 = stats.get("poseP50")
         lines: list[tuple[str, tuple]] = []
+        # `timing` is how the decoder timed the frames (producer.Decoder):
+        # the sender's clock, or arrival here.
+        timing = context.get("timing")
         lines.append((
             f"t {frame.at_s:7.1f}s   pose {pose_rate:.1f}/s"
             + (f" p50 {p50:.0f}ms" if p50 is not None else "")
             + f" drops {stats.get('dropped', 0)}"
-            + f"   view {self.delay_s:.1f}s behind decode, aligned",
+            + f"   view {self.delay_s:.1f}s behind decode, aligned"
+            + (f"   clock {timing}" if isinstance(timing, str) and timing else ""),
             COLOR_TEXT))
         if pose.points is not None and pose.scores is not None:
             confident = int((pose.scores >= MIN_KEYPOINT_SCORE).sum())
@@ -755,6 +966,8 @@ class OverlayRenderer(threading.Thread):
             lines.append((f"NO PERSON  (detector saw {pose.people})", COLOR_BAD))
         else:
             lines.append(("waiting for the first pose", COLOR_WARN))
+        if self.sync is not None:
+            lines.append(self._face_hud_line())
         # Whatever the analysis process last said about the session
         # (analysis/protocol.md `hud`), drawn verbatim under the pose lines:
         # this renderer knows nothing about what the lines mean.
@@ -762,6 +975,24 @@ class OverlayRenderer(threading.Thread):
             if isinstance(text, str) and text:
                 lines.append((text, COLOR_TEXT))
         return lines
+
+    def _face_hud_line(self) -> tuple[str, tuple]:
+        """The inset's line: what it shows, how the two views stand."""
+        state = self._face_state
+        skew = self.sync.skew_s()
+        stand = (f"skew {skew * 1000:+.0f}ms" if skew is not None else "clocks apart")
+        if state == "waiting":
+            return f"face: waiting for the phone's camera   {stand}", COLOR_WARN
+        if state == "unpaired":
+            return f"face: no frame at this moment   {stand}", COLOR_WARN
+        if state == "none":
+            return f"face: waiting for the first pose   {stand}", COLOR_WARN
+        if state == "missing":
+            return f"face: NO PERSON   {stand}", COLOR_BAD
+        pairing = (f" paired {self._face_age_s * 1000:+.0f}ms"
+                   if self._face_age_s is not None else "")
+        color = COLOR_WARN if state == "stale" else COLOR_TEXT
+        return f"face: {state}{pairing}   {stand}   {self.sync.timing}", color
 
     # -- the thread -------------------------------------------------------------
 
@@ -791,6 +1022,10 @@ class OverlayRenderer(threading.Thread):
     def snapshot(self) -> dict:
         with self._lock:
             stored, detections = len(self.frames), len(self.track)
+            face_stored, face_detections = len(self.face_frames), len(self.face_track)
+            timing = self._context.get("timing")
+            face_mirror = self.face_mirror
+        skew = self.sync.skew_s() if self.sync is not None else None
         return {
             "publishUrl": self.publisher.url,
             "encoder": self.publisher.encoder,
@@ -805,6 +1040,20 @@ class OverlayRenderer(threading.Thread):
             "detections": detections,
             "lastState": self._last_state,
             "lastIndex": self._last_index,
+            "timing": timing if isinstance(timing, str) else None,
+            # The layout: `single` is one camera filling the view; `inset`
+            # is the fixed camera's with the phone's in the corner, where
+            # `inset` says (x, y, w, h on the canvas) and `mirror` how.
+            "view": {
+                "layout": "inset" if self.sync is not None else "single",
+                "inset": list(self._inset) if self._inset else None,
+                "faceState": self._face_state if self.sync is not None else None,
+                "faceFramesStored": face_stored,
+                "faceDetections": face_detections,
+                "skewMs": round(skew * 1000) if skew is not None else None,
+                "mirror": face_mirror,
+                "timing": self.sync.timing if self.sync is not None else None,
+            },
         }
 
 
@@ -818,9 +1067,11 @@ class _Null:
 
 def build_renderer(args, telemetry, source_fps: float = 30.0,
                    record_path: str | Path | None = None,
-                   probe=probe_nvenc) -> OverlayRenderer | None:
+                   probe=probe_nvenc, sync=None) -> OverlayRenderer | None:
     """The renderer for a session's args, or None when no publish URL is
-    configured (the default: zero overhead)."""
+    configured (the default: zero overhead). `sync` (sync.ViewSync) makes
+    it the two-camera layout, the face inset mirrored as `args.face_mirror`
+    says to begin with."""
     url = getattr(args, "overlay_publish", "") or ""
     if not url:
         return None
@@ -838,4 +1089,5 @@ def build_renderer(args, telemetry, source_fps: float = 30.0,
         publisher, telemetry, size=size, fps=fps,
         delay_s=float(getattr(args, "overlay_delay_s", 1.0) or 1.0),
         source_fps=source_fps,
-        mirror=bool(getattr(args, "overlay_mirror", False)))
+        mirror=bool(getattr(args, "overlay_mirror", False)),
+        sync=sync, face_mirror=bool(getattr(args, "face_mirror", False)))

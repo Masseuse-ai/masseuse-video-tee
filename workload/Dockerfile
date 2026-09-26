@@ -70,6 +70,24 @@ for i, group in enumerate(plan):
           + ", ".join(w.name.split("-")[0] for w in group))
 EOF
 
+# -- stream-reader (workload/reader) -------------------------------------------
+# The reader the producer decodes a live stream through (producer.Decoder):
+# an RTSP client that keeps each frame's sender time beside the decoded
+# frame, so two cameras' views can be lined up on their senders' clocks
+# (producer/sync.py). Built from this tree with the pinned toolchain,
+# without cgo, so the binary is a function of the source alone.
+# golang:1.27.1-bookworm, multi-arch index (the digest Dockerfile.tee pins
+# for the gateway).
+FROM golang@sha256:648f440f42a0958804efb24df176f806f9d353b41f1c0627f666428e40310f6b AS reader
+ENV CGO_ENABLED=0 GOTOOLCHAIN=go1.27.1 GOFLAGS=-mod=mod \
+    GOPROXY=https://proxy.golang.org,direct GOSUMDB=sum.golang.org
+WORKDIR /src/reader
+COPY workload/reader/go.mod workload/reader/go.sum ./
+RUN go mod download
+COPY workload/reader/ ./
+RUN GOOS=linux GOARCH=amd64 go build -trimpath -buildvcs=false -ldflags='-s -w -buildid=' \
+      -o /out/stream-reader ./cmd/stream-reader
+
 # -- the image -----------------------------------------------------------------
 FROM ${CUDA_BASE}
 
@@ -127,6 +145,8 @@ WORKDIR /app
 COPY workload/pixel /app/workload/pixel
 COPY workload/audio /app/workload/audio
 COPY workload/producer /app/workload/producer
+# Where producer.Decoder looks for it (STREAM_READER_BIN).
+COPY --from=reader /out/stream-reader /app/bin/stream-reader
 
 ENV PATH="/venv/bin:$PATH"
 EXPOSE 8080

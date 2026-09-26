@@ -85,6 +85,7 @@ print('torch', torch.__version__, 'torchvision', torchvision.__version__, 'trans
  && id analysis && setpriv --version && tar --zstd --help > /dev/null \\
  && caddy version && test -x /usr/local/bin/mediamtx && ffmpeg -version | head -1 \\
  && masseuse-camlink-gateway --version \\
+ && test -x /app/bin/stream-reader && /app/bin/stream-reader -h 2>&1 | head -1 \\
  && test -f /etc/ssl/certs/ca-certificates.crt
 EOF
     docker buildx build --builder "$BUILDX_BUILDER" --progress plain --no-cache \

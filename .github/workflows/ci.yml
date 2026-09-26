@@ -36,6 +36,42 @@ jobs:
       - name: build
         run: go build -trimpath -buildvcs=false -o /tmp/tee-verify . && /tmp/tee-verify -h 2>&1 | head -3
 
+  reader:
+    # stream-reader (workload/reader): the reader the producer decodes a
+    # live stream through, keeping each frame's sender time. Its tests
+    # encode a test pattern with the runner's ffmpeg and read it back
+    # through an in-process RTSP server.
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: workload/reader
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: workload/reader/go.mod
+          cache-dependency-path: workload/reader/go.sum
+      - name: ffmpeg
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg
+      - name: gofmt
+        run: test -z "$(gofmt -l . | tee /dev/stderr)"
+      - name: go vet
+        run: go vet ./...
+      - name: go mod tidy is a no-op
+        run: |
+          cp go.mod /tmp/go.mod && cp go.sum /tmp/go.sum
+          go mod tidy
+          diff -u /tmp/go.mod go.mod && diff -u /tmp/go.sum go.sum
+      - name: go test
+        run: go test -race -count=1 ./...
+      - name: build as the image does
+        run: |
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -buildvcs=false -ldflags='-s -w -buildid=' \
+            -o /tmp/stream-reader ./cmd/stream-reader
+          test -x /tmp/stream-reader
+
   terraform:
     runs-on: ubuntu-latest
     defaults:

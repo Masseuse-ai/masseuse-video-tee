@@ -319,7 +319,8 @@ def test_connect_adds_the_pinned_path_waits_for_video_and_reports_it():
         # The relay got the link, the pin, TCP transport, and an eager pull.
         assert relay.ext_config == {"source": "rtsps://u:p@cam.example:7441/live?enableSrtp",
                                     "sourceFingerprint": FINGERPRINT,
-                                    "rtspTransport": "tcp", "sourceOnDemand": False}
+                                    "rtspTransport": "tcp", "sourceOnDemand": False,
+                                    "useAbsoluteTimestamp": True}
         assert relay.ext_polls == 3
         assert source.active is True and source.session_id == "sess-1"
         assert source.mode == "direct"
@@ -439,7 +440,7 @@ def test_a_home_camera_goes_through_the_connector_with_its_own_certificate_pinne
         assert relay.ext_config == {
             "source": "rtsps://127.0.0.1:7441/SGSV8hfdHpQXGyIz?enableSrtp",
             "sourceFingerprint": FINGERPRINT, "rtspTransport": "tcp",
-            "sourceOnDemand": False}
+            "sourceOnDemand": False, "useAbsoluteTimestamp": True}
         assert source.active is True and source.mode == "tunnel"
         tunnel = {"connected": True, "sinceMs": 1_699_999_000_000}
         assert source.status() == {"kind": "external", "path": "ext", "ready": True,

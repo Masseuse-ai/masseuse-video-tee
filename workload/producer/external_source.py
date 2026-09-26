@@ -283,7 +283,8 @@ class ExternalSource:
         self.relay = relay
         self.own_ip = own_ip or ""
         self.path = path
-        self.stream_url = f"{rtsp_base.rstrip('/')}/{path}"
+        self.rtsp_base = rtsp_base.rstrip("/")
+        self.stream_url = f"{self.rtsp_base}/{path}"
         self.connect_timeout_s = float(connect_timeout_s)
         self.probe_timeout_s = float(probe_timeout_s)
         self.poll_s = float(poll_s)
@@ -327,6 +328,12 @@ class ExternalSource:
         enclave) or "tunnel" (through the connector); None with none."""
         with self._state_lock:
             return (self._mode or None) if self._active else None
+
+    @property
+    def phone_stream_url(self) -> str:
+        """The phone's own camera on the relay: the face view's stream
+        while the external camera is the session's."""
+        return f"{self.rtsp_base}/{self.relay.ingest_path}"
 
     def tunnel_status(self) -> dict:
         """{connected, sinceMs}: whether a camera at home could be reached
@@ -464,11 +471,17 @@ class ExternalSource:
             raise SourceError("relay", "the slot's relay is not answering", 503) from None
 
     def _add_path(self, url: str, fingerprint: str) -> None:
+        # useAbsoluteTimestamp: the relay keeps the camera's own frame
+        # times (its RTCP sender reports) and gives them to its readers
+        # rather than restamping at arrival, so the producer can line this
+        # view up with the phone's (producer.Decoder, sync.py). The relay
+        # skips the packets before the camera's first report.
         code = self._api("POST", f"/v3/config/paths/add/{self.path}", {
             "source": url,
             "sourceFingerprint": fingerprint,
             "rtspTransport": "tcp",
             "sourceOnDemand": False,
+            "useAbsoluteTimestamp": True,
         })
         if code != 200:
             raise SourceError("relay", f"the relay refused the path ({code})", 503)

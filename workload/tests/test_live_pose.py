@@ -129,6 +129,97 @@ def test_nobody_in_frame_is_a_missing_row_and_an_empty_tap(monkeypatch):
     assert offered[0][2] is None and tracker.posed == []
 
 
+# -- two views on one model ------------------------------------------------------
+
+class AnchoringTracker(StubTracker):
+    """A tracker whose detect keeps an identity anchor, as the real one
+    does: what the second view must not disturb."""
+
+    def detect(self, frame):
+        box, score, people, unresolved = super().detect(frame)
+        self.previous = [self.detects * 1.0] + box[1:]
+        return self.previous, score, people, unresolved
+
+
+def test_a_second_view_keeps_its_own_anchor_scenery_cache_and_tap(monkeypatch):
+    tracker = AnchoringTracker()
+    tracker.scenery = [[1.0, 2.0, 3.0, 4.0]]  # the body view's, learnt
+    pose = _pose(monkeypatch, tracker, stride="3")
+    body_taps, face_taps = [], []
+    pose.on_full = lambda *args: body_taps.append(args[0])
+    pose.view("face").on_full = lambda *args: face_taps.append(args[0])
+    rgb = np.zeros((HEIGHT, WIDTH, 3), np.uint8)
+
+    # The body view's step: its anchor lands on the tracker.
+    pose.step(rgb, 0, 0.0)
+    body_anchor = tracker.previous
+    assert body_anchor == [1.0, 20.0, 100.0, 200.0]
+
+    # The face view has not learnt its scenery and has no anchor: its
+    # first step learns from the frame (candidates asked) and detects,
+    # and afterwards the tracker holds the body's anchor and scenery again.
+    face_row = pose.step(rgb, 0, 0.0, view="face")
+    assert face_row["frame"] == 0 and face_row["keypoints"]
+    assert tracker.candidate_calls == 1
+    assert tracker.previous == body_anchor
+    assert tracker.scenery == [[1.0, 2.0, 3.0, 4.0]]
+    face = pose.view("face")
+    assert face.previous == [2.0, 20.0, 100.0, 200.0]
+    assert face.scenery == [] and not face.scenery_done
+    assert len(face.warmup) == 1
+
+    # Each view's detect cache is its own: the body's second and third
+    # steps reuse its box (no detect), the face's too.
+    pose.step(rgb, 5, 5 / 30)
+    pose.step(rgb, 10, 10 / 30)
+    pose.step(rgb, 10, 10 / 30, view="face")
+    pose.step(rgb, 20, 20 / 30, view="face")
+    assert tracker.detects == 2
+    pose.step(rgb, 15, 15 / 30)
+    assert tracker.detects == 3 and tracker.previous == [3.0, 20.0, 100.0, 200.0]
+    pose.step(rgb, 30, 30 / 30, view="face")
+    assert tracker.detects == 4
+    assert pose.view("face").previous == [4.0, 20.0, 100.0, 200.0]
+    assert tracker.previous == [3.0, 20.0, 100.0, 200.0]
+
+    # Each tap saw its own view's frames only.
+    assert body_taps == [0, 5, 10, 15]
+    assert face_taps == [0, 10, 20, 30]
+
+    # A session reset clears every view's state but keeps the taps.
+    pose.reset_session_state()
+    assert tracker.previous is None and tracker.scenery == []
+    assert pose.view("face").previous is None and pose.view("face").warmup == []
+    assert pose.view("face").cached_detection is None
+    assert pose.on_full is not None and pose.view("face").on_full is not None
+    assert pose._scenery_done is False
+
+
+def test_the_body_views_state_keeps_its_old_names(monkeypatch):
+    pose = _pose(monkeypatch, StubTracker())
+    assert pose._scenery_done is True and pose.views["body"].scenery_done is True
+    pose._cached_detection = ("box", 0.5, 1, False)
+    assert pose.views["body"].cached_detection == ("box", 0.5, 1, False)
+    pose._detect_countdown = 2
+    assert pose.views["body"].detect_countdown == 2
+    assert pose._warmup is pose.views["body"].warmup
+
+
+def test_sideload_replays_the_body_only(tmp_path):
+    import json
+
+    rows = [{"frame": 0, "atS": 0.0, "keypoints": {"nose": [1.0, 2.0, 0.9]}},
+            {"frame": 5, "atS": 5 / 30, "keypoints": {"nose": [3.0, 4.0, 0.9]}}]
+    (tmp_path / "poses.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows))
+    pose = live_pose.SideloadPose(tmp_path)
+    face_taps = []
+    pose.view("face").on_full = lambda *args: face_taps.append(args)
+    assert pose.step(None, 5, 5 / 30)["keypoints"] == {"nose": [3.0, 4.0, 0.9]}
+    face_row = pose.step(None, 5, 5 / 30, view="face")
+    assert face_row == {"frame": 5, "atS": round(5 / 30, 4), "keypoints": None}
+    assert len(face_taps) == 1 and face_taps[0][2] is None
+
+
 # -- the parity check ------------------------------------------------------------
 
 

@@ -57,6 +57,13 @@ not cross it.
   (`audio` messages may follow and `classify` requests are answered).
   `false` means the stream's sound is not read at all. `audioModel` names
   the classifier build and weights (`null` without the stage).
+- `views` (absent in older producers, then `["body"]`): the camera views
+  the session reads. `["body"]` is one camera. `["body", "face"]` is a
+  fixed camera behind the user as the body view - everything below that
+  is not marked otherwise - and the user's phone, pointed at their face,
+  as a second view whose keypoints arrive as `facePose`; the audio stage
+  then reads the phone's track. `facePoseFps` is the face view's keypoint
+  cadence (`null` with one view).
 
 ### `pose`, every keypoint-model result, in order
 
@@ -74,6 +81,29 @@ not cross it.
   (`workload/pixel/keypoints.py`).
 - `frameSize`: the decoded frame's `[width, height]`, so framing can be
   judged against the picture edges. Nothing else about the picture is sent.
+
+### `facePose`, every keypoint-model result on the face view, in order
+
+Only in a session whose `hello` listed a `face` view.
+
+```json
+{"kind": "facePose", "frame": 45, "atS": 1.5, "bodyAtS": 3.5,
+ "keypoints": {"nose": [318.2, 411.7, 0.97], "...": "..."},
+ "dropped": false, "error": false, "frameSize": [720, 1280]}
+```
+
+- `frame`, `atS`: the face view's own decode frame index and stream time;
+  its timeline is not the body view's.
+- `bodyAtS`: the same moment on the body view's timeline, from the two
+  streams' sender clocks (`workload/producer/sync.py`), so a face row can
+  be set beside the `pose` and `frame` rows around it; `null` before the
+  two views are lined up.
+- `keypoints`, `dropped`, `error`, `frameSize`: as in `pose`, for the face
+  view's frame. The model is the same and so are the keypoint names; the
+  body points of a face view are whatever of the body the phone sees.
+
+Face rows carry no descriptors: the regional motion descriptors are the
+body view's alone.
 
 ### `frame`, every decoded frame that has a final pose decision, in order
 

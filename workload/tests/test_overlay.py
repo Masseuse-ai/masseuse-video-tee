@@ -556,3 +556,174 @@ def test_sideload_pose_offers_the_row_to_the_tap_and_returns_it_unchanged(tmp_pa
     assert missing["keypoints"] is None
     assert offered[1][2] is None  # nobody: no points to draw
     assert MIN_KEYPOINT_SCORE < 0.8
+
+
+# -- the face inset --------------------------------------------------------------
+
+from sync import ViewSync  # noqa: E402
+
+
+def dual_renderer(publisher, clock, telemetry=None, size=(1280, 720),
+                  face_mirror=False):
+    """A two-camera view whose clocks are anchored: the face view's
+    timeline starts 2 s after the body's on the senders' clock."""
+    sync = ViewSync(clock=clock)
+    sync.body.anchor(1_000.0)
+    sync.face.anchor(1_002.0)
+    view = OverlayRenderer(publisher, telemetry, size=size, fps=15.0,
+                           delay_s=0.0, source_fps=FPS, clock=clock,
+                           sync=sync, face_mirror=face_mirror)
+    return view, sync
+
+
+def face_frame(width: int, height: int) -> np.ndarray:
+    """A face-view frame, bright in its left half only."""
+    frame = gray_frame(width, height, value=20)
+    frame[:height, :width // 2] = 220
+    return frame
+
+
+def head_points(width: int, height: int, cx: float, cy: float) -> tuple:
+    """308 points with the head block gathered around (cx, cy) - a face
+    about a fifth of the frame high - and everything else unsure."""
+    points = np.zeros((308, 2), np.float32)
+    scores = np.zeros(308, np.float32)
+    rng = np.random.default_rng(3)
+    for index in overlay.HEAD_KEYPOINTS:
+        points[index] = (cx + rng.uniform(-width * 0.05, width * 0.05),
+                         cy + rng.uniform(-height * 0.1, height * 0.1))
+        scores[index] = 0.9
+    return points, scores
+
+
+def test_inset_rect_sits_in_the_top_right_corner_at_the_layouts_size():
+    x, y, w, h = overlay.inset_rect(1280, 720)
+    assert h == 288 and w == 216  # 40% of the height, 3:4, multiples of 4
+    assert (x, y) == (1280 - 216 - overlay.INSET_MARGIN, overlay.INSET_MARGIN)
+
+
+def test_the_crop_follows_the_head_and_falls_back_to_the_middle():
+    width, height = 720, 1280
+    # Nobody: the middle of the frame, as tall as the frame allows.
+    cx, cy, h = overlay.face_crop_target(None, None, width, height)
+    assert (cx, cy) == (360, 640) and h == pytest.approx(min(1280, 720 / 0.75))
+    # A head near the top-left: the crop centres on it, grown, at least
+    # INSET_MIN_HEIGHT_FRACTION of the frame, and stays inside the frame.
+    points, scores = head_points(width, height, 120, 200)
+    cx, cy, h = overlay.face_crop_target(points, scores, width, height)
+    assert h >= height * overlay.INSET_MIN_HEIGHT_FRACTION
+    assert cx - h * 0.75 / 2 >= 0 and cy - h / 2 >= 0
+    assert abs(cy - 200) <= h / 2  # the head is inside the crop
+    # Unsure head points do not steer it.
+    cx2, cy2, h2 = overlay.face_crop_target(points, scores * 0.1, width, height)
+    assert (cx2, cy2, h2) == (360, 640, h2) and h2 == pytest.approx(min(1280, 720 / 0.75))
+    box = overlay.crop_box(cx, cy, h, width, height)
+    x, y, w, hh = box
+    assert x % 2 == 0 and y % 2 == 0 and w % 4 == 0 and hh % 4 == 0
+    assert 0 <= x and x + w <= width and 0 <= y and y + hh <= height
+    crop = overlay.crop_i420(gray_frame(width, height, 77), box)
+    assert crop.shape == (hh * 3 // 2, w) and crop[:hh].min() == 77
+
+
+def test_the_inset_shows_the_face_frame_at_the_same_moment_with_its_keypoints():
+    clock, publisher, telemetry = Clock(), FakePublisher(), Telemetry()
+    view, sync = dual_renderer(publisher, clock, telemetry)
+    body = gray_frame(640, 360, value=0)
+    fw, fh = 360, 640
+    face_a = face_frame(fw, fh)              # at face time 1.0 = body time 3.0
+    face_b = gray_frame(fw, fh, value=90)    # at face time 1.5 = body time 3.5
+    view.offer_frame(90, 3.0, body)
+    view.offer_face_frame(30, 1.0, face_a)
+    view.offer_face_frame(45, 1.5, face_b)
+    points, scores = head_points(fw, fh, fw / 2, fh / 2)
+    view.offer_face_pose(30, 1.0, points, scores, [100, 200, 160, 200], 0.8, 1, False)
+    assert view.tick() == "emitted"
+    canvas = publisher.frames[0]
+    x, y, w, h = view.snapshot()["view"]["inset"]
+    inset = canvas[y:y + h, x:x + w]
+    # The inset holds face_a (bright left half, dark right half), not
+    # face_b, and the body picture around it stays black.
+    assert inset[h // 2:, :w // 4].mean() > 150 and inset[h // 2:, 3 * w // 4:].mean() < 60
+    assert canvas[y + h + 10:, x:x + w].max() == 0
+    # Its border frames it.
+    assert canvas[y - 1, x:x + w].min() == 255
+    # The head keypoints were drawn in the inset: colour where they map.
+    fit = fit_geometry(*overlay.crop_box(*overlay.face_crop_target(
+        points, scores, fw, fh), fw, fh)[2:], w, h)
+    box = overlay.crop_box(*overlay.face_crop_target(points, scores, fw, fh), fw, fh)
+    px, py = overlay.CropGeometry(fit, box[0], box[1]).point(*points[NOSE])
+    patch = inset[max(0, py - 3):py + 4, max(0, px - 3):px + 4]
+    assert patch.size and (patch[..., 0] != patch[..., 2]).any()  # a coloured mark
+    snap = view.snapshot()["view"]
+    assert snap["layout"] == "inset" and snap["faceState"] == "exact"
+    assert snap["skewMs"] == 2000 and snap["mirror"] is False and snap["timing"] == "ntp"
+    assert "overlayFaceUnpaired" not in telemetry.snapshot()["counters"]
+
+
+def test_no_face_frame_within_the_tolerance_leaves_the_inset_out():
+    clock, publisher, telemetry = Clock(), FakePublisher(), Telemetry()
+    view, sync = dual_renderer(publisher, clock, telemetry)
+    body = gray_frame(640, 360, value=0)
+    view.offer_frame(90, 3.0, body)
+    # The face frame is 0.4 s from the body's moment: not this moment.
+    view.offer_face_frame(12, 0.6, face_frame(360, 640))
+    assert view.tick() == "emitted"
+    canvas = publisher.frames[0]
+    x, y, w, h = overlay.inset_rect(1280, 720)
+    b = overlay.INSET_BORDER
+    assert canvas[y - b:y + h + b, x - b:x + w + b].max() == 0  # no inset, no border
+    assert view.snapshot()["view"]["faceState"] == "unpaired"
+    assert telemetry.snapshot()["counters"]["overlayFaceUnpaired"] == 1
+    # And with no face frame at all, the same.
+    view2, _ = dual_renderer(FakePublisher(), clock, telemetry)
+    view2.offer_frame(0, 0.0, body)
+    view2.tick()
+    assert view2.snapshot()["view"]["faceState"] == "unpaired"
+
+
+def test_clocks_not_yet_placed_mean_waiting():
+    clock, publisher, telemetry = Clock(), FakePublisher(), Telemetry()
+    sync = ViewSync(clock=clock)
+    view = OverlayRenderer(publisher, telemetry, size=(1280, 720), fps=15.0,
+                           delay_s=0.0, source_fps=FPS, clock=clock, sync=sync)
+    view.offer_frame(0, 0.0, gray_frame(640, 360))
+    view.offer_face_frame(0, 0.0, face_frame(360, 640))
+    assert view.tick() == "emitted"
+    assert view.snapshot()["view"]["faceState"] == "waiting"
+    assert telemetry.snapshot()["counters"]["overlayFaceWaiting"] == 1
+    assert view.mirror is False  # the body picture is never a mirror here
+
+
+def test_the_inset_is_a_mirror_when_told_and_the_body_is_not():
+    clock = Clock()
+    plain, selfie = FakePublisher(), FakePublisher()
+    straight, _ = dual_renderer(plain, clock, Telemetry())
+    mirrored, _ = dual_renderer(selfie, clock, Telemetry(), face_mirror=True)
+    body = gray_frame(640, 360, value=0)
+    body[:360, :100] = 200  # the body picture is bright on its left
+    for view in (straight, mirrored):
+        view.offer_frame(90, 3.0, body)
+        view.offer_face_frame(30, 1.0, face_frame(360, 640))
+        assert view.tick() == "emitted"
+    a, b = plain.frames[0], selfie.frames[0]
+    x, y, w, h = straight.snapshot()["view"]["inset"]
+    # The body picture is on the same side in both.
+    assert a[100:170, :40].mean() > 150 and b[100:170, :40].mean() > 150
+    # The inset flipped: bright half on the right in the mirror.
+    assert a[y + h // 2:y + h, x:x + w // 4].mean() > 150
+    assert b[y + h // 2:y + h, x + 3 * w // 4:x + w].mean() > 150
+    assert b[y + h // 2:y + h, x:x + w // 4].mean() < 60
+    assert mirrored.snapshot()["view"]["mirror"] is True
+    # It can be changed while running.
+    straight.set_mirror(True)
+    straight.offer_frame(91, 3.0 + 1 / FPS, body)
+    assert straight.tick() == "emitted"
+    c = plain.frames[-1]
+    assert c[y + h // 2:y + h, x + 3 * w // 4:x + w].mean() > 150
+
+
+def test_a_single_view_snapshot_says_so():
+    view = renderer(FakePublisher(), Clock(), Telemetry())
+    snap = view.snapshot()["view"]
+    assert snap["layout"] == "single" and snap["inset"] is None
+    assert snap["faceState"] is None and snap["timing"] is None

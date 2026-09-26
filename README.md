@@ -28,6 +28,21 @@ Inside the enclave, in code that is in this repository:
 - An annotated view (skeleton, boxes, a status line) is drawn on the frames
   and streamed back to the same device that sent the video, and to nothing
   else.
+- With a second camera - a fixed one behind the user, through a connector
+  or named directly (the trust boundary below) - the phone's own camera
+  stays live too. The fixed camera's picture is the session's: the body
+  view, which everything above runs on. The phone's picture is decoded
+  beside it, its person and keypoints found by the same detectors at a
+  lower cadence, and drawn as an inset in the top-right corner of the
+  annotated view with those keypoints, cropped to follow the face and
+  mirrored the way the phone's own preview was when its camera faces the
+  user (the phone says which, `PUT /ingest/view`). The two pictures are
+  lined up by the time each frame was taken - both senders time their
+  frames with their own clocks (RTCP sender reports), the relay keeps
+  those times, and `workload/reader/` reads them beside the frames - so
+  the inset shows the same moment as the body view. Only the phone's
+  microphone is listened to then, being the one near the user's face; the
+  fixed camera's sound, if it has any, is not read.
 - When the stream carries an audio track (the phone's microphone travels
   with its camera unless you turn it off with `?mic=0`; a network camera's
   microphone, when it has one), the audio is decoded to 16 kHz mono and,
@@ -39,9 +54,10 @@ Inside the enclave, in code that is in this repository:
 - Frames and audio are then discarded. Nothing is written to disk; the VM
   has no persistent storage and nobody at masseuse.ai can read its memory.
 
-The keypoints, descriptors and vocalization labels, which identify nobody,
-go to an analysis module that turns them into a few numbers per second for
-the masseuse (the masseuse.ai service on Cloud Run). The analysis module
+The keypoints (the face view's included, as their own rows), descriptors
+and vocalization labels, which identify nobody, go to an analysis module
+that turns them into a few numbers per second for the masseuse (the
+masseuse.ai service on Cloud Run). The analysis module
 runs inside the same enclave as a separate process, receives no frames and
 no audio, and its logic is not published; its exact version is pinned by
 hash in this repository so the attested image says which one is running.
@@ -143,6 +159,15 @@ kind makes plain:
   this image is: it is open source, and its releases are reproducible and
   signed.
 
+With any of the three, the phone keeps publishing its own camera to the
+slot over WHIP as before, and the two pictures meet only inside this
+image: the fixed camera's as the body view, the phone's as the face inset
+drawn over it, both returned over the one WHEP leg to the same phone. The
+phone's capability is what opens `PUT /ingest/view`, the one control over
+how its picture is drawn (mirrored or not); the masseuse learns the layout
+and the inset's place from the slot's status (`overlay.view`) and nothing
+of either picture.
+
 **One session per slot.** A slot serves one session at a time: the lease
 holds a single capability hash, and the publish and overlay routes accept
 only that capability as a bearer, so a second person cannot join a slot
@@ -171,8 +196,9 @@ report a check that should hold and does not.
 | --- | --- |
 | `workload/pixel/` | Everything that reads frames: decode geometry and stream handling (`live_pose.py`), RT-DETRv4 person detection (`vendor/rtdetrv4/`, `pose_track.py`), Sapiens2-1B keypoints (`pose_post.py`, `pose_rows.py`, `keypoints.py`), the captured CUDA graphs both forwards replay (`gpu_graph.py`) and the debug-slot bench of the pose graph over batches of crops (`pose_bench.py`), regional motion descriptors (`motion.py`) |
 | `workload/audio/` | Everything that reads sound: the audio track decoded to 16 kHz PCM (`audio_stage.py`), the CED non-speech vocalization classifier binding (`ced.py`; the library and weights are built into the image, `Dockerfile.tee`), level and pitch (`pitch.py`, `audio_features.py`) |
-| `workload/producer/` | The session shell (`producer.py`), the overlay drawn back to the phone, the WHIP/WHEP relay proxy with the capability and evidence checks, the external-camera and connector ingest, the enclave's boot helpers (attestation, ACME, weights and analysis bundle fetch), the socket client to the analysis module |
-| `workload/tee/` | The image: `Dockerfile` (base: Python, torch, ffmpeg), `Dockerfile.tee` (MediaMTX, Caddy, the connector gateway, the launch policy), `entrypoint.sh`, `Caddyfile`, `mediamtx.tee.yml` |
+| `workload/producer/` | The session shell (`producer.py`), the overlay drawn back to the phone, the WHIP/WHEP relay proxy with the capability and evidence checks, the external-camera and connector ingest, the two views' clocks (`sync.py`), the enclave's boot helpers (attestation, ACME, weights and analysis bundle fetch), the socket client to the analysis module |
+| `workload/reader/` | `stream-reader` (Go): reads a live stream's video track off the relay and hands the producer each decoded frame with the time its sender gave it, so two cameras' views line up on their senders' clocks; the frame record it writes is documented in `record/record.go` |
+| `workload/tee/` | The image: `Dockerfile` (base: Python, torch, ffmpeg, `stream-reader`), `Dockerfile.tee` (MediaMTX, Caddy, the connector gateway, the launch policy), `entrypoint.sh`, `Caddyfile`, `mediamtx.tee.yml` |
 | `workload/tests/` | The workload's tests, CPU only |
 | `analysis/protocol.md` | What crosses the socket to the analysis module and what comes back |
 | `analysis.lock` | The analysis bundle (version and SHA-256) the image will run; copied into the image |

@@ -83,6 +83,21 @@ RUN test -n "${CAMLINK_VERSION}" && test -n "${CAMLINK_SHA256}" \
  && echo "${CAMLINK_SHA256}  /go/bin/masseuse-camlink-gateway" | sha256sum -c - \
  && /go/bin/masseuse-camlink-gateway --version
 
+# stream-reader (workload/reader): the reader the producer decodes a live
+# stream through, built again from this tree - as the workload is copied
+# again below - so the layer the digest is measured on carries the binary
+# of exactly this source. Same toolchain image and flags as the base's
+# stage (workload/Dockerfile).
+FROM golang@sha256:648f440f42a0958804efb24df176f806f9d353b41f1c0627f666428e40310f6b AS reader
+ENV CGO_ENABLED=0 GOTOOLCHAIN=go1.27.1 GOFLAGS=-mod=mod \
+    GOPROXY=https://proxy.golang.org,direct GOSUMDB=sum.golang.org
+WORKDIR /src/reader
+COPY workload/reader/go.mod workload/reader/go.sum ./
+RUN go mod download
+COPY workload/reader/ ./
+RUN GOOS=linux GOARCH=amd64 go build -trimpath -buildvcs=false -ldflags='-s -w -buildid=' \
+      -o /out/stream-reader /src/reader/cmd/stream-reader
+
 # The audio classifier (workload/audio/ced.py): ced.cpp, the ggml port of
 # Xiaomi's CED AudioSet tagger, built as a shared library from a pinned
 # commit (MIT; the licence files are copied into the image), and the GGUF
@@ -154,6 +169,7 @@ RUN groupadd --system analysis && useradd --system --gid analysis \
 COPY workload/pixel /app/workload/pixel
 COPY workload/audio /app/workload/audio
 COPY workload/producer /app/workload/producer
+COPY --from=reader /out/stream-reader /app/bin/stream-reader
 COPY analysis.lock /app/analysis.lock
 COPY workload/tee/entrypoint.sh /app/tee/entrypoint.sh
 COPY workload/tee/Caddyfile /app/tee/Caddyfile

@@ -201,7 +201,7 @@ class StubHandler(BaseHTTPRequestHandler):
         self._reply(404, {}, b"")
 
 
-def test_route_recognises_the_six_shapes_and_nothing_else():
+def test_route_recognises_the_seven_shapes_and_nothing_else():
     assert route("/overlay/status") == ("status", None)
     assert route("/overlay/whep") == ("whep", None)
     assert route("/overlay/whep/0f8b2c1e-1111-2222-3333-444455556666") == (
@@ -210,12 +210,14 @@ def test_route_recognises_the_six_shapes_and_nothing_else():
     assert route("/ingest/whip") == ("whip", None)
     assert route(f"/ingest/whip/{WHIP_SECRET}") == ("whip", WHIP_SECRET)
     assert route("/ingest/source") == ("source", None)
+    assert route("/ingest/view") == ("view", None)
     for bad in ("/overlay", "/overlay/", "/overlay/whep/", "/overlay/whep/a/b",
                 "/overlay/whep/../other", "/overlay/whep/with space",
                 "/overlay/whip", "/other/whep", "/overlay/whep/" + "x" * 65,
                 "/ingest", "/ingest/", "/ingest/whep", "/ingest/whip/",
                 "/ingest/whip/a/b", "/cam/whip", "/ingest/whip/" + "x" * 65,
-                "/ingest/source/", "/ingest/source/x", "/overlay/source"):
+                "/ingest/source/", "/ingest/source/x", "/overlay/source",
+                "/ingest/view/", "/ingest/view/x", "/overlay/view"):
         assert route(bad) is None, bad
 
 

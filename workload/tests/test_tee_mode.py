@@ -616,7 +616,7 @@ def test_the_phone_names_an_external_camera_with_its_capability():
         assert slot.relay.ext_config == {
             "source": "rtsps://viewer:s3cret@cam.example:7441/back?enableSrtp",
             "sourceFingerprint": FINGERPRINT, "rtspTransport": "tcp",
-            "sourceOnDemand": False}
+            "sourceOnDemand": False, "useAbsoluteTimestamp": True}
         code, _, body = slot.as_phone(cap, "GET", "/ingest/source")
         assert json.loads(body)["kind"] == "external"
 
@@ -873,7 +873,54 @@ def test_a_produce_on_the_external_stream_is_landscape_and_unmirrored():
                                    overlay_mirror=True, overlay_size="720x1280")
         assert producer.external_view_args(fixed, slot.external) is True
         assert (fixed.overlay_mirror, fixed.overlay_size) == (False, "1280x720")
+        # The phone's camera stays live beside the fixed one: the face view
+        # and the microphone are its.
+        assert fixed.face_stream == "rtsp://127.0.0.1:8554/cam"
+        assert fixed.audio_stream == "rtsp://127.0.0.1:8554/cam"
+        assert not hasattr(phone, "face_stream")
         assert producer.external_view_args(fixed, None) is False
+
+
+def test_the_phone_sets_how_its_own_picture_is_drawn_as_the_inset():
+    """/ingest/view: the phone's capability sets the face inset's mirror
+    for the running session and the next; anything else is refused."""
+    json_type = {"Content-Type": "application/json"}
+    with Slot() as slot:
+        cap = slot.lease("sess-1")
+        # Read before set: the slot's default, no session to show it on.
+        code, headers, body = slot.as_phone(cap, "GET", "/ingest/view")
+        assert code == 200 and json.loads(body) == {"mirror": False, "view": None}
+        assert headers["Access-Control-Allow-Origin"] == ORIGIN
+        # Preflight is answered here.
+        code, headers, _ = slot.request("OPTIONS", "/ingest/view", b"", {"Origin": ORIGIN})
+        assert code == 204 and headers["Access-Control-Allow-Origin"] == ORIGIN
+        # A running session's overlay is told at once...
+        told = []
+        slot.server.current["session"] = argparse.Namespace(
+            overlay=argparse.Namespace(
+                snapshot=lambda: {"view": {"layout": "inset", "mirror": True}},
+                set_mirror=told.append),
+            run_name="sess-1")
+        code, _, body = slot.as_phone(cap, "PUT", "/ingest/view",
+                                      b'{"mirror": true}', json_type)
+        assert code == 200
+        assert json.loads(body) == {"mirror": True,
+                                    "view": {"layout": "inset", "mirror": True}}
+        assert told == [True]
+        # ...and the next session starts with it (the /produce handler
+        # copies the slot's preference into its args).
+        slot.server.current["session"] = None
+        code, _, body = slot.as_phone(cap, "GET", "/ingest/view")
+        assert json.loads(body) == {"mirror": True, "view": None}
+        # Not a boolean, not JSON, not the phone: refused, nothing changed.
+        assert slot.as_phone(cap, "PUT", "/ingest/view", b'{"mirror": "yes"}', json_type)[0] == 400
+        assert slot.as_phone(cap, "PUT", "/ingest/view", b'nope', json_type)[0] == 400
+        assert slot.request("PUT", "/ingest/view", b'{"mirror": false}',
+                            {**json_type, "Origin": ORIGIN})[0] == 401
+        assert slot.as_phone(cap, "DELETE", "/ingest/view")[0] == 405
+        assert json.loads(slot.as_phone(cap, "GET", "/ingest/view")[2])["mirror"] is True
+        # The trainer's token is not the phone's capability.
+        assert slot.as_trainer("PUT", "/ingest/view", b'{"mirror": false}', json_type)[0] == 401
 
 
 def test_tee_mode_refuses_capture_configuration(monkeypatch, capsys):

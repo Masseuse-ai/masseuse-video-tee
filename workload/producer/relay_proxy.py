@@ -81,6 +81,7 @@ def route(path: str) -> tuple[str, str | None] | None:
     ('ingest-status', None)  GET  /ingest/status
     ('whip', None|secret)    /ingest/whip[/<secret>]
     ('source', None)         PUT/GET/DELETE /ingest/source
+    ('view', None)           PUT/GET /ingest/view
     """
     if path == "/overlay/status":
         return "status", None
@@ -92,6 +93,8 @@ def route(path: str) -> tuple[str, str | None] | None:
         return "whip", None
     if path == "/ingest/source":
         return "source", None
+    if path == "/ingest/view":
+        return "view", None
     for prefix, kind in (("/overlay/whep/", "whep"), ("/ingest/whip/", "whip")):
         if path.startswith(prefix) and WHEP_SECRET.match(path[len(prefix):]):
             return kind, path[len(prefix):]

@@ -330,6 +330,28 @@ def test_a_starved_track_is_given_up_on_after_the_bound(monkeypatch):
     assert STARVED_TRACK_MAX_S <= clock.now - start < STARVED_TRACK_MAX_S + 2
 
 
+def test_a_secondary_view_waits_out_a_starved_or_absent_track(monkeypatch):
+    """With `wait_for_track` (the phone's camera beside a fixed one) a
+    starved track is not given up on at the bound, and a track that is not
+    there at all is waited for too, every TRACK_RETRY_S."""
+    from producer import STARVED_TRACK_MAX_S, TRACK_RETRY_S
+
+    starved = {"streams": [{"width": 0, "height": 0}]}
+    absent = {"streams": []}
+    _probe_result(monkeypatch, *([starved] * 40 + [absent] * 3
+                                 + [{"streams": [{"width": 720, "height": 1280}]}]))
+    clock = _Clock()
+    telemetry = Telemetry()
+    decoder = Decoder("rtsp://127.0.0.1:8554/cam", telemetry,
+                      clock=clock, sleep=clock.sleep, wait_for_track=True)
+    start = clock.now
+    assert decoder._await_probe() == (720, 1280)
+    assert clock.now - start > STARVED_TRACK_MAX_S
+    counters = telemetry.snapshot()["counters"]
+    assert counters["starvedProbes"] == 40 and counters["trackWaits"] == 3
+    assert clock.now - start == 40 * 1.0 + 3 * TRACK_RETRY_S
+
+
 def test_a_stop_while_starved_lands(monkeypatch):
     """A /stop during the wait ends frames() quietly, as one during a
     reconnect does."""
@@ -349,3 +371,186 @@ def test_a_stop_while_starved_lands(monkeypatch):
     decoder.sleep = sleep
     assert list(decoder.frames()) == []
     assert 5 < clock.now - start < 30
+
+
+# -- stream-reader records: the grid by sender time ---------------------------
+
+T0 = 1_757_500_000.0  # a sender's clock, unix seconds
+RTP0 = 4_000_000_000  # an RTP timestamp near the top of its range
+
+
+def _record(*, seq=0, ntp_s=None, rtp=RTP0, keyframe=False):
+    """One record as stream-reader writes it, in the two reads the decoder
+    makes of it: the header, then the frame. `ntp_s` None leaves the
+    sender's time out (the flag clear)."""
+    from producer import RECORD, RECORD_KEYFRAME, RECORD_MAGIC, RECORD_NTP_VALID
+    flags = (RECORD_NTP_VALID if ntp_s is not None else 0) | (
+        RECORD_KEYFRAME if keyframe else 0)
+    header = RECORD.pack(RECORD_MAGIC, 1, flags, 1, 0, seq,
+                         int(round((ntp_s or 0.0) * 1e9)), rtp & 0xFFFFFFFF,
+                         WIDTH, HEIGHT, len(FRAME))
+    return [header, FRAME]
+
+
+def _frame_of(k):
+    """A frame whose bytes say which record it came from."""
+    return bytes([k] * (WIDTH * HEIGHT * 3 // 2))
+
+
+def _reader_decoder(spawns, *, stopping=None, wall_start=T0 + 0.3):
+    """A Decoder reading records through a stub stream-reader. The host's
+    clock starts 300 ms after the sender's first frame: a real path's
+    latency, well within CLOCK_SKEW_MAX_S."""
+    clock = _Clock()
+    wall = _Clock()
+    wall.now = wall_start
+    decoder = Decoder("rtsp://127.0.0.1:8554/cam", Telemetry(),
+                      stopping=stopping, clock=clock, sleep=clock.sleep,
+                      reader_bin=sys.executable, wall=wall)
+    assert decoder.use_reader and decoder.timing == "ntp"
+    decoder.size = (WIDTH, HEIGHT)
+    queue = [list(reads) for reads in spawns]
+    decoder.spawned = 0
+
+    def spawn():
+        decoder.spawned += 1
+        decoder.proc = _Proc(queue.pop(0) if queue else [])
+
+    decoder._spawn = spawn
+    return decoder, wall
+
+
+def _records(*specs):
+    """Reads for a spawn: one record per (seq, ntp_s, rtp) spec, its frame
+    bytes naming its seq."""
+    reads = []
+    for seq, ntp_s, rtp in specs:
+        header, _frame = _record(seq=seq, ntp_s=ntp_s, rtp=rtp)
+        reads += [header, _frame_of(seq)]
+    return reads
+
+
+def _collect(decoder, stopping, spawns_expected):
+    """Every (index, at_s, frame tag) the decoder yields before the last
+    scripted spawn's reads are gone."""
+    out = []
+    for index, at_s, yuv in decoder.frames():
+        out.append((index, round(at_s, 4), int(yuv[0, 0])))
+        if decoder.spawned >= spawns_expected and not decoder.proc.stdout.reads:
+            stopping.set()
+    return out
+
+
+def test_reader_records_are_laid_on_the_grid_by_the_senders_time():
+    stopping = threading.Event()
+    decoder, _wall = _reader_decoder([_records(
+        (0, T0, RTP0), (1, T0 + 1 / 30, RTP0 + 3000), (2, T0 + 2 / 30, RTP0 + 6000))],
+        stopping=stopping)
+    out = _collect(decoder, stopping, 1)
+    assert out == [(0, 0.0, 0), (1, round(1 / 30, 4), 1), (2, round(2 / 30, 4), 2)]
+    assert decoder.timing == "ntp"
+    assert decoder.epoch == T0
+    counters = decoder.telemetry.snapshot()["counters"]
+    assert "frameEarly" not in counters and "frameGap" not in counters
+
+
+def test_the_reader_is_asked_for_the_pinned_size():
+    decoder, _wall = _reader_decoder([])
+    argv = decoder._reader_argv()
+    assert argv[0] == sys.executable
+    assert argv[argv.index("-url") + 1] == "rtsp://127.0.0.1:8554/cam"
+    assert argv[argv.index("-width") + 1] == str(WIDTH)
+    assert argv[argv.index("-height") + 1] == str(HEIGHT)
+
+
+def test_without_the_binary_a_live_stream_is_decoded_by_ffmpeg_as_before():
+    decoder = Decoder("rtsp://127.0.0.1:8554/cam", Telemetry(),
+                      reader_bin="/nonexistent/stream-reader")
+    assert not decoder.use_reader and decoder.timing == "arrival"
+    assert Decoder("/mnt/clips/session.mp4", Telemetry(),
+                   reader_bin=sys.executable).timing == "file"
+
+
+def test_a_slow_sender_repeats_the_last_frame_and_a_long_gap_jumps():
+    stopping = threading.Event()
+    decoder, _wall = _reader_decoder([_records(
+        (0, T0, RTP0),
+        (1, T0 + 2 / 30, RTP0 + 6000),        # one slot skipped: repeated
+        (2, T0 + 2 / 30 + 1.0, RTP0 + 6000 + 90000))],  # a second: a jump
+        stopping=stopping)
+    out = _collect(decoder, stopping, 1)
+    assert [(i, tag) for i, _at, tag in out] == [(0, 0), (1, 0), (2, 1), (32, 2)]
+    assert out[3][1] == round(32 / 30, 4)
+    counters = decoder.telemetry.snapshot()["counters"]
+    assert counters["frameDup"] == 1 and counters["frameGap"] == 1
+
+
+def test_a_frame_timed_at_or_before_the_last_slot_is_dropped():
+    stopping = threading.Event()
+    decoder, _wall = _reader_decoder([_records(
+        (0, T0, RTP0),
+        (1, T0 + 1 / 30, RTP0 + 3000),
+        (2, T0 + 1 / 30 + 0.004, RTP0 + 3360),   # the same slot again
+        (3, T0 + 0.5 / 30, RTP0 + 1500),         # before it
+        (4, T0 + 2 / 30, RTP0 + 6000))],
+        stopping=stopping)
+    out = _collect(decoder, stopping, 1)
+    assert [(i, tag) for i, _at, tag in out] == [(0, 0), (1, 1), (2, 4)]
+    assert decoder.telemetry.snapshot()["counters"]["frameEarly"] == 2
+
+
+def test_a_sender_clock_far_from_the_hosts_times_the_view_by_arrival():
+    stopping = threading.Event()
+    # The sender says it is 100 s ahead of this host: not believed. The
+    # grid then follows the RTP timestamps from the arrival epoch.
+    decoder, wall = _reader_decoder([_records(
+        (0, T0 + 100, RTP0), (1, T0 + 100 + 1 / 30, RTP0 + 3000),
+        (2, T0 + 100 + 3 / 30, RTP0 + 9000))],
+        stopping=stopping)
+    out = _collect(decoder, stopping, 1)
+    assert [(i, tag) for i, _at, tag in out] == [(0, 0), (1, 1), (2, 1), (3, 2)]
+    assert decoder.timing == "arrival"
+    assert decoder.epoch == wall.now  # this host's clock at the first frame
+    counters = decoder.telemetry.snapshot()["counters"]
+    assert counters["clockSkew"] == 1 and counters["arrivalTimed"] == 1
+
+
+def test_records_without_a_senders_time_run_on_their_rtp_timestamps():
+    stopping = threading.Event()
+    # No sender report: the flag is clear. The timestamps wrap around the
+    # top of their range on the way.
+    decoder, wall = _reader_decoder([_records(
+        (0, None, 0xFFFFFFFF - 1500), (1, None, 1500), (2, None, 4500))],
+        stopping=stopping)
+    out = _collect(decoder, stopping, 1)
+    assert [(i, tag) for i, _at, tag in out] == [(0, 0), (1, 1), (2, 2)]
+    assert decoder.timing == "arrival"
+    assert decoder.epoch == wall.now
+
+
+def test_the_epoch_survives_a_reconnect_and_the_grid_keeps_its_place():
+    stopping = threading.Event()
+    decoder, _wall = _reader_decoder([
+        _records((0, T0, RTP0), (1, T0 + 1 / 30, RTP0 + 3000)),
+        _records((0, T0 + 2.0, 12345), (1, T0 + 2.0 + 1 / 30, 12345 + 3000)),
+    ], stopping=stopping)
+    out = _collect(decoder, stopping, 2)
+    assert [(i, tag) for i, _at, tag in out] == [(0, 0), (1, 1), (60, 0), (61, 1)]
+    assert decoder.epoch == T0
+    counters = decoder.telemetry.snapshot()["counters"]
+    assert counters["reconnects"] == 1 and counters["frameGap"] == 1
+
+
+def test_a_record_out_of_step_restarts_the_reader():
+    stopping = threading.Event()
+    good = _records((0, T0, RTP0))
+    bad_header, _frame = _record(seq=1, ntp_s=T0 + 1 / 30)
+    bad_header = b"JUNK" + bad_header[4:]
+    decoder, _wall = _reader_decoder([
+        good + [bad_header, _frame_of(1)],
+        _records((0, T0 + 1 / 30, RTP0 + 3000)),
+    ], stopping=stopping)
+    out = _collect(decoder, stopping, 2)
+    assert [(i, tag) for i, _at, tag in out] == [(0, 0), (1, 0)]
+    counters = decoder.telemetry.snapshot()["counters"]
+    assert counters["readerDesync"] == 1 and counters["reconnects"] == 1

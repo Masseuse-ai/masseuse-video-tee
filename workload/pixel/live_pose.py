@@ -363,6 +363,43 @@ def _fetch_fuse(jobs) -> None:
         list(pool.map(fetch, jobs))
 
 
+# The session's primary stream's view; a second stream's is named by the
+# session (the producer calls the phone's, beside a fixed camera, "face").
+BODY_VIEW = "body"
+
+
+class ViewState:
+    """What the pose keeps between one stream's frames.
+
+    Scenery is learnt from the first seconds of a stream, the identity
+    anchor follows one person through it, and the detector's box is reused
+    for a few frames: all of it is about one camera's picture. A session
+    with two cameras poses both through the one booted model, so each view
+    has its own of these and the model sees them one at a time.
+    """
+
+    def __init__(self, on_full=None):
+        # The live overlay's tap on this view's full result
+        # (share_full_result).
+        self.on_full = on_full
+        self.warmup: list[tuple[list[list[float]], np.ndarray]] = []
+        self.scenery_done = False
+        self.detect_countdown = 0
+        self.cached_detection: tuple | None = None
+        # The tracker's identity anchor and scenery while this view is not
+        # the one on the tracker (GpuPose.step swaps them in and out).
+        self.previous: list[float] | None = None
+        self.scenery: list[list[float]] = []
+
+    def reset(self) -> None:
+        self.warmup.clear()
+        self.scenery_done = False
+        self.detect_countdown = 0
+        self.cached_detection = None
+        self.previous = None
+        self.scenery = []
+
+
 class GpuPose:
     """RT-DETRv4-X + Sapiens2-1B in bf16, one frame at a time.
 
@@ -428,30 +465,83 @@ class GpuPose:
                      if flip is None else flip)
         self.telemetry = telemetry
         self.tracker = None
-        # The live overlay's tap on the full result (see share_full_result);
-        # a session sets it for its duration and clears it after.
-        self.on_full = None
-        self._warmup: list[tuple[list[list[float]], np.ndarray]] = []
-        self._scenery_done = False
         self._detect_stride = max(
             1, int(os.environ.get("POSE_DETECT_STRIDE", "3") or "3"))
-        self._detect_countdown = 0
-        self._cached_detection: tuple | None = None
+        # What a session keeps between frames, per view (ViewState). The
+        # body view - the session's primary stream - is always there; a
+        # second view (the phone's camera beside a fixed one) is made on
+        # first use. The body view's identity anchor and scenery live on the
+        # tracker itself, as they always did; another view's are swapped in
+        # for its step and out again.
+        self.views: dict[str, ViewState] = {BODY_VIEW: ViewState()}
+        # One frame at a time through the models, whichever view it is
+        # from: the captured graphs have one set of static inputs.
+        self._lock = threading.Lock()
+
+    # The body view's state, under the names the rest of the module and the
+    # tests always used.
+    @property
+    def on_full(self):
+        """The live overlay's tap on the full result (see
+        share_full_result); a session sets it for its duration and clears
+        it after."""
+        return self.views[BODY_VIEW].on_full
+
+    @on_full.setter
+    def on_full(self, value) -> None:
+        self.views[BODY_VIEW].on_full = value
+
+    @property
+    def _warmup(self):
+        return self.views[BODY_VIEW].warmup
+
+    @property
+    def _scenery_done(self) -> bool:
+        return self.views[BODY_VIEW].scenery_done
+
+    @_scenery_done.setter
+    def _scenery_done(self, value: bool) -> None:
+        self.views[BODY_VIEW].scenery_done = bool(value)
+
+    @property
+    def _detect_countdown(self) -> int:
+        return self.views[BODY_VIEW].detect_countdown
+
+    @_detect_countdown.setter
+    def _detect_countdown(self, value: int) -> None:
+        self.views[BODY_VIEW].detect_countdown = int(value)
+
+    @property
+    def _cached_detection(self):
+        return self.views[BODY_VIEW].cached_detection
+
+    @_cached_detection.setter
+    def _cached_detection(self, value) -> None:
+        self.views[BODY_VIEW].cached_detection = value
+
+    def view(self, name: str | None) -> ViewState:
+        """The named view's state, made on first use; None is the body's."""
+        name = name or BODY_VIEW
+        state = self.views.get(name)
+        if state is None:
+            state = self.views[name] = ViewState()
+        return state
 
     def reset_session_state(self) -> None:
         """Forget the previous session's scene, keep the booted weights.
 
         The model is session-independent; scenery, the identity anchor and
-        the detect cache are not. Clearing them is what lets one booted
-        instance serve consecutive sessions without minutes of reload.
+        the detect cache are not - for any view. Clearing them is what lets
+        one booted instance serve consecutive sessions without minutes of
+        reload. The overlay taps are kept: the session sets and clears
+        those itself.
         """
-        self._warmup.clear()
-        self._scenery_done = False
-        self._cached_detection = None
-        self._detect_countdown = 0
-        if self.tracker is not None:
-            self.tracker.previous = None
-            self.tracker.scenery = []
+        with self._lock:
+            for state in self.views.values():
+                state.reset()
+            if self.tracker is not None:
+                self.tracker.previous = None
+                self.tracker.scenery = []
 
     def boot(self) -> None:
         prefetch_model_store(self.telemetry)
@@ -621,11 +711,11 @@ class GpuPose:
         except (OSError, subprocess.TimeoutExpired):
             print("gpu: nvidia-smi unavailable", flush=True)
 
-    def _learn_scenery(self, at_s: float) -> None:
-        if self._scenery_done or at_s < SCENERY_WARMUP_S:
+    def _learn_scenery(self, state: ViewState, at_s: float) -> None:
+        if state.scenery_done or at_s < SCENERY_WARMUP_S:
             return
-        per_frame = [boxes for boxes, _ in self._warmup]
-        grays = [gray for _, gray in self._warmup]
+        per_frame = [boxes for boxes, _ in state.warmup]
+        grays = [gray for _, gray in state.warmup]
 
         def motion(box: list[float]) -> float:
             x0, y0, x1, y1 = (int(v / SCENERY_SCALE) for v in box)
@@ -637,18 +727,42 @@ class GpuPose:
             ]
             return float(np.mean(deltas)) if deltas else 0.0
 
+        # The view's scenery goes on the tracker: this runs with the view's
+        # state swapped in (step), so the tracker's is this view's.
         self.tracker.scenery = pose_rows.find_scenery(per_frame, motion)
-        self._scenery_done = True
-        self._warmup.clear()
+        state.scenery_done = True
+        state.warmup.clear()
 
-    def step(self, rgb: np.ndarray, frame_index: int, at_s: float) -> dict:
+    def step(self, rgb: np.ndarray, frame_index: int, at_s: float,
+             view: str | None = None) -> dict:
+        """One frame of `view` (the body's by default) through detection
+        and keypoints: the row for the assembler, the full result to the
+        view's tap. Views take turns on the model."""
+        name = view or BODY_VIEW
+        state = self.view(name)
+        with self._lock:
+            if name == BODY_VIEW:
+                return self._step(state, rgb, frame_index, at_s)
+            # Another view's turn: its identity anchor and scenery on the
+            # tracker for the step, the body's kept and put back after.
+            tracker = self.tracker
+            body_previous, body_scenery = tracker.previous, tracker.scenery
+            tracker.previous, tracker.scenery = state.previous, state.scenery
+            try:
+                return self._step(state, rgb, frame_index, at_s)
+            finally:
+                state.previous, state.scenery = tracker.previous, tracker.scenery
+                tracker.previous, tracker.scenery = body_previous, body_scenery
+
+    def _step(self, state: ViewState, rgb: np.ndarray, frame_index: int,
+              at_s: float) -> dict:
         tracker = self.tracker
         started = time.monotonic()
         # The frame's one trip to the device; everything below reads it there.
         frame = tracker.frame_tensor(rgb, self.device)
         if self.telemetry:
             self.telemetry.observe("frameUpload", time.monotonic() - started)
-        if not self._scenery_done:
+        if not state.scenery_done:
             # Scenery learning needs every person candidate, before identity
             # selection; the detector backend owns preprocessing and label
             # mapping, so the candidates come through it.
@@ -658,13 +772,13 @@ class GpuPose:
                 cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY),
                 (rgb.shape[1] // SCENERY_SCALE,
                  rgb.shape[0] // SCENERY_SCALE))
-            self._warmup.append((boxes, small))
-            self._learn_scenery(at_s)
+            state.warmup.append((boxes, small))
+            self._learn_scenery(state, at_s)
 
-        cached = self._cached_detection
+        cached = state.cached_detection
         if (cached is not None and cached[0] is not None
-                and self._detect_countdown > 0):
-            self._detect_countdown -= 1
+                and state.detect_countdown > 0):
+            state.detect_countdown -= 1
             box, score, people, unresolved = cached
         else:
             started = time.monotonic()
@@ -674,10 +788,10 @@ class GpuPose:
                 # detect costs, not an average diluted by reuse. The copy
                 # back is inside, so this is the latency, not the enqueue.
                 self.telemetry.observe("detect", time.monotonic() - started)
-            self._cached_detection = (box, score, people, unresolved)
-            self._detect_countdown = self._detect_stride - 1
+            state.cached_detection = (box, score, people, unresolved)
+            state.detect_countdown = self._detect_stride - 1
         if box is None:
-            share_full_result(self.on_full, self.telemetry, frame_index, at_s,
+            share_full_result(state.on_full, self.telemetry, frame_index, at_s,
                               None, None, None, None, people, unresolved)
             return pose_rows.missing_row(frame_index, at_s)
         started = time.monotonic()
@@ -687,7 +801,7 @@ class GpuPose:
         if self.telemetry:
             self.telemetry.observe("poseInfer", time.monotonic() - started)
         keypoints, scores = result[:, :2], result[:, 2]
-        share_full_result(self.on_full, self.telemetry, frame_index, at_s,
+        share_full_result(state.on_full, self.telemetry, frame_index, at_s,
                           keypoints, scores, box, score, people, unresolved)
         return pose_rows.row_for(frame_index, at_s, keypoints, scores, box,
                                  score, people, unresolved)
@@ -719,16 +833,41 @@ class SideloadPose:
             (b - a for a, b in zip(frames, frames[1:]) if b > a), default=1)
         self.span = (frames[-1] + self.stride) if frames else 1
         self.telemetry = telemetry
-        # Same tap as GpuPose, fed the row's 21 body points: the local loop
-        # renders the overlay without a GPU (hands and face stay empty).
-        self.on_full = None
+        # Same taps as GpuPose, per view; the body's is fed the row's 21
+        # body points, so the local loop renders the overlay without a GPU
+        # (hands and face stay empty). A capture holds one stream's poses,
+        # so another view replays as nobody there.
+        self.views: dict[str, ViewState] = {BODY_VIEW: ViewState()}
         if telemetry:
             telemetry.boot_phase("weights", started)
+
+    @property
+    def on_full(self):
+        return self.views[BODY_VIEW].on_full
+
+    @on_full.setter
+    def on_full(self, value) -> None:
+        self.views[BODY_VIEW].on_full = value
+
+    def view(self, name: str | None) -> ViewState:
+        """The named view's state, made on first use; None is the body's."""
+        name = name or BODY_VIEW
+        state = self.views.get(name)
+        if state is None:
+            state = self.views[name] = ViewState()
+        return state
 
     def boot(self) -> None:
         return None
 
-    def step(self, rgb: np.ndarray, frame_index: int, at_s: float) -> dict:
+    def step(self, rgb: np.ndarray, frame_index: int, at_s: float,
+             view: str | None = None) -> dict:
+        state = self.view(view)
+        if (view or BODY_VIEW) != BODY_VIEW:
+            share_full_result(state.on_full, self.telemetry, frame_index, at_s,
+                              None, None, None, None, 0, False)
+            return {"frame": frame_index, "atS": round(at_s, 4),
+                    "keypoints": None}
         key = frame_index % self.span
         row = self.rows.get(key)
         if row is None:
@@ -738,15 +877,15 @@ class SideloadPose:
             if nearest is not None and abs(nearest - key) * 2 <= self.stride:
                 row = self.rows[nearest]
         if row is None or not row.get("keypoints"):
-            share_full_result(self.on_full, self.telemetry, frame_index, at_s,
+            share_full_result(state.on_full, self.telemetry, frame_index, at_s,
                               None, None, None, None,
                               (row or {}).get("people", 0),
                               (row or {}).get("identityUnresolved", False))
             return {"frame": frame_index, "atS": round(at_s, 4),
                     "keypoints": None}
-        if self.on_full is not None:
+        if state.on_full is not None:
             points, scores = row_keypoint_arrays(row["keypoints"])
-            share_full_result(self.on_full, self.telemetry, frame_index, at_s,
+            share_full_result(state.on_full, self.telemetry, frame_index, at_s,
                               points, scores, row.get("box"),
                               row.get("boxScore"), row.get("people", 1),
                               row.get("identityUnresolved", False))

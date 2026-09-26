@@ -1,12 +1,15 @@
 # The build context is the repository root (workload/Dockerfile,
 # workload/tee/Dockerfile.tee). Only the workload tree and the two lock
 # files are read; everything else stays out of the context and out of the
-# image.
+# image. The reader's tests and their fixtures stay out too: the stage
+# builds cmd/stream-reader alone.
 *
 !workload/
 !analysis.lock
 !camlink.lock
 workload/tests/
+workload/reader/**/*_test.go
+workload/reader/testmedia/
 **/__pycache__/
 **/*.pyc
 **/.pytest_cache/

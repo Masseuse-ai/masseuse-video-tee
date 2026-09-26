@@ -50,6 +50,7 @@ import os
 import queue
 import re
 import signal
+import struct
 import subprocess
 import sys
 import threading
@@ -77,6 +78,7 @@ from overlay import build_renderer  # noqa: E402
 from relay_proxy import (RelayProxy, location_secret,  # noqa: E402
                          route as relay_route)
 from sinks import Capture, Poster  # noqa: E402
+from sync import ViewSync  # noqa: E402
 from tee_mode import (CLIENT_NONCE, IdleExit, TeeMode,  # noqa: E402
                       bearer as bearer_token, cors_headers)
 from telemetry import Telemetry  # noqa: E402
@@ -89,6 +91,41 @@ FPS = 30.0
 # at whatever the first seconds carried.
 STREAM_LONG_SIDE = 1280
 POSE_QUEUE_DEPTH = 2
+# The secondary view's probe cadence while its path has no video track
+# (Decoder.wait_for_track): an ffprobe against the loopback relay.
+TRACK_RETRY_S = 3.0
+# A video track that is announced but carries no frame yet - the connector
+# drops video while its tunnel catches up and resumes at the next keyframe,
+# within seconds - is probed again this often, and given up on as a track
+# without frames after STARVED_TRACK_MAX_S in that state (the primary; the
+# secondary waits as it waits for a track).
+STARVED_RETRY_S = 1.0
+STARVED_TRACK_MAX_S = 30.0
+# The face view's pose cadence. A face in a hand-held or propped phone
+# moves little; three keypoint passes a second draw it and leave the GPU
+# to the body view's six.
+FACE_POSE_FPS = 3.0
+# stream-reader (workload/reader): reads a live stream's video track with
+# the time its sender gave each frame and hands the frames over as records
+# (workload/reader/record). Without the binary a live stream is decoded
+# by ffmpeg as before, timed by arrival.
+STREAM_READER_BIN = os.environ.get("STREAM_READER_BIN", "/app/bin/stream-reader")
+# The record header, little-endian: magic, version, flags, codec,
+# reserved, seq, ntp_ns, rtp_ts, width, height, length.
+RECORD = struct.Struct("<4sBBBBIqIHHI")
+RECORD_MAGIC = b"MSFR"
+RECORD_VERSION = 1
+RECORD_NTP_VALID = 0x01
+RECORD_KEYFRAME = 0x02
+RTP_CLOCK = 90000
+# The 30 fps grid a live view's frames are laid on by their time. A gap up
+# to this is filled by repeating the last frame (a sender below 30 fps, a
+# frame the relay dropped); a longer one - a reconnect, a pause - is left
+# as a jump in the frame index, the way the stream really went.
+GRID_DUP_MAX_S = 0.5
+# A sender whose clock is further than this from the enclave's is not
+# believed: its view is timed by arrival instead, and says so.
+CLOCK_SKEW_MAX_S = 10.0
 # A run name becomes a capture sub-directory and a GCS path segment.
 RUN_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 # The only files a /produce request may name: the bucket mount. A track or
@@ -175,19 +212,51 @@ class Decoder:
     tunnel catches up - is waited for, for at most `STARVED_TRACK_MAX_S`:
     the connector resumes at its next keyframe, and a probe of 0x0 is not a
     geometry to pin the pipe to.
+
+    `wait_for_track` is the secondary view's shape (the phone's camera
+    beside a fixed one): a path with no video track yet - the phone has
+    not published, or is between cameras - is not an error but a wait,
+    probed again every `TRACK_RETRY_S` until a track is there or the
+    session stops. The primary keeps raising: its track is what the
+    session was started for. A track that is there but starved - announced,
+    no frame of it within ffprobe's window, which is the connector dropping
+    video while its tunnel catches up - is waited for by both, the primary
+    for at most `STARVED_TRACK_MAX_S`: the connector resumes at its next
+    keyframe, and a probe of 0x0 is not a geometry to pin the pipe to.
+
+    Time. A live stream is read through stream-reader when the binary is
+    there (`reader_bin`, STREAM_READER_BIN): each frame comes with the
+    moment its sender gave it (the RTCP sender report's NTP time), and the
+    frames are laid on the 30 fps grid by that moment - slot zero is the
+    first frame's, the view's `epoch`, and a frame's index is how many
+    slots its time is past it. A sender below 30 fps repeats the last
+    frame into the slots it skips (`frameDup`); a frame timed at or before
+    the last slot filled is dropped (`frameEarly`); a gap longer than
+    GRID_DUP_MAX_S is left as a jump (`frameGap`), and the epoch survives
+    reconnects, so the index says where in the stream a frame really is.
+    `timing` says how the view is timed: `ntp` on the sender's clock, or
+    `arrival` - the reader is absent, the sender does not report, or its
+    clock is more than CLOCK_SKEW_MAX_S from this host's (`clockSkew`) -
+    in which case the grid runs on the frames' RTP timestamps from an
+    arrival-time epoch, or, without the reader, on the ffmpeg cadence as
+    before. Two views on `ntp` line up exactly (sync.py); a `file` keeps
+    its own count.
     """
 
     def __init__(self, url: str, telemetry: Telemetry,
                  realtime: bool = False,
                  stopping: threading.Event | None = None,
                  lost_after_s: float = 0.0, clock=time.monotonic,
-                 sleep=time.sleep):
+                 sleep=time.sleep, wait_for_track: bool = False,
+                 reader_bin: str | None = None, wall=time.time):
         self.url = url
         self.telemetry = telemetry
         self.stopping = stopping
         self.lost_after_s = float(lost_after_s or 0.0)
         self.clock = clock
         self.sleep = sleep
+        self.wall = wall
+        self.wait_for_track = wait_for_track
         # A file decodes as fast as ffmpeg can read it, which starves a
         # real GPU pose worker of wall time and craters the delivered pose
         # cadence in media time. -re paces a file like the camera it stands
@@ -205,6 +274,18 @@ class Decoder:
         # and ffmpeg is told to deliver exactly it; a file's is its own.
         self.size: tuple[int, int] | None = None
         self.probed: tuple[int, int] | None = None
+        # The reader, when a live stream has one to be read through.
+        self.reader_bin = (STREAM_READER_BIN if reader_bin is None
+                           else reader_bin)
+        self.use_reader = network and bool(self.reader_bin) and os.path.isfile(
+            self.reader_bin)
+        # How the frames are timed (see the class docstring) and slot
+        # zero's moment: the sender's clock as unix seconds on `ntp`, this
+        # host's on `arrival`; None for a file, or before the first frame.
+        self.timing = ("file" if not network
+                       else "ntp" if self.use_reader else "arrival")
+        self.epoch: float | None = None
+        self._said_skew = False
 
     def _probe(self) -> tuple[int, int]:
         out = subprocess.run(
@@ -259,16 +340,31 @@ class Decoder:
                 "-vf", self._filters(), "-f", "rawvideo",
                 "-pix_fmt", "yuv420p", "pipe:1"]
 
+    def _reader_argv(self) -> list[str]:
+        width, height = self.size
+        return [self.reader_bin, "-url", self.url,
+                "-width", str(width), "-height", str(height)]
+
     def _spawn(self) -> None:
-        self.proc = subprocess.Popen(self._argv(), stdout=subprocess.PIPE)
+        argv = self._reader_argv() if self.use_reader else self._argv()
+        self.proc = subprocess.Popen(argv, stdout=subprocess.PIPE)
 
     def _stopped(self) -> bool:
         return self.stopping is not None and self.stopping.is_set()
 
     def _await_probe(self) -> tuple[int, int] | None:
-        """The probe, repeated while the track is starved of frames, for at
-        most STARVED_TRACK_MAX_S; None once the session stopped while
-        waiting."""
+        """The probe, repeated while the track is not yet decodable.
+
+        A track that is starved (`StarvedTrack`: announced, no frame of it
+        within ffprobe's window - the connector dropping video while its
+        tunnel catches up) is probed again every STARVED_RETRY_S, for at
+        most STARVED_TRACK_MAX_S, then raised as an error. A track that is
+        not there at all is an error too - unless `wait_for_track`, in which
+        case both shapes are waited for as long as the session lasts, every
+        TRACK_RETRY_S. None once the session stopped while waiting.
+        """
+        starved_since: float | None = None
+        said = False
         starved_since: float | None = None
         while True:
             if self._stopped():
@@ -282,11 +378,23 @@ class Decoder:
                     print(f"decoder: {self.url} has a video track but no "
                           f"frames yet; waiting for its next keyframe",
                           flush=True)
-                elif now - starved_since >= STARVED_TRACK_MAX_S:
+                elif (now - starved_since >= STARVED_TRACK_MAX_S
+                      and not self.wait_for_track):
                     raise RuntimeError(
                         f"{error} after {STARVED_TRACK_MAX_S:g} s") from None
                 self.telemetry.count("starvedProbes")
-            deadline = self.clock() + STARVED_RETRY_S
+                retry_s = STARVED_RETRY_S
+            except (RuntimeError, OSError, ValueError,
+                    subprocess.TimeoutExpired) as error:
+                if not self.wait_for_track:
+                    raise
+                self.telemetry.count("trackWaits")
+                if not said:
+                    said = True
+                    print(f"decoder: {self.url} has no video track yet "
+                          f"({error}); waiting", flush=True)
+                retry_s = TRACK_RETRY_S
+            deadline = self.clock() + retry_s
             while self.clock() < deadline:
                 if self._stopped():
                     return None
@@ -301,40 +409,176 @@ class Decoder:
             self.probed = probed
             self.size = pipe_size(self.probed) if self.network else self.probed
             print(f"decoder: {self.url} probed {self.probed[0]}x{self.probed[1]}, "
-                  f"decoding at {self.size[0]}x{self.size[1]}", flush=True)
+                  f"decoding at {self.size[0]}x{self.size[1]}"
+                  + (" through stream-reader" if self.use_reader else ""),
+                  flush=True)
+        if self.use_reader:
+            yield from self._frames_from_reader()
+        else:
+            yield from self._frames_from_ffmpeg()
+
+    def _ended(self, lost_since: float | None) -> tuple[bool, float | None]:
+        """The pipe ended: whether to give up, and the loss clock.
+        Reconnects a network stream after a second; a file is over."""
+        self.telemetry.count("reconnects")
+        self.proc.stdout.close()
+        self.proc.wait()
+        self.proc = None
+        if not self.url.startswith(("rtsp://", "rtsps://")):
+            return True, lost_since  # a file ended; only network streams reconnect
+        now = self.clock()
+        if lost_since is None:
+            lost_since = now
+        elif self.lost_after_s and now - lost_since >= self.lost_after_s:
+            self.telemetry.count("inputLost")
+            print(f"decoder: no frames from {self.url} for "
+                  f"{now - lost_since:.0f}s; treating the stream as "
+                  "ended", flush=True)
+            return True, lost_since
+        self.sleep(1.0)
+        return False, lost_since
+
+    def _frames_from_ffmpeg(self):
+        """ffmpeg's rawvideo pipe: one frame per read, timed by count."""
         width, height = self.size
         frame_bytes = width * height * 3 // 2
         index = 0
         lost_since: float | None = None
         while True:
-            if self.stopping is not None and self.stopping.is_set():
+            if self._stopped():
                 return
             if self.proc is None or self.proc.poll() is not None:
                 self._spawn()
             buffer = self.proc.stdout.read(frame_bytes)
             if len(buffer) < frame_bytes:
-                self.telemetry.count("reconnects")
-                self.proc.stdout.close()
-                self.proc.wait()
-                self.proc = None
-                if not self.url.startswith(("rtsp://", "rtsps://")):
-                    return  # a file ended; only network streams reconnect
-                now = self.clock()
-                if lost_since is None:
-                    lost_since = now
-                elif self.lost_after_s and now - lost_since >= self.lost_after_s:
-                    self.telemetry.count("inputLost")
-                    print(f"decoder: no frames from {self.url} for "
-                          f"{now - lost_since:.0f}s; treating the stream as "
-                          "ended", flush=True)
+                ended, lost_since = self._ended(lost_since)
+                if ended:
                     return
-                self.sleep(1.0)
                 continue
             lost_since = None
+            if self.epoch is None:
+                self.epoch = self.wall()
             yuv = np.frombuffer(buffer, np.uint8).reshape(
                 height * 3 // 2, width)
             yield index, index / FPS, yuv
             index += 1
+
+    def _read_exact(self, n: int) -> bytes:
+        """Up to n bytes from the reader's pipe; short at its end."""
+        out = self.proc.stdout.read(n)
+        while len(out) < n:
+            more = self.proc.stdout.read(n - len(out))
+            if not more:
+                break
+            out += more
+        return out
+
+    def _frames_from_reader(self):
+        """stream-reader's records, laid on the grid by their time."""
+        width, height = self.size
+        frame_bytes = width * height * 3 // 2
+        next_index = 0          # the next slot to fill
+        last_yuv: np.ndarray | None = None
+        lost_since: float | None = None
+        # This connection's RTP timeline, for `arrival` timing: the first
+        # frame's timestamp, its unwrapped position, and its wall moment.
+        rtp_first: int | None = None
+        rtp_prev: int | None = None
+        rtp_pos = 0
+        conn_wall: float | None = None
+        conn_timing: str | None = None
+        while True:
+            if self._stopped():
+                return
+            if self.proc is None or self.proc.poll() is not None:
+                self._spawn()
+                rtp_first = rtp_prev = None
+                rtp_pos = 0
+                conn_wall = conn_timing = None
+            header = self._read_exact(RECORD.size)
+            if len(header) < RECORD.size:
+                ended, lost_since = self._ended(lost_since)
+                if ended:
+                    return
+                continue
+            (magic, version, flags, _codec, _pad, _seq, ntp_ns, rtp_ts,
+             rec_width, rec_height, length) = RECORD.unpack(header)
+            if (magic != RECORD_MAGIC or version != RECORD_VERSION
+                    or (rec_width, rec_height) != (width, height)
+                    or length != frame_bytes):
+                # Not a record of ours, or not the frame we asked for: the
+                # pipe is out of step; start it over.
+                self.telemetry.count("readerDesync")
+                print(f"decoder: {self.url} reader out of step "
+                      f"(magic {magic!r} v{version} {rec_width}x{rec_height} "
+                      f"{length} bytes); restarting it", flush=True)
+                self.proc.kill()
+                ended, lost_since = self._ended(lost_since)
+                if ended:
+                    return
+                continue
+            buffer = self._read_exact(length)
+            if len(buffer) < length:
+                ended, lost_since = self._ended(lost_since)
+                if ended:
+                    return
+                continue
+            lost_since = None
+            now = self.wall()
+            # This connection's timing, decided on its first frame.
+            if conn_timing is None:
+                conn_timing = "ntp" if flags & RECORD_NTP_VALID else "arrival"
+                if conn_timing == "ntp":
+                    skew = ntp_ns / 1e9 - now
+                    if abs(skew) > CLOCK_SKEW_MAX_S:
+                        self.telemetry.count("clockSkew")
+                        if not self._said_skew:
+                            self._said_skew = True
+                            print(f"decoder: {self.url} sender clock is "
+                                  f"{skew:+.1f}s from this host's; timing "
+                                  "the view by arrival", flush=True)
+                        conn_timing = "arrival"
+                if conn_timing == "arrival" and self.timing != "arrival":
+                    self.telemetry.count("arrivalTimed")
+                self.timing = conn_timing
+                conn_wall = now
+                rtp_first = rtp_prev = rtp_ts
+                rtp_pos = 0
+            elif conn_timing == "ntp" and not flags & RECORD_NTP_VALID:
+                # The sender's time went missing mid-stream (it cannot,
+                # once reported; said if it does) - the frame keeps the
+                # timeline through its RTP timestamp instead.
+                self.telemetry.count("ntpMissing")
+            # The RTP timeline, unwrapped, in seconds from this
+            # connection's first frame.
+            step = (rtp_ts - rtp_prev) & 0xFFFFFFFF
+            if step >= 0x80000000:
+                step -= 0x100000000
+            rtp_pos += step
+            rtp_prev = rtp_ts
+            if conn_timing == "ntp" and flags & RECORD_NTP_VALID:
+                at = ntp_ns / 1e9
+            else:
+                at = conn_wall + rtp_pos / RTP_CLOCK
+            if self.epoch is None:
+                self.epoch = at
+            slot = int(round((at - self.epoch) * FPS))
+            if slot < next_index:
+                self.telemetry.count("frameEarly")
+                continue
+            gap = slot - next_index
+            if gap > 0:
+                if gap <= GRID_DUP_MAX_S * FPS and last_yuv is not None:
+                    self.telemetry.count("frameDup", gap)
+                    for filled in range(next_index, slot):
+                        yield filled, filled / FPS, last_yuv
+                else:
+                    self.telemetry.count("frameGap")
+            yuv = np.frombuffer(buffer, np.uint8).reshape(
+                height * 3 // 2, width)
+            yield slot, slot / FPS, yuv
+            last_yuv = yuv
+            next_index = slot + 1
 
     def stop(self) -> None:
         if self.proc is not None:
@@ -342,16 +586,27 @@ class Decoder:
 
 
 class PoseWorker(threading.Thread):
-    """Pose at the 6fps cadence, never allowed to block the decode."""
+    """Pose at the 6fps cadence, never allowed to block the decode.
 
-    def __init__(self, pose, assembler: RowAssembler, lock: threading.Lock,
+    `view` names the stream this worker poses (`GpuPose.step`'s view; None
+    is the body's) and `stage` the telemetry stage its steps time. A worker
+    without an assembler - the face view's - hands its rows to `on_pose`
+    only: the assembler and the descriptors are the body's.
+    """
+
+    def __init__(self, pose, assembler: RowAssembler | None, lock: threading.Lock,
                  telemetry: Telemetry, on_row=None,
-                 queue_depth: int | None = None, on_pose=None):
+                 queue_depth: int | None = None, on_pose=None,
+                 view: str | None = None, stage: str = "pose",
+                 dropped_counter: str = "poseDropped"):
         super().__init__(daemon=True)
         self.pose = pose
         self.assembler = assembler
         self.lock = lock
         self.telemetry = telemetry
+        self.view = view
+        self.stage = stage
+        self.dropped_counter = dropped_counter
         # Every real pose row in slot order, with its flags and the frame
         # size, for the analysis process (the `pose` message of
         # analysis/protocol.md): the interpolated rows the assembler makes
@@ -391,7 +646,7 @@ class PoseWorker(threading.Thread):
             # The clock must advance even when the pose is dropped, or the
             # assembler would wait forever for a decision that never comes -
             # but only once the slots ahead of it have reported.
-            self.telemetry.count("poseDropped")
+            self.telemetry.count(self.dropped_counter)
             row = {"frame": index, "atS": round(at_s, 4), "keypoints": None}
             self._finish(index, row, {"dropped": True})
 
@@ -403,8 +658,9 @@ class PoseWorker(threading.Thread):
             while self._order and self._order[0] in self._finished:
                 ready.append(self._finished.pop(self._order.popleft()))
         for ready_row, ready_flags in ready:
-            with self.lock:
-                self.assembler.push_pose(ready_row)
+            if self.assembler is not None:
+                with self.lock:
+                    self.assembler.push_pose(ready_row)
             if self.on_pose is not None:
                 try:
                     self.on_pose(ready_row, ready_flags, self.frame_size)
@@ -430,8 +686,11 @@ class PoseWorker(threading.Thread):
             if self.frame_size is None and hasattr(rgb, "shape"):
                 self.frame_size = (int(rgb.shape[1]), int(rgb.shape[0]))
             try:
-                with self.telemetry.time_stage("pose"):
-                    row = self.pose.step(rgb, index, at_s)
+                with self.telemetry.time_stage(self.stage):
+                    if self.view is None:
+                        row = self.pose.step(rgb, index, at_s)
+                    else:
+                        row = self.pose.step(rgb, index, at_s, view=self.view)
             except Exception as error:  # noqa: BLE001 - said aloud, survived
                 # An uncaught step error would kill this thread and the rest
                 # of the session would report only runaway poseDropped (a
@@ -568,7 +827,19 @@ def capture_dir(sink_dir: str, run_name: str) -> Path:
 
 
 class Session:
-    """One stream, start to stop."""
+    """One stream, start to stop - or two.
+
+    With `args.face_stream` (a fixed camera behind the user as the stream,
+    the phone's own camera as the face stream) the session reads both: the
+    body view is everything a session was - pose, descriptors, the analysis
+    messages, the annotated view - and the face view is decoded beside it,
+    posed at FACE_POSE_FPS through the same model, drawn as an inset over
+    the view (overlay.py) and sent to the analysis as `facePose` rows; the
+    two are lined up on one clock (sync.py). `args.audio_stream` names the
+    stream whose audio track --audio reads: the phone's, when both are
+    present, since it is the one near the user's face. Two views need the
+    GPU pose; a sideload session reads the body alone.
+    """
 
     def __init__(self, args, telemetry: Telemetry):
         self.args = args
@@ -581,6 +852,18 @@ class Session:
             started = time.monotonic()
             self.pose = acquire_gpu_pose(args, telemetry)
         telemetry.boot_phase("poseReady", started)
+        face_stream = getattr(args, "face_stream", "") or ""
+        if face_stream and args.pose != "gpu":
+            print("face view: needs --pose gpu; reading the body view alone",
+                  flush=True)
+            face_stream = ""
+        if face_stream == args.stream:
+            face_stream = ""  # one camera is one view
+        self.face_stream = face_stream
+        self.audio_stream = getattr(args, "audio_stream", "") or args.stream
+        # The two views' clocks, on this host's wall clock - the scale the
+        # decoders' sender-time epochs are on (sync.py).
+        self.sync = ViewSync(clock=time.time) if face_stream else None
 
         # Pose cadence and the interpolation bridge it needs: the bridge
         # scales with the pose interval (1.3x of it, at least 0.35 s).
@@ -609,13 +892,16 @@ class Session:
         record = (self.capture.directory / "overlay.mp4"
                   if getattr(args, "overlay_record", False) else None)
         self.overlay = build_renderer(args, telemetry, source_fps=FPS,
-                                      record_path=record)
+                                      record_path=record, sync=self.sync)
         # The audio stage (workload/audio/audio_stage.py): the stream's
         # audio track, if it has one, classified and measured in this
         # process; its numbers go over the same socket. The classifier is
         # loaded here, before the link, so a missing library fails the
         # session before anything else is up.
         self.stream_at_s: float | None = None
+        # The views' decoders, once run() has made them (views()).
+        self.decoder: Decoder | None = None
+        self.face_decoder: Decoder | None = None
         self.audio_classifier = (acquire_audio_classifier(telemetry)
                                  if getattr(args, "audio", False) else None)
         self.audio: AudioStage | None = None
@@ -631,7 +917,9 @@ class Session:
             run=self.run_name or None,
             audio=self.audio_classifier is not None,
             audioModel=(self.audio_classifier.version
-                        if self.audio_classifier is not None else None))
+                        if self.audio_classifier is not None else None),
+            views=(["body", "face"] if self.face_stream else ["body"]),
+            facePoseFps=(FACE_POSE_FPS if self.face_stream else None))
         if self.analysis.connected:
             ready = self.analysis.ready or {}
             print(f"analysis: {ready.get('version', '?')} "
@@ -639,7 +927,7 @@ class Session:
                   f"{args.analysis_socket}", flush=True)
         if self.audio_classifier is not None:
             self.audio = AudioStage(
-                AudioSource(args.stream, telemetry,
+                AudioSource(self.audio_stream, telemetry,
                             realtime=args.pose == "gpu", stopping=self.stopping),
                 self.audio_classifier, self.analysis.send, telemetry,
                 stream_clock=lambda: self.stream_at_s)
@@ -720,6 +1008,62 @@ class Session:
             "frameSize": list(frame_size) if frame_size else None,
         })
 
+    def _on_face_pose(self, row: dict, flags: dict,
+                      frame_size: tuple[int, int] | None) -> None:
+        """Every real face-view pose row, from the face pose worker: the
+        `facePose` message, with the body view's moment for it."""
+        body_at_s = self.sync.body_at_s(row["atS"]) if self.sync else None
+        self.analysis.send({
+            "kind": "facePose",
+            "frame": row["frame"],
+            "atS": row["atS"],
+            "bodyAtS": round(body_at_s, 4) if body_at_s is not None else None,
+            "keypoints": row.get("keypoints"),
+            "dropped": bool(flags.get("dropped")),
+            "error": bool(flags.get("error")),
+            "frameSize": list(frame_size) if frame_size else None,
+        })
+
+    def _clock_view(self, clock, decoder: "Decoder", at_s: float) -> None:
+        """Place one view on the shared clock from its decoder: anchored on
+        the sender-time epoch when the view has one, estimated from
+        arrivals otherwise (sync.py)."""
+        if decoder.timing == "ntp" and decoder.epoch is not None:
+            if not clock.anchored or clock.offset != decoder.epoch:
+                clock.anchor(decoder.epoch)
+            clock.note(at_s)
+            return
+        if clock.anchored:
+            clock.anchor(None)
+        clock.note(at_s)
+
+    def _face_loop(self, decoder: "Decoder", worker: "PoseWorker") -> None:
+        """The face view's decode: frames to the overlay, every
+        FACE_POSE_FPS-th to its pose worker, its clock kept. On its own
+        thread; ends with the session or the stream."""
+        stride = max(1, int(round(FPS / FACE_POSE_FPS)))
+        width = None
+        try:
+            for index, at_s, yuv in decoder.frames():
+                if self.stopping.is_set():
+                    break
+                self._clock_view(self.sync.face, decoder, at_s)
+                self.telemetry.count("faceFramesIn")
+                if width is None:
+                    width = yuv.shape[1]
+                if self.overlay is not None:
+                    self.overlay.offer_face_frame(index, at_s, yuv)
+                if index % stride == 0:
+                    with self.telemetry.time_stage("faceRgb"):
+                        rgb = cv2.cvtColor(
+                            yuv.reshape(-1, width), cv2.COLOR_YUV2RGB_I420)
+                    worker.submit(rgb, index, at_s)
+        except Exception as error:  # noqa: BLE001 - said aloud; the body goes on
+            self.telemetry.count("faceViewErrors")
+            print(f"face view failed: {error!r}", flush=True)
+        finally:
+            decoder.stop()
+
     def _gauges(self, at_s: float, wall_start: float,
                 queued: int) -> None:
         wall = time.monotonic() - wall_start
@@ -756,24 +1100,65 @@ class Session:
                 print(f"descriptors failed at {item[0]['atS']}s: {error!r}",
                       flush=True)
 
+    def views(self) -> dict:
+        """How each view's frames are timed (`Decoder.timing`) and where
+        its grid starts, for /statz; with two views, how they stand to each
+        other."""
+        out = {}
+        for name, decoder in (("body", self.decoder), ("face", self.face_decoder)):
+            if decoder is not None:
+                out[name] = {"timing": decoder.timing, "epoch": decoder.epoch,
+                             "url": decoder.url}
+        if self.sync is not None:
+            skew = self.sync.skew_s()
+            out["sync"] = {"timing": self.sync.timing,
+                           "skewMs": round(skew * 1000) if skew is not None else None}
+        return out
+
     def run(self) -> dict:
         decoder = Decoder(
             self.args.stream, self.telemetry,
             realtime=self.args.pose == "gpu", stopping=self.stopping,
             lost_after_s=getattr(self.args, "input_lost_after", 0.0) or 0.0)
+        self.decoder = decoder
+        timing_said: str | None = None
         worker = PoseWorker(self.pose, self.assembler, self.assembler_lock,
                             self.telemetry, on_row=self.capture.pose,
                             on_pose=self._on_pose)
+        face_worker: PoseWorker | None = None
+        face_thread: threading.Thread | None = None
+        if self.face_stream:
+            # The face view: its own decoder (waiting for the phone's track
+            # rather than failing without it), its own pose worker at the
+            # face cadence, no assembler and no descriptors.
+            self.face_decoder = Decoder(
+                self.face_stream, self.telemetry,
+                realtime=self.args.pose == "gpu", stopping=self.stopping,
+                wait_for_track=True)
+            face_worker = PoseWorker(
+                self.pose, None, self.assembler_lock, self.telemetry,
+                on_pose=self._on_face_pose, view="face", stage="facePose",
+                dropped_counter="facePoseDropped")
+            face_thread = threading.Thread(
+                target=self._face_loop, args=(self.face_decoder, face_worker),
+                daemon=True)
         if self.overlay is not None:
             # The full result reaches the overlay before row_for narrows it;
             # the tap is per session on a process-wide GpuPose.
             self.pose.on_full = self.overlay.offer_pose
+            if face_worker is not None:
+                self.pose.view("face").on_full = self.overlay.offer_face_pose
             self.overlay.start()
             print(f"overlay: publishing {self.overlay.publisher.url} "
                   f"{self.overlay.snapshot()['size']}@{self.overlay.fps:g} "
                   f"{self.overlay.publisher.encoder}, {self.overlay.delay_s:.1f}s "
-                  f"behind decode", flush=True)
+                  f"behind decode"
+                  + (f", face inset from {self.face_stream}" if self.face_stream else ""),
+                  flush=True)
         worker.start()
+        if face_worker is not None:
+            face_worker.start()
+            face_thread.start()
         if self.audio is not None:
             self.audio.start()
         # Descriptors off the decode thread. Measuring a frame pair costs
@@ -807,8 +1192,15 @@ class Session:
                     height = yuv.shape[0] * 2 // 3
                 gray = yuv[:height]
                 self.telemetry.count("framesIn")
+                if self.sync is not None:
+                    self._clock_view(self.sync.body, decoder, at_s)
                 if self.overlay is not None:
                     self.overlay.offer_frame(index, at_s, yuv)  # O(1): a reference
+                    timing = (self.sync.timing if self.sync is not None
+                              else decoder.timing)
+                    if timing != timing_said:
+                        timing_said = timing
+                        self.overlay.offer_context("timing", timing_said)
                 pending[index] = gray.copy()
                 if len(pending) > PENDING_CAP:
                     pending.pop(min(pending))
@@ -845,6 +1237,13 @@ class Session:
         finally:
             worker.stopping.set()
             decoder.stop()
+            if face_worker is not None:
+                # The face view ends with the body's: its decoder is
+                # stopped (the loop sees `stopping` too) and its worker
+                # released.
+                face_worker.stopping.set()
+                self.face_decoder.stop()
+                face_thread.join(timeout=5.0)
             if self.audio is not None:
                 # Its ffmpeg dies with the decoder's; the thread finishes
                 # the hop it is on, answers pending requests "closed" and
@@ -855,6 +1254,8 @@ class Session:
                 # Before the capture closes: the recording, if any, must be
                 # finalised on disk to ride the upload with the jsonl files.
                 self.pose.on_full = None
+                if face_worker is not None:
+                    self.pose.view("face").on_full = None
                 self.overlay.close()
             with self.assembler_lock:
                 rows = self.assembler.drain(last_index)
@@ -1180,15 +1581,19 @@ EXTERNAL_VIEW_SIZE = "1280x720"
 
 
 def external_view_args(session_args, external) -> bool:
-    """Retune a /produce's annotated view when its stream is the external
-    camera's path: a fixed camera behind the user is landscape and not a
-    selfie, so the view goes out 16:9 and unmirrored, whatever the phone's
-    own camera is published as (--overlay-size/--overlay-mirror in
-    tee/entrypoint.sh). True when it did."""
+    """Retune a /produce when its stream is the external camera's path: a
+    fixed camera behind the user is landscape and not a selfie, so the view
+    goes out 16:9 and unmirrored, whatever the phone's own camera is
+    published as (--overlay-size/--overlay-mirror in tee/entrypoint.sh);
+    and the phone's camera stays live beside it - its stream is the face
+    view drawn as an inset, its microphone the one the audio stage listens
+    to (Session). True when it did."""
     if external is None or getattr(session_args, "stream", "") != external.stream_url:
         return False
     session_args.overlay_mirror = False
     session_args.overlay_size = EXTERNAL_VIEW_SIZE
+    session_args.face_stream = external.phone_stream_url
+    session_args.audio_stream = external.phone_stream_url
     return True
 
 
@@ -1205,6 +1610,9 @@ def build_server(args, telemetry: Telemetry,
     # The session behind the busy lock, for /stop; set and cleared by the
     # /produce handler while it holds the lock.
     current: dict = {"session": None}
+    # How the phone's picture is drawn as the face inset (/ingest/view):
+    # kept for the slot, so it outlives the session it was set in.
+    view_prefs: dict = {"mirror": False}
     warmup: dict = {"thread": None, "error": None}
     teardown = Teardown(
         busy, drain_s=getattr(args, "teardown_drain_s", TEARDOWN_DRAIN_S))
@@ -1560,6 +1968,56 @@ def build_server(args, telemetry: Telemetry,
             telemetry.count("externalSourceConnected")
             self._json(200, answer, cors)
 
+        def _view(self) -> None:
+            """/ingest/view: how the phone's own picture is drawn while an
+            external camera is the session's - the face inset's
+            `mirror` (the phone says whether its camera faces the user, so
+            the inset reads as a mirror the way its own preview did). PUT
+            {mirror} sets it for the running session and the next; GET
+            reads it back. Gated by the phone's capability like WHIP: the
+            picture is the phone's to arrange.
+            """
+            cors = self._cors()
+            if self.command == "OPTIONS":
+                self.send_response(204)
+                for name, value in cors:
+                    self.send_header(name, value)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            if self.command not in ("PUT", "GET"):
+                self._json(405, {"error": "method not allowed"},
+                           cors + [("Allow", "OPTIONS, PUT, GET")])
+                return
+            if self._tee_signalling_gate("view") is None:
+                return
+            if self.command == "PUT":
+                length = int(self.headers.get("Content-Length") or 0)
+                if length > LEASE_BODY_CAP:
+                    self._json(413, {"error": "body too large"}, cors)
+                    return
+                try:
+                    body = json.loads(self.rfile.read(length) or b"{}")
+                    if not isinstance(body, dict) or not isinstance(
+                            body.get("mirror"), bool):
+                        raise ValueError("expected {\"mirror\": true|false}")
+                except ValueError as error:
+                    self._json(400, {"error": f"invalid body: {error}"}, cors)
+                    return
+                view_prefs["mirror"] = body["mirror"]
+                session = current["session"]
+                overlay = getattr(session, "overlay", None) if session else None
+                set_mirror = getattr(overlay, "set_mirror", None)
+                if callable(set_mirror):
+                    set_mirror(body["mirror"])
+                telemetry.count("viewMirrorSet")
+            session = current["session"]
+            overlay = getattr(session, "overlay", None) if session else None
+            snapshot = overlay.snapshot() if overlay is not None else None
+            self._json(200, {"mirror": view_prefs["mirror"],
+                             "view": (snapshot or {}).get("view")},
+                       cors + [("Cache-Control", "no-store")])
+
         # -- the relay routes ------------------------------------------------
 
         def _overlay(self) -> bool:
@@ -1592,6 +2050,13 @@ def build_server(args, telemetry: Telemetry,
                                               "Confidential Space slot"})
                 else:
                     self._source()
+                return True
+            if kind == "view":
+                if tee is None:
+                    self._json(404, {"error": "the face inset needs a "
+                                              "Confidential Space slot"})
+                else:
+                    self._view()
                 return True
             if kind in ("status", "ingest-status"):
                 if self.command != "GET":
@@ -1776,6 +2241,8 @@ def build_server(args, telemetry: Telemetry,
                 overlay = getattr(session, "overlay", None) if session else None
                 snapshot["overlay"] = (overlay.snapshot()
                                        if overlay is not None else None)
+                views = getattr(session, "views", None) if session else None
+                snapshot["views"] = views() if callable(views) else None
                 if tee is not None:
                     snapshot["tee"] = tee.snapshot()
                     snapshot["tee"]["idleExit"] = idle_exit.snapshot()
@@ -1864,7 +2331,8 @@ def build_server(args, telemetry: Telemetry,
                     # A TEE run leaves no production-capture evidence by
                     # design: no annotated recording, whatever was asked.
                     session_args.overlay_record = False
-                external_view_args(session_args, external)
+                if external_view_args(session_args, external):
+                    session_args.face_mirror = view_prefs["mirror"]
                 self.send_response(200)
                 self.send_header("Content-Type", "text/event-stream")
                 self.send_header("Cache-Control", "no-cache")
@@ -1981,6 +2449,17 @@ def build_parser() -> argparse.ArgumentParser:
                              "vocalization labels with level and pitch and "
                              "send those numbers over the analysis socket; "
                              "needs CED_LIBRARY_PATH and CED_MODEL_PATH")
+    parser.add_argument("--face-stream", default="",
+                        help="a second stream, decoded beside --stream and "
+                             "drawn as an inset over the annotated view with "
+                             "its own keypoints: the phone's camera while "
+                             "--stream is a fixed camera behind the user. In "
+                             "TEE mode it is set for a /produce on the "
+                             "external camera's path. Needs --pose gpu")
+    parser.add_argument("--audio-stream", default="",
+                        help="the stream whose audio track --audio reads; "
+                             "default --stream's (the phone's, in TEE mode, "
+                             "when both cameras are present)")
     parser.add_argument("--duration", type=float, default=0.0)
     parser.add_argument("--input-lost-after", type=float, default=0.0,
                         help="end the session once the stream has delivered "

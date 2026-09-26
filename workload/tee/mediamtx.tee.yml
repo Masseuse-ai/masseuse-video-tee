@@ -53,8 +53,15 @@ api: yes
 apiAddress: 127.0.0.1:9997
 
 paths:
-  # The phone's camera (WHIP in, RTSP out to the producer).
-  cam: {}
+  # The phone's camera (WHIP in, RTSP out to the producer). The relay
+  # keeps the phone's own frame times (its RTCP sender reports) for its
+  # readers instead of restamping at arrival: the producer's stream-reader
+  # lines this view up with the external camera's by them (sync.py). The
+  # packets before the phone's first report are skipped; the phone sends
+  # one within its first second and the relay asks it for a keyframe every
+  # two, so the first picture is late by that much at most.
+  cam:
+    useAbsoluteTimestamp: yes
   # The annotated view (RTSP in from the producer, WHEP out to the phone).
   overlay: {}
   # `ext` (the external camera, RTSPS pulled in, RTSP out to the producer)

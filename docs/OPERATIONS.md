@@ -83,6 +83,23 @@ Registry (`VERIFY.md`, "How the image is built").
 `bash build.sh` runs the same two builds locally, without a push (gzip layers,
 so a different digest, and no stamp), for iterating on the tree.
 
+Both Dockerfiles build `stream-reader` (`workload/reader/`, Go, no cgo,
+the pinned toolchain image) and place it at `/app/bin/stream-reader`: the
+reader the producer decodes a live stream through, which keeps the time
+the sender gave each frame (its RTCP sender reports) beside the decoded
+frame so the phone's view and an external camera's line up on their
+senders' clocks (`workload/producer/sync.py`). The relay is configured to
+pass those times on (`useAbsoluteTimestamp` on `cam`, and on the external
+camera's path when the producer adds it). Without the binary the producer
+falls back to decoding with ffmpeg, timed by arrival; `/statz` says which
+under `views` (`timing`: `ntp` or `arrival`), and the overlay's first HUD
+line ends with `clock ntp` or `clock arrival`. A sender whose clock is more
+than 10 s from the enclave's is timed by arrival too (`clockSkew` in the
+counters); one that never reports is arrival-timed after a second
+(`arrivalTimed`). The grid counters `frameDup`, `frameEarly` and `frameGap`
+say how the frames sat on the 30 fps grid: repeats for a slow sender, drops
+for one above 30 fps, jumps across reconnects.
+
 Put the digest into `terraform.tfvars` (`container_image` and
 `container_image_digest`): that is the deployment's pin, what the VM boots
 and which principal may read the weights. The trainer's policy does not
