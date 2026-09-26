@@ -8,6 +8,10 @@ producer forwards the handful of signalling requests each leg needs.
 
     OPTIONS/POST   /overlay/whep           -> relay  /overlay/whep
     PATCH/DELETE   /overlay/whep/<secret>  -> relay  /overlay/whep/<secret>
+    ...            /overlay-half/whep[/s]  -> relay  /overlay-half/whep[/s]
+                   (and overlay-small, overlay-lean: the view's renditions,
+                   overlay.RENDITIONS; one reader per path, so a phone
+                   opens the next before it closes the one it has)
     GET            /overlay/status         -> relay API paths/get/overlay
     OPTIONS/POST   /ingest/whip            -> relay  /cam/whip
     PATCH/DELETE   /ingest/whip/<secret>   -> relay  /cam/whip/<secret>
@@ -47,12 +51,29 @@ import json
 import re
 import urllib.error
 import urllib.request
+from typing import NamedTuple
 from urllib.parse import urlsplit
 
 WHEP_SECRET = re.compile(r"^[A-Za-z0-9-]{1,64}$")
 WHEP_METHODS = frozenset({"OPTIONS", "POST", "PATCH", "DELETE"})
 # The two legs this proxy carries: (route prefix, relay verb).
 LEGS = {"whep": "whep", "whip": "whip"}
+# The annotated view's renditions by name and relay path suffix
+# (overlay.RENDITIONS, kept in step by test_relay_proxy): each is its own
+# relay path, `overlay` for `hi` and `overlay-<name>` for the rest.
+RENDITION_SUFFIXES = {"hi": "", "half": "-half", "small": "-small", "lean": "-lean"}
+OVERLAY_PATH = "overlay"
+OVERLAY_PATHS = tuple(OVERLAY_PATH + suffix for suffix in RENDITION_SUFFIXES.values())
+
+
+class Route(NamedTuple):
+    """One matched route: its kind, the session secret when the path names
+    one, and for the WHEP routes the relay path (`overlay`, `overlay-half`,
+    ...) the request is for."""
+
+    kind: str
+    secret: str | None
+    path: str | None = None
 _LOCATION_SECRET = re.compile(r"(?:^|/)(?:whep|whip)/([A-Za-z0-9-]{1,64})/?$")
 # What a WHEP client sends that the relay reads. Authorization is not on
 # the list: the relay does not authenticate, IAM already has.
@@ -73,46 +94,60 @@ RESPONSE_HEADERS = ("Content-Type", "Location", "Link", "ETag", "ID",
 BODY_CAP = 64 * 1024  # an SDP offer is a few KB; a trickle fragment less
 
 
-def route(path: str) -> tuple[str, str | None] | None:
+def route(path: str) -> Route | None:
     """The proxy's route table, or None for anything else.
 
-    ('status', None)         GET  /overlay/status
-    ('whep', None|secret)    /overlay/whep[/<secret>]
-    ('ingest-status', None)  GET  /ingest/status
-    ('whip', None|secret)    /ingest/whip[/<secret>]
-    ('source', None)         PUT/GET/DELETE /ingest/source
-    ('view', None)           PUT/GET /ingest/view
+    ('status', None)                   GET  /overlay/status
+    ('whep', None|secret, 'overlay')   /overlay/whep[/<secret>]
+    ('whep', None|secret, 'overlay-half')  /overlay-half/whep[/<secret>],
+                                       likewise overlay-small, overlay-lean
+    ('ingest-status', None)            GET  /ingest/status
+    ('whip', None|secret)              /ingest/whip[/<secret>]
+    ('source', None)                   PUT/GET/DELETE /ingest/source
+    ('view', None)                     PUT/GET /ingest/view
     """
     if path == "/overlay/status":
-        return "status", None
-    if path == "/overlay/whep":
-        return "whep", None
+        return Route("status", None)
     if path == "/ingest/status":
-        return "ingest-status", None
+        return Route("ingest-status", None)
     if path == "/ingest/whip":
-        return "whip", None
+        return Route("whip", None)
     if path == "/ingest/source":
-        return "source", None
+        return Route("source", None)
     if path == "/ingest/view":
-        return "view", None
-    for prefix, kind in (("/overlay/whep/", "whep"), ("/ingest/whip/", "whip")):
-        if path.startswith(prefix) and WHEP_SECRET.match(path[len(prefix):]):
-            return kind, path[len(prefix):]
+        return Route("view", None)
+    if path.startswith("/ingest/whip/") and WHEP_SECRET.match(path[len("/ingest/whip/"):]):
+        return Route("whip", path[len("/ingest/whip/"):])
+    for relay_path in OVERLAY_PATHS:
+        prefix = f"/{relay_path}/whep"
+        if path == prefix:
+            return Route("whep", None, relay_path)
+        if path.startswith(prefix + "/") and WHEP_SECRET.match(path[len(prefix) + 1:]):
+            return Route("whep", path[len(prefix) + 1:], relay_path)
     return None
 
 
-def own_location(value: str, leg: str, public_origin: str = "") -> str:
+def rendition_whep_paths(renditions=tuple(RENDITION_SUFFIXES)) -> dict[str, str]:
+    """The WHEP route of each rendition, by name: `{"hi": "/overlay/whep",
+    "half": "/overlay-half/whep", ...}` for the names given."""
+    return {name: f"/{OVERLAY_PATH}{RENDITION_SUFFIXES[name]}/whep"
+            for name in renditions if name in RENDITION_SUFFIXES}
+
+
+def own_location(value: str, leg: str, public_origin: str = "",
+                 path: str | None = None) -> str:
     """The relay's session Location, in this proxy's namespace.
 
     MediaMTX answers a WHIP/WHEP POST with a Location that is the bare
     session secret (a relative reference), or a path ending in
-    `/<verb>/<secret>`. Either becomes `/overlay/whep/<secret>` or
+    `/<verb>/<secret>`. Either becomes `/overlay/whep/<secret>` (or the
+    rendition's, `/overlay-half/whep/<secret>`, when `path` names it) or
     `/ingest/whip/<secret>`; anything else is passed through. With a
     `public_origin` the result is absolute (`https://slot/ingest/whip/<s>`):
     a browser following it from another origin must not resolve it
     against the page.
     """
-    prefix = "/overlay/whep/" if leg == "whep" else "/ingest/whip/"
+    prefix = f"/{path or OVERLAY_PATH}/whep/" if leg == "whep" else "/ingest/whip/"
     candidate = value.strip()
     if WHEP_SECRET.match(candidate):
         return public_origin + prefix + candidate
@@ -140,7 +175,8 @@ class RelayProxy:
                  path: str = "overlay", timeout_s: float = 10.0,
                  body_cap: int = BODY_CAP, opener=urllib.request.urlopen,
                  ingest_path: str = "cam", public_origin: str = "",
-                 rtsp_base: str = "rtsp://127.0.0.1:8554"):
+                 rtsp_base: str = "rtsp://127.0.0.1:8554",
+                 renditions: tuple[str, ...] = ("hi",)):
         self.webrtc_base = webrtc_base.rstrip("/")
         self.api_base = api_base.rstrip("/")
         self.path = path
@@ -152,15 +188,26 @@ class RelayProxy:
         # Where the producer reads a relay path back: the loopback RTSP
         # listener, so `/ingest/status` can name the stream to /produce.
         self.rtsp_base = rtsp_base.rstrip("/")
+        # The renditions the session publishes (producer
+        # --overlay-renditions), so the status can say where each is
+        # dialled before and after a session is up.
+        self.renditions = tuple(name for name in RENDITION_SUFFIXES if name in renditions)
+
+    def rendition_paths(self) -> dict[str, str]:
+        """`{"hi": "/overlay/whep", "half": "/overlay-half/whep", ...}` for
+        the renditions this slot publishes."""
+        return rendition_whep_paths(self.renditions)
 
     # -- WHEP / WHIP -----------------------------------------------------------
 
     def forward(self, method: str, secret: str | None, headers, body: bytes,
-                client: str = "", leg: str = "whep",
+                client: str = "", leg: str = "whep", path: str | None = None,
                 ) -> tuple[int, list[tuple[str, str]], bytes]:
         """One signalling request to the relay; (status, headers, body) back.
 
-        `leg` is 'whep' (the overlay out, default) or 'whip' (the camera in).
+        `leg` is 'whep' (the overlay out, default) or 'whip' (the camera
+        in). `path` is the relay path a WHEP request is for (the rendition's,
+        route().path); the overlay's own when None.
         """
         if leg not in LEGS:
             raise ValueError(f"unknown leg {leg!r}")
@@ -172,7 +219,7 @@ class RelayProxy:
             return 405, [("Allow", "OPTIONS, PATCH, DELETE")], b""
         if len(body) > self.body_cap:
             return 413, [], b""
-        relay_path = self.ingest_path if leg == "whip" else self.path
+        relay_path = self.ingest_path if leg == "whip" else (path or self.path)
         url = f"{self.webrtc_base}/{relay_path}/{LEGS[leg]}"
         if secret is not None:
             url += f"/{secret}"
@@ -187,21 +234,22 @@ class RelayProxy:
             url, data=body if body else None, headers=forwarded, method=method)
         try:
             with self.opener(request, timeout=self.timeout_s) as response:
-                return (response.status, self._headers(response.headers, leg),
+                return (response.status, self._headers(response.headers, leg, path),
                         response.read())
         except urllib.error.HTTPError as error:
             # 4xx/5xx from the relay are answers, not failures: a stale
             # secret is a 404 the client must see.
-            return error.code, self._headers(error.headers, leg), error.read()
+            return error.code, self._headers(error.headers, leg, path), error.read()
         except (urllib.error.URLError, OSError, TimeoutError) as error:
             return 502, [("Content-Type", "application/json")], json.dumps(
                 {"error": "relay unreachable", "detail": str(error)}).encode()
 
-    def webrtc_sessions(self, leg: str) -> list[str]:
+    def webrtc_sessions(self, leg: str, path: str | None = None) -> list[str]:
         """The relay's WebRTC session ids currently on a leg: the publisher
-        of the camera path, or the readers of the overlay. Empty when the
-        relay is unreachable or the path is idle."""
-        path = self.ingest_path if leg == "whip" else self.path
+        of the camera path, or the readers of the overlay (of the rendition
+        `path` names; the overlay's own when None). Empty when the relay is
+        unreachable or the path is idle."""
+        path = self.ingest_path if leg == "whip" else (path or self.path)
         try:
             with self.opener(f"{self.api_base}/v3/paths/get/{path}",
                              timeout=self.timeout_s) as response:
@@ -216,14 +264,16 @@ class RelayProxy:
         return [str(reader["id"]) for reader in info.get("readers") or []
                 if reader.get("type") == "webRTCSession" and reader.get("id")]
 
-    def evict(self, leg: str) -> int:
+    def evict(self, leg: str, path: str | None = None) -> int:
         """Kick whatever WebRTC session holds a leg, so a new offer from the
         lease's holder takes it over: one publisher and one subscriber per
         lease, and a phone that reconnects (page reload, network change) is
         not locked out by its own lingering session for the relay's
-        timeout. Returns how many sessions were kicked."""
+        timeout. Per relay path: a phone moving to another rendition opens
+        it while its reader of the old one lives on until it DELETEs it,
+        so the picture never gaps. Returns how many sessions were kicked."""
         kicked = 0
-        for session_id in self.webrtc_sessions(leg):
+        for session_id in self.webrtc_sessions(leg, path):
             request = urllib.request.Request(
                 f"{self.api_base}/v3/webrtcsessions/kick/{session_id}",
                 method="POST")
@@ -237,12 +287,14 @@ class RelayProxy:
                 break
         return kicked
 
-    def _headers(self, headers, leg: str = "whep") -> list[tuple[str, str]]:
+    def _headers(self, headers, leg: str = "whep",
+                 path: str | None = None) -> list[tuple[str, str]]:
         out = []
         for name in RESPONSE_HEADERS:
             for value in headers.get_all(name) or []:
                 if name == "Location":
-                    value = own_location(value, leg, self.public_origin)
+                    value = own_location(value, leg, self.public_origin,
+                                         path if leg == "whep" else None)
                 out.append((name, value))
         return out
 
@@ -286,6 +338,9 @@ class RelayProxy:
             "overlay": overlay.snapshot() if overlay is not None else None,
             "relay": relay,
             "whep": "/overlay/whep",
+            # Where each rendition of the view is dialled; the overlay
+            # snapshot above says what each is (size, fps, bitrate).
+            "renditions": self.rendition_paths(),
         }
         if relay is None:
             body["error"] = "relay unreachable"

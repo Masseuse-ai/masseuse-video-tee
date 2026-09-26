@@ -64,10 +64,16 @@ class StubPose:
 
 
 class StubDecoder:
-    """Decoder's surface: scripted frames per URL, sender-timed."""
+    """Decoder's surface: scripted frames per URL, sender-timed.
+
+    A script entry is `(index, at_s)` or `(index, at_s, picture)`: frames
+    with the same `picture` are the same buffer contents, as the decode's
+    `fps=30` conform repeats a slow source's frames; without it every
+    frame is its own picture, as a 30 fps camera's are.
+    """
 
     made: list["StubDecoder"] = []
-    scripts: dict[str, list[tuple[int, float]]] = {}
+    scripts: dict[str, list[tuple]] = {}
     epochs: dict[str, float] = {}
 
     def __init__(self, url, telemetry, **kwargs):
@@ -80,8 +86,13 @@ class StubDecoder:
         StubDecoder.made.append(self)
 
     def frames(self):
-        yuv = np.full((HEIGHT * 3 // 2, WIDTH), 128, np.uint8)
-        for index, at_s in StubDecoder.scripts.get(self.url, []):
+        for entry in StubDecoder.scripts.get(self.url, []):
+            index, at_s = entry[0], entry[1]
+            picture = entry[2] if len(entry) > 2 else index
+            # A fresh buffer per frame, as the decoder hands out.
+            yuv = np.full((HEIGHT * 3 // 2, WIDTH), 128, np.uint8)
+            yuv[0, 0] = picture % 256
+            yuv[0, 1] = (picture // 256) % 256
             self.epoch = StubDecoder.epochs[self.url]
             yield index, at_s, yuv
             time.sleep(0.05)  # the workers keep up, as a paced stream lets them
@@ -205,6 +216,33 @@ def test_a_nine_fps_body_submits_the_picker_slots(monkeypatch, tmp_path):
     rows = [m for m in link.sent if m["kind"] == "pose"]
     assert [row["frame"] for row in rows] == [0, 3, 7, 10]
     assert [row["atS"] for row in rows] == [0.0, 0.1, round(7 / 30, 4), round(10 / 30, 4)]
+
+
+def test_a_slow_upload_conformed_to_the_grid_is_posed_on_distinct_frames(monkeypatch, tmp_path):
+    """A phone uploading 10 fps arrives as every frame three times on the
+    30 fps grid (`fps=30`), here with one frame held a slot longer than
+    its share. Both views' 9 fps picks are distinct pictures: a pick that
+    lands on a repeat of the frame last posed moves to the next frame
+    that differs, and each move is counted per view."""
+    pictures = [0, 0, 0, 0, 1, 1, 1, 2, 2, 2, 3, 3, 3, 4, 4, 4, 5, 5, 5, 6, 6, 6,
+                7, 7, 7, 8, 8, 8, 9, 9]
+    grid = [(i, i / 30, picture) for i, picture in enumerate(pictures)]
+    session, pose, link = run_session(
+        monkeypatch, tmp_path, pose_fps=9.0,
+        scripts={BODY_URL: grid, FACE_URL: grid})
+    for view in ("body", "face"):
+        indices = sorted(index for name, index, _ in pose.steps if name == view)
+        # Slot 3 shows picture 0 again (posed at slot 0): the pick moves to
+        # slot 4, the first frame that differs; the rest are on their slots.
+        assert indices == [0, 4, 7, 10, 13, 17, 20, 23, 27], view
+        assert len({pictures[i] for i in indices}) == len(indices), view
+    counters = session.telemetry.snapshot()["counters"]
+    assert counters["poseRepeatDeferred"] == 1
+    assert counters["facePoseRepeatDeferred"] == 1
+    # The rows carry the frame actually posed, at its own grid time.
+    rows = [m for m in link.sent if m["kind"] == "pose"]
+    assert [row["frame"] for row in rows] == [0, 4, 7, 10, 13, 17, 20, 23, 27]
+    assert rows[1]["atS"] == round(4 / 30, 4)
 
 
 def test_one_view_without_a_face_stream(monkeypatch, tmp_path):

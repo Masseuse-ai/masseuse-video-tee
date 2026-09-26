@@ -27,7 +27,19 @@ Inside the enclave, in code that is in this repository:
   which direction a region moves).
 - An annotated view (skeleton, boxes, a status line) is drawn on the frames
   and streamed back to the same device that sent the video, and to nothing
-  else.
+  else. It is encoded in four renditions at once, from the one picture:
+  the full view at 30 fps, the full view at 15 fps, and three quarters of
+  its size at 15 fps at two bit rates. They give things up in that order -
+  frame rate first, then resolution, then bits - and the device picks one
+  and moves between them, stepping down when it drops frames and back up
+  when it stops; which rendition it watches changes nothing about what is
+  analysed.
+- A device that cannot keep up also sends its own camera at fewer frames
+  a second (never at a lower resolution or bit rate). The frames it sends
+  are laid on a fixed 30 fps grid with repeats where it sent none, and the
+  keypoint detector's picks skip a repeat of the frame it last posed for
+  the next frame that differs, so it keeps working from distinct, sharp
+  pictures at any upload rate down to ten a second.
 - With a second camera - a fixed one behind the user, through a connector
   or named directly (the trust boundary below) - the phone's own camera
   stays live too. The fixed camera's picture is the session's: the body

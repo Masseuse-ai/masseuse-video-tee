@@ -193,6 +193,7 @@ python3 /app/workload/producer/producer.py \
     --overlay-size 720x1280 \
     --overlay-fps 30 \
     --overlay-bitrate 6M \
+    --overlay-renditions hi,half,small,lean \
     --overlay-delay-s 1.0 \
     --overlay-encoder x264 \
     --overlay-mirror \

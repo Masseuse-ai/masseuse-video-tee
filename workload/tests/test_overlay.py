@@ -65,6 +65,10 @@ class FakePublisher:
     def alive(self) -> bool:
         return True
 
+    def rendition_table(self) -> list[dict]:
+        return [{"name": "hi", "size": "1280x720", "fps": 15.0, "bitrate": "6M",
+                 "path": "overlay"}]
+
     def write(self, bgr: np.ndarray) -> bool:
         if self.fail:
             return False
@@ -482,6 +486,151 @@ def test_publisher_defaults_to_every_grid_frame_at_the_same_bits_per_frame():
     # A publisher told 15 fps keeps the two-second keyframe interval.
     slower = OverlayPublisher("rtsp://r/overlay", (1280, 720), 15.0).argv()
     assert slower[slower.index("-g") + 1] == "30"
+
+
+def _outputs(argv: list[str]) -> list[dict]:
+    """Each output of a multi-rendition argv: its `-map` label, the flags
+    between the previous output and its URL, and the URL."""
+    outputs, current = [], {}
+    i = argv.index("-filter_complex") + 2
+    while i < len(argv):
+        token = argv[i]
+        if token == "-map":
+            current["map"] = argv[i + 1]
+            i += 2
+            continue
+        if token.startswith("-") and i + 1 < len(argv):
+            current[token] = argv[i + 1]
+            i += 2
+            continue
+        current["url"] = token
+        outputs.append(current)
+        current = {}
+        i += 1
+    return outputs
+
+
+def test_renditions_are_one_graph_and_an_output_each_with_the_recording_on_hi():
+    """Four renditions: one filter_complex (split, one fps, one scale), an
+    encoder block per output with its own keyframe interval and bit rate,
+    each mapped to its relay path, the mp4 tee on `hi` alone."""
+    publisher = OverlayPublisher(
+        "rtsp://127.0.0.1:8554/overlay", (720, 1280), 30.0,
+        renditions=("hi", "half", "small", "lean"),
+        record_path="/tmp/run/overlay.mp4")
+    assert publisher.renditions == ("hi", "half", "small", "lean")
+    assert publisher.filter_graph() == (
+        "[0:v]split=2[hi][rest];[rest]fps=15,split=2[half][sm];"
+        "[sm]scale=540:960:flags=area,split=2[small][lean]")
+    argv = publisher.argv()
+    assert argv.count("-filter_complex") == 1
+    outputs = _outputs(argv)
+    assert [o["map"] for o in outputs] == ["[hi]", "[half]", "[small]", "[lean]"]
+    assert [o["-g"] for o in outputs] == ["60", "30", "30", "30"]
+    assert [o["-b:v"] for o in outputs] == ["6M", "3M", "1700k", "850k"]
+    assert all(o["-maxrate"] == o["-bufsize"] == o["-b:v"] for o in outputs)
+    assert [f"keyint={g}:min-keyint={g}" in o["-x264-params"]
+            for o, g in zip(outputs, ("60", "30", "30", "30"))] == [True] * 4
+    assert all(o["-profile:v"] == "baseline" and o["-flags"] == "+global_header"
+               for o in outputs)
+    # hi is the tee of the RTSP publish and the recording; the rest RTSP only.
+    assert outputs[0]["-f"] == "tee"
+    assert "[f=rtsp:rtsp_transport=tcp:pkt_size=1200]rtsp://127.0.0.1:8554/overlay|" in outputs[0]["url"]
+    assert "onfail=ignore]/tmp/run/overlay.mp4" in outputs[0]["url"]
+    assert [o["-f"] for o in outputs[1:]] == ["rtsp"] * 3
+    assert [o["url"] for o in outputs[1:]] == [
+        "rtsp://127.0.0.1:8554/overlay-half", "rtsp://127.0.0.1:8554/overlay-small",
+        "rtsp://127.0.0.1:8554/overlay-lean"]
+    assert all(o["-rtsp_transport"] == "tcp" and o["-pkt_size"] == "1200"
+               for o in outputs[1:])
+    assert argv.count("overlay.mp4") == 0  # the file is inside the tee spec only
+    # The table the status and the trainer see.
+    assert publisher.rendition_table() == [
+        {"name": "hi", "size": "720x1280", "fps": 30.0, "bitrate": "6M", "path": "overlay"},
+        {"name": "half", "size": "720x1280", "fps": 15.0, "bitrate": "3M", "path": "overlay-half"},
+        {"name": "small", "size": "540x960", "fps": 15.0, "bitrate": "1700k", "path": "overlay-small"},
+        {"name": "lean", "size": "540x960", "fps": 15.0, "bitrate": "850k", "path": "overlay-lean"},
+    ]
+    # A landscape canvas (the fixed camera's view) scales the same way.
+    wide = OverlayPublisher("rtsp://r/overlay", (1280, 720), 30.0,
+                            renditions=("hi", "small"))
+    assert wide.rendition_table()[1]["size"] == "960x540"
+    assert wide.filter_graph() == "[0:v]split=2[hi][rest];[rest]fps=15[sm];[sm]scale=960:540:flags=area[small]"
+    # NVENC per output too.
+    nvenc = OverlayPublisher("rtsp://r/overlay", (720, 1280), 30.0, encoder="nvenc",
+                             renditions=("hi", "half"))
+    assert nvenc.argv().count("h264_nvenc") == 2
+    assert nvenc.filter_graph() == "[0:v]split=2[hi][rest];[rest]fps=15[half]"
+
+
+def test_hi_alone_is_the_command_it_always_was():
+    """The default (`--overlay-renditions hi`, local runs, the tests above)
+    is byte-for-byte today's argv: no filter graph, no map without a tee."""
+    plain = OverlayPublisher("rtsp://127.0.0.1:8554/overlay", (720, 1280), 30.0)
+    assert plain.renditions == ("hi",)
+    argv = plain.argv()
+    assert "-filter_complex" not in argv and "-map" not in argv
+    assert argv[-7:] == ["-f", "rtsp", "-rtsp_transport", "tcp",
+                         "-pkt_size", "1200", "rtsp://127.0.0.1:8554/overlay"]
+    assert argv.index("-c:v") == argv.index("-an") + 1
+    recorded = OverlayPublisher("rtsp://r/overlay", (720, 1280), 30.0,
+                                record_path="/tmp/run/overlay.mp4").argv()
+    assert recorded[-5:-1] == ["-f", "tee", "-map", "0:v"]
+    assert plain.rendition_table() == [
+        {"name": "hi", "size": "720x1280", "fps": 30.0, "bitrate": "6M", "path": "overlay"}]
+
+
+def test_parse_renditions_keeps_hi_and_the_table_order():
+    assert overlay.parse_renditions("") == ("hi",)
+    assert overlay.parse_renditions(None) == ("hi",)
+    assert overlay.parse_renditions("lean,half") == ("hi", "half", "lean")
+    assert overlay.parse_renditions("hi, half ,small,lean") == ("hi", "half", "small", "lean")
+    with pytest.raises(ValueError, match="huge"):
+        overlay.parse_renditions("hi,huge")
+    # The sizes: three quarters of the canvas, each side a multiple of 4;
+    # a rendition never claims a rate above the canvas's.
+    small = overlay.RENDITIONS["small"]
+    assert small.size((720, 1280)) == (540, 960) and small.size((1280, 720)) == (960, 540)
+    assert small.size((100, 100)) == (76, 76)
+    assert overlay.RENDITIONS["half"].rate(30.0) == 15.0
+    assert overlay.RENDITIONS["half"].rate(10.0) == 10.0
+    assert overlay.RENDITIONS["hi"].rate(30.0) == 30.0 and overlay.RENDITIONS["hi"].bits("6M") == "6M"
+    assert overlay.RENDITIONS["lean"].path("overlay") == "overlay-lean"
+
+
+def test_the_slot_relay_config_and_entrypoint_carry_every_rendition_path():
+    """The production slot (tee/): the relay lists a path per rendition
+    the producer publishes to, and the entrypoint asks for all four."""
+    import yaml
+    tee = Path(__file__).resolve().parents[1] / "tee"
+    config = yaml.safe_load((tee / "mediamtx.tee.yml").read_text())
+    publisher = OverlayPublisher("rtsp://127.0.0.1:8554/overlay", (720, 1280), 30.0,
+                                 renditions=("hi", "half", "small", "lean"))
+    for rendition in publisher.rendition_table():
+        assert rendition["path"] in config["paths"], rendition["path"]
+    assert set(config["paths"]) >= {"cam", "overlay", "overlay-half",
+                                    "overlay-small", "overlay-lean"}
+    entrypoint = (tee / "entrypoint.sh").read_text()
+    assert "--overlay-renditions hi,half,small,lean" in entrypoint
+    assert "--overlay-publish rtsp://127.0.0.1:8554/overlay" in entrypoint
+
+
+def test_build_renderer_reads_the_renditions_and_the_snapshot_lists_them():
+    import argparse
+    args = argparse.Namespace(overlay_publish="rtsp://r/overlay", overlay_size="720x1280",
+                              overlay_renditions="hi,half,small,lean")
+    view = overlay.build_renderer(args, Telemetry())
+    assert view.publisher.renditions == ("hi", "half", "small", "lean")
+    snap = view.snapshot()
+    assert [r["name"] for r in snap["renditions"]] == ["hi", "half", "small", "lean"]
+    assert [r["path"] for r in snap["renditions"]] == [
+        "overlay", "overlay-half", "overlay-small", "overlay-lean"]
+    assert snap["renditions"][0]["size"] == snap["size"] == "720x1280"
+    # Args without the flag (older callers, /produce) are hi alone.
+    bare = overlay.build_renderer(
+        argparse.Namespace(overlay_publish="rtsp://r/overlay"), Telemetry())
+    assert bare.publisher.renditions == ("hi",)
+    assert [r["name"] for r in bare.snapshot()["renditions"]] == ["hi"]
 
 
 def test_publisher_respawns_a_dead_encoder_with_backoff_and_a_fresh_file():

@@ -70,13 +70,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from analysis_link import open_link  # noqa: E402
 from audio_stage import AudioSource, AudioStage  # noqa: E402
-from cadence import CadencePicker  # noqa: E402
+from cadence import CadencePicker, FreshPicker  # noqa: E402
 from camlink_gateway import (CamlinkGateway, GatewayError,  # noqa: E402
                              parse_expectation)
 from external_source import ExternalSource, SourceError  # noqa: E402
 from live_pose import GpuPose, SideloadPose, prefetch_model_store  # noqa: E402
 from motion import DescriptorWorker, RowAssembler  # noqa: E402
-from overlay import build_renderer  # noqa: E402
+from overlay import build_renderer, parse_renditions  # noqa: E402
 from relay_proxy import (RelayProxy, location_secret,  # noqa: E402
                          route as relay_route)
 from sinks import Capture, Poster  # noqa: E402
@@ -1068,7 +1068,12 @@ class Session:
         """The face view's decode: frames to the overlay, the face
         cadence's to its pose worker, its clock kept. On its own thread;
         ends with the session or the stream."""
-        picker = CadencePicker(FPS, self.face_pose_fps)
+        # The face cadence's slots on distinct frames: a phone uploading
+        # fewer than 30 fps arrives conformed to the grid with repeats,
+        # and a pick that lands on one moves to the next frame that
+        # differs (cadence.FreshPicker); each move is counted.
+        picker = FreshPicker(CadencePicker(FPS, self.face_pose_fps))
+        deferred = 0
         width = None
         try:
             for index, at_s, yuv in decoder.frames():
@@ -1080,7 +1085,11 @@ class Session:
                     width = yuv.shape[1]
                 if self.overlay is not None:
                     self.overlay.offer_face_frame(index, at_s, yuv)
-                if picker.take(index):
+                taken = picker.take(index, yuv)
+                if picker.deferred != deferred:
+                    deferred = picker.deferred
+                    self.telemetry.count("facePoseRepeatDeferred")
+                if taken:
                     with self.telemetry.time_stage("faceRgb"):
                         rgb = cv2.cvtColor(
                             yuv.reshape(-1, width), cv2.COLOR_YUV2RGB_I420)
@@ -1200,6 +1209,11 @@ class Session:
                                     daemon=True)
         observer.start()
         pending: dict[int, np.ndarray] = {}
+        # The pose cadence's slots on distinct frames (cadence.FreshPicker):
+        # a source slower than the grid repeats frames, and a pick that
+        # lands on a repeat moves to the next frame that differs.
+        fresh = FreshPicker(self.picker)
+        deferred = 0
         wall_start = time.monotonic()
         last_log = wall_start
         last_frame_wall = wall_start
@@ -1232,7 +1246,11 @@ class Session:
                 if len(pending) > PENDING_CAP:
                     pending.pop(min(pending))
                     self.telemetry.count("pendingEvicted")
-                if self.picker.take(index):
+                taken = fresh.take(index, yuv)
+                if fresh.deferred != deferred:
+                    deferred = fresh.deferred
+                    self.telemetry.count("poseRepeatDeferred")
+                if taken:
                     with self.telemetry.time_stage("rgb"):
                         rgb = cv2.cvtColor(
                             yuv.reshape(-1, width), cv2.COLOR_YUV2RGB_I420)
@@ -1731,7 +1749,9 @@ def build_server(args, telemetry: Telemetry,
                         getattr(args, "overlay_relay_api", "")
                         or "http://127.0.0.1:9997",
                         public_origin=tee.origin if tee is not None else "",
-                        rtsp_base=rtsp_base)
+                        rtsp_base=rtsp_base,
+                        renditions=parse_renditions(
+                            getattr(args, "overlay_renditions", "") or ""))
              if getattr(args, "overlay_publish", "") else None)
     # The external camera (external_source.py): TEE only, because the link
     # is a credential that must reach the enclave and nothing in front of
@@ -1922,11 +1942,14 @@ def build_server(args, telemetry: Telemetry,
             return info
 
         def _tee_answer(self, leg: str, code: int, headers, payload: bytes,
-                        session_id: str) -> tuple[int, list, bytes] | None:
+                        session_id: str, path: str | None = None,
+                        ) -> tuple[int, list, bytes] | None:
             """Dress a forwarded answer for the phone: the relay's own CORS
             replaced by ours, and on a 201 the signed DTLS fingerprint. An
             answer with no fingerprint is refused (and its relay session
-            closed) rather than handed over unvouched."""
+            closed) rather than handed over unvouched. The evidence binds
+            the leg, not the relay path: a rendition's answer is vouched
+            for the same way as the view's own."""
             kept = [(name, value) for name, value in headers
                     if not name.lower().startswith("access-control-")]
             kept.extend(self._cors())
@@ -1942,7 +1965,7 @@ def build_server(args, telemetry: Telemetry,
             if evidence is None:
                 telemetry.count("teeEvidenceMissingFingerprint")
                 if secret:
-                    relay.forward("DELETE", secret, {}, b"", leg=leg)
+                    relay.forward("DELETE", secret, {}, b"", leg=leg, path=path)
                 return 502, self._cors() + [("Content-Type", "application/json")], \
                     json.dumps({"error": "answer carries no DTLS fingerprint"}).encode()
             telemetry.count("teeEvidenceIssued")
@@ -2094,7 +2117,10 @@ def build_server(args, telemetry: Telemetry,
             if relay is None:
                 self._json(404, {"error": "overlay is not configured"})
                 return True
-            kind, secret = matched
+            # `path` is the relay path a WHEP request names: the view's
+            # own (`overlay`) or a rendition's (`overlay-half`, ...); the
+            # leg, the gate and the evidence are the same for all of them.
+            kind, secret, path = matched
             if kind == "source":
                 if external is None:
                     self._json(404, {"error": "an external camera needs a "
@@ -2139,16 +2165,18 @@ def build_server(args, telemetry: Telemetry,
             if (leg == "whep" and current["session"] is None
                     and self.command != "OPTIONS"):
                 self._json(503, {"error": "no session is running",
-                                 "whep": "/overlay/whep"}, self._cors())
+                                 "whep": "/overlay/whep",
+                                 "renditions": relay.rendition_paths()}, self._cors())
                 return True
             if tee is not None and self.command == "POST" and secret is None:
                 # One publisher and one subscriber per lease. Only the
                 # lease's holder gets this far, so whatever holds the leg is
                 # its own earlier session (a reload, a network change) and
                 # is kicked rather than left to lock it out until the
-                # relay's timeout.
+                # relay's timeout. Per relay path: a phone moving to
+                # another rendition keeps the one it has until it hangs up.
                 try:
-                    kicked = relay.evict(leg)
+                    kicked = relay.evict(leg, path)
                 except Exception as error:  # noqa: BLE001 - said aloud
                     print(f"tee: evicting the {leg} leg failed: {error!r}",
                           flush=True)
@@ -2162,10 +2190,10 @@ def build_server(args, telemetry: Telemetry,
             body = self.rfile.read(length) if length else b""
             code, headers, payload = relay.forward(
                 self.command, secret, self.headers, body,
-                client=self.client_address[0], leg=leg)
+                client=self.client_address[0], leg=leg, path=path)
             if tee is not None:
                 code, headers, payload = self._tee_answer(
-                    leg, code, headers, payload, session_id)
+                    leg, code, headers, payload, session_id, path)
             self.send_response(code)
             for name, value in headers:
                 self.send_header(name, value)
@@ -2567,6 +2595,16 @@ def build_parser() -> argparse.ArgumentParser:
                         help="also write the annotated view to overlay.mp4 "
                              "in the capture directory (uploaded with the "
                              "run). /produce takes overlay_record=1")
+    parser.add_argument("--overlay-renditions", default="hi",
+                        help="which encodings of the view the one encoder "
+                             "publishes, comma-separated from hi (the "
+                             "canvas at --overlay-fps and --overlay-bitrate, "
+                             "relay path overlay), half (canvas at 15 fps, "
+                             "3M, overlay-half), small (0.75x at 15 fps, "
+                             "1700k, overlay-small) and lean (0.75x at 15 "
+                             "fps, 850k, overlay-lean); a phone that cannot "
+                             "keep up steps down that list. hi is always "
+                             "published and the one recorded")
     parser.add_argument("--overlay-relay-webrtc",
                         default="http://127.0.0.1:8889",
                         help="the relay's WHEP endpoint, loopback")

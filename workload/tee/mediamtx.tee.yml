@@ -62,7 +62,13 @@ paths:
   # two, so the first picture is late by that much at most.
   cam:
     useAbsoluteTimestamp: yes
-  # The annotated view (RTSP in from the producer, WHEP out to the phone).
+  # The annotated view (RTSP in from the producer, WHEP out to the phone),
+  # in its four renditions (producer --overlay-renditions): the canvas at
+  # 30 fps, the canvas at 15 fps, and three quarters of it at 15 fps at
+  # two bit rates. The phone subscribes to one and moves between them.
   overlay: {}
+  overlay-half: {}
+  overlay-small: {}
+  overlay-lean: {}
   # `ext` (the external camera, RTSPS pulled in, RTSP out to the producer)
   # is added and removed at runtime by the producer; it is not listed here.

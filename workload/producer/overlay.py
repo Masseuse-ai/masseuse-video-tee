@@ -99,6 +99,74 @@ SIZE_RE = re.compile(r"^(\d{2,5})x(\d{2,5})$")
 DEFAULT_FPS = 30.0
 DEFAULT_BITRATE = "6M"
 
+
+@dataclass(frozen=True)
+class Rendition:
+    """One encoding of the annotated view (RENDITIONS).
+
+    `scale` is of the canvas; `fps` and `bitrate` None mean the canvas
+    cadence and the publisher's own bit rate (the `hi` rung, today's
+    view). `suffix` is appended to the relay path: `overlay-half`.
+    """
+
+    name: str
+    scale: float
+    fps: float | None
+    bitrate: str | None
+    suffix: str
+
+    def size(self, canvas: tuple[int, int]) -> tuple[int, int]:
+        """The rendition's frame size: the canvas scaled, each side rounded
+        to a multiple of 4 (yuv420 needs even; 4 keeps x264 happy)."""
+        if self.scale == 1.0:
+            return canvas
+        return tuple(max(4, int(round(side * self.scale / 4)) * 4)
+                     for side in canvas)
+
+    def rate(self, canvas_fps: float) -> float:
+        """The rendition's frame rate: its own, never above the canvas's."""
+        return canvas_fps if self.fps is None else min(self.fps, canvas_fps)
+
+    def bits(self, canvas_bitrate: str) -> str:
+        return canvas_bitrate if self.bitrate is None else self.bitrate
+
+    def path(self, base: str = "overlay") -> str:
+        """The relay path: the canvas's path with the suffix."""
+        return f"{base}{self.suffix}"
+
+
+# The renditions the view is published in, one encoder process for all
+# of them (OverlayPublisher.argv). In the order a phone that cannot keep
+# up steps down: frame rate first (`half`: every other frame, the same
+# 200 kbit a frame), then resolution (`small`: three quarters of the
+# canvas on each side, the same bits per pixel), then bits (`lean`: half
+# of those). The phone picks one by its relay path (relay_proxy.route),
+# the trainer's snapshot lists them (OverlayRenderer.snapshot), and the
+# recording, when asked for, is of `hi` only.
+RENDITIONS: dict[str, Rendition] = {
+    "hi": Rendition("hi", 1.0, None, None, ""),
+    "half": Rendition("half", 1.0, 15.0, "3M", "-half"),
+    "small": Rendition("small", 0.75, 15.0, "1700k", "-small"),
+    "lean": Rendition("lean", 0.75, 15.0, "850k", "-lean"),
+}
+# The frame rate of every rendition below `hi`, shared by one `fps` filter.
+RENDITION_FPS = 15.0
+DEFAULT_RENDITIONS = ("hi",)
+
+
+def parse_renditions(text: str | None) -> tuple[str, ...]:
+    """`--overlay-renditions hi,half,small,lean` as the tuple of names, in
+    RENDITIONS' order, `hi` always among them (it is the view's canvas
+    and the one recorded); empty or None is `hi` alone."""
+    names = {part.strip() for part in (text or "").split(",") if part.strip()}
+    unknown = names - set(RENDITIONS)
+    if unknown:
+        raise ValueError(f"unknown overlay rendition(s): {sorted(unknown)}; "
+                         f"known: {list(RENDITIONS)}")
+    names.add("hi")
+    return tuple(name for name in RENDITIONS if name in names)
+
+
 # The face inset: the phone's view drawn over the fixed camera's, in the
 # top-right corner, portrait 3:4 at this fraction of the canvas height,
 # this far from the edges, with a border.
@@ -577,6 +645,14 @@ class OverlayPublisher:
     respawned with backoff on the next write; frames offered while it is
     down are dropped and counted. `close` sends EOF and waits so a
     recording finalises.
+
+    With more `renditions` than `hi` (RENDITIONS) the one process encodes
+    each from the same frames through one filter graph - a `split`, one
+    `fps` for the slower rungs, one `scale` for the smaller ones - and
+    publishes each to its own relay path (`overlay-half`, ...), so the
+    renderer still writes one frame a tick and a crash is still one
+    respawn. About 2.1 cores for the four: 720p30 ~1.0, 720p15 ~0.5, two
+    540p15 ~0.3 each. The recording tee stays on `hi`.
     """
 
     BACKOFF_S = (1.0, 2.0, 4.0, 8.0, 10.0)
@@ -584,7 +660,8 @@ class OverlayPublisher:
     def __init__(self, url: str, size: tuple[int, int], fps: float,
                  encoder: str = "x264", bitrate: str = DEFAULT_BITRATE,
                  record_path: str | Path | None = None, telemetry=None,
-                 popen=subprocess.Popen, clock=time.monotonic):
+                 popen=subprocess.Popen, clock=time.monotonic,
+                 renditions: tuple[str, ...] = DEFAULT_RENDITIONS):
         self.url = url
         self.size = size
         self.fps = fps
@@ -594,6 +671,7 @@ class OverlayPublisher:
         self.telemetry = telemetry
         self.popen = popen
         self.clock = clock
+        self.renditions = parse_renditions(",".join(renditions))
         self.proc = None
         self.spawns = 0
         self.failures = 0
@@ -611,20 +689,58 @@ class OverlayPublisher:
         return self.record_path.with_name(
             f"{self.record_path.stem}.{self.spawns}{self.record_path.suffix}")
 
-    def argv(self) -> list[str]:
-        width, height = self.size
-        gop = max(1, int(round(self.fps * 2)))
-        argv = ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error",
-                "-f", "rawvideo", "-pixel_format", "bgr24",
-                "-video_size", f"{width}x{height}",
-                "-framerate", f"{self.fps:g}", "-i", "pipe:0", "-an"]
+    def rendition_url(self, name: str) -> str:
+        """Where a rendition is published: the canvas URL with the suffix."""
+        return self.url + RENDITIONS[name].suffix
+
+    def rendition_table(self) -> list[dict]:
+        """The renditions as the status and the trainer's snapshot list
+        them: name, size, fps, bitrate and the relay path the phone dials
+        (`overlay-half`, from the publish URL's last segment)."""
+        base = self.url.rstrip("/").rsplit("/", 1)[-1] or "overlay"
+        table = []
+        for name in self.renditions:
+            rendition = RENDITIONS[name]
+            width, height = rendition.size(self.size)
+            table.append({"name": name, "size": f"{width}x{height}",
+                          "fps": rendition.rate(self.fps),
+                          "bitrate": rendition.bits(self.bitrate),
+                          "path": rendition.path(base)})
+        return table
+
+    def filter_graph(self) -> str:
+        """The `-filter_complex` that feeds every rendition from the one
+        input: `[0:v]split=2[hi][rest];[rest]fps=15,split=2[half][sm];
+        [sm]scale=W:H:flags=area,split=2[small][lean]` for all four,
+        the same graph with the unused branches left out for fewer."""
+        slower = [name for name in self.renditions if name != "hi"]
+        if not slower:
+            return "[0:v]null[hi]"
+        graph = ["[0:v]split=2[hi][rest]"]
+        smaller = [name for name in slower if RENDITIONS[name].scale != 1.0]
+        full = [name for name in slower if RENDITIONS[name].scale == 1.0]
+        outs = [f"[{name}]" for name in full] + (["[sm]"] if smaller else [])
+        graph.append(f"[rest]fps={RENDITION_FPS:g}"
+                     + (f",split={len(outs)}" if len(outs) > 1 else "")
+                     + "".join(outs))
+        if smaller:
+            width, height = RENDITIONS[smaller[0]].size(self.size)
+            outs = [f"[{name}]" for name in smaller]
+            graph.append(f"[sm]scale={width}:{height}:flags=area"
+                         + (f",split={len(outs)}" if len(outs) > 1 else "")
+                         + "".join(outs))
+        return ";".join(graph)
+
+    def _codec(self, gop: int, bitrate: str) -> list[str]:
+        """One output's encoder block: the codec, its keyframe interval and
+        its CBR bit rate."""
         if self.encoder == "nvenc":
-            argv += ["-c:v", "h264_nvenc", "-preset", "p1", "-tune", "ll",
-                     "-zerolatency", "1", "-rc", "cbr"]
+            argv = ["-c:v", "h264_nvenc", "-preset", "p1", "-tune", "ll",
+                    "-zerolatency", "1", "-rc", "cbr"]
         else:
-            argv += ["-c:v", "libx264", "-preset", "ultrafast",
-                     "-tune", "zerolatency", "-x264-params",
-                     f"keyint={gop}:min-keyint={gop}:scenecut=0:repeat-headers=1"]
+            argv = ["-c:v", "libx264", "-preset", "ultrafast",
+                    "-tune", "zerolatency", "-x264-params",
+                    f"keyint={gop}:min-keyint={gop}:scenecut=0:repeat-headers=1"]
         # global_header is load-bearing for the recording: without extradata
         # the mp4 muxer writes Annex-B samples into an avc1 track and the
         # file is unreadable (seen 2026-09-04). The RTSP side still carries
@@ -632,17 +748,42 @@ class OverlayPublisher:
         # packets fit the relay's WebRTC MTU without remuxing.
         argv += ["-profile:v", "baseline", "-pix_fmt", "yuv420p",
                  "-g", str(gop), "-bf", "0", "-flags", "+global_header",
-                 "-b:v", self.bitrate, "-maxrate", self.bitrate,
-                 "-bufsize", self.bitrate]
-        record = self.record_file()
+                 "-b:v", bitrate, "-maxrate", bitrate, "-bufsize", bitrate]
+        return argv
+
+    def _sink(self, url: str, record: Path | None, mapping: list[str]) -> list[str]:
+        """One output's muxer: RTSP to the relay, or a tee of that and the
+        mp4 recording."""
         if record is None:
-            argv += ["-f", "rtsp", "-rtsp_transport", "tcp",
-                     "-pkt_size", "1200", self.url]
-        else:
-            argv += ["-f", "tee", "-map", "0:v",
-                     f"[f=rtsp:rtsp_transport=tcp:pkt_size=1200]{self.url}|"
-                     f"[f=mp4:movflags=+frag_keyframe+empty_moov+default_base_moof"
-                     f":onfail=ignore]{record}"]
+            return mapping + ["-f", "rtsp", "-rtsp_transport", "tcp",
+                              "-pkt_size", "1200", url]
+        return ["-f", "tee"] + mapping + [
+            f"[f=rtsp:rtsp_transport=tcp:pkt_size=1200]{url}|"
+            f"[f=mp4:movflags=+frag_keyframe+empty_moov+default_base_moof"
+            f":onfail=ignore]{record}"]
+
+    def argv(self) -> list[str]:
+        width, height = self.size
+        gop = max(1, int(round(self.fps * 2)))
+        argv = ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error",
+                "-f", "rawvideo", "-pixel_format", "bgr24",
+                "-video_size", f"{width}x{height}",
+                "-framerate", f"{self.fps:g}", "-i", "pipe:0", "-an"]
+        record = self.record_file()
+        if self.renditions == ("hi",):
+            # Today's command, unchanged: the encoder straight off the input.
+            argv += self._codec(gop, self.bitrate)
+            argv += self._sink(self.url, record, ["-map", "0:v"] if record else [])
+            return argv
+        argv += ["-filter_complex", self.filter_graph()]
+        for name in self.renditions:
+            rendition = RENDITIONS[name]
+            rate = rendition.rate(self.fps)
+            argv += self._codec(max(1, int(round(rate * 2))),
+                                rendition.bits(self.bitrate))
+            argv += self._sink(self.rendition_url(name),
+                               record if name == "hi" else None,
+                               ["-map", f"[{name}]"])
         return argv
 
     # -- the process --------------------------------------------------------
@@ -1048,6 +1189,9 @@ class OverlayRenderer(threading.Thread):
             "publisherSpawns": self.publisher.spawns,
             "recordPath": (str(self.publisher.record_path)
                            if self.publisher.record_path else None),
+            # Every encoding of the view the relay carries, the phone's to
+            # pick from by `path` (relay_proxy.route): `hi` is this canvas.
+            "renditions": self.publisher.rendition_table(),
             "framesStored": stored,
             "detections": detections,
             "lastState": self._last_state,
@@ -1096,7 +1240,8 @@ def build_renderer(args, telemetry, source_fps: float = 30.0,
     publisher = OverlayPublisher(
         url, size, fps, encoder=encoder,
         bitrate=getattr(args, "overlay_bitrate", DEFAULT_BITRATE) or DEFAULT_BITRATE,
-        record_path=record_path, telemetry=telemetry)
+        record_path=record_path, telemetry=telemetry,
+        renditions=parse_renditions(getattr(args, "overlay_renditions", "") or ""))
     return OverlayRenderer(
         publisher, telemetry, size=size, fps=fps,
         delay_s=float(getattr(args, "overlay_delay_s", 1.0) or 1.0),

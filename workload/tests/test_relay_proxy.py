@@ -37,6 +37,8 @@ from relay_proxy import RelayProxy, own_location, route  # noqa: E402
 from telemetry import Telemetry  # noqa: E402
 
 WHIP_SECRET = "7d1e4c2a-aaaa-bbbb-cccc-ddddeeeeffff"
+OVERLAY_PATH_NAMES = ("overlay", "overlay-half", "overlay-small", "overlay-lean")
+OVERLAY_WHEP_PATHS = tuple(f"/{name}/whep" for name in OVERLAY_PATH_NAMES)
 
 
 class StubRelay(ThreadingHTTPServer):
@@ -126,7 +128,7 @@ class StubHandler(BaseHTTPRequestHandler):
                 "Accept-Patch": "application/trickle-ice-sdpfrag",
                 "Link": '<turn:turn.example:3478>; rel="ice-server"',
             }, b"v=0\r\nwhip-answer-for:" + body)
-        if self.path != "/overlay/whep":
+        if self.path not in OVERLAY_WHEP_PATHS:
             return self._reply(404, {}, b'{"error":"not found"}')
         if self.headers.get("Content-Type") != "application/sdp":
             return self._reply(400, {"Content-Type": "application/json"},
@@ -134,9 +136,11 @@ class StubHandler(BaseHTTPRequestHandler):
         if not self.server.path_ready:
             return self._reply(404, {"Content-Type": "application/json"},
                                b'{"error":"path is not ready"}')
+        # The Location in the relay's own namespace for the path dialled
+        # (a rendition's answers under its path), as MediaMTX shapes it.
         self._reply(201, {
             "Content-Type": "application/sdp",
-            "Location": "/overlay/whep/0f8b2c1e-1111-2222-3333-444455556666",
+            "Location": f"{self.path}/0f8b2c1e-1111-2222-3333-444455556666",
             "ETag": "*", "ID": "abc",
             "Link": '<stun:stun.example:3478>; rel="ice-server"',
             "Access-Control-Expose-Headers": "ETag, ID, Accept-Patch, Link, Location",
@@ -177,14 +181,18 @@ class StubHandler(BaseHTTPRequestHandler):
                 "bytesReceived": 1 << 20,
                 "source": {"type": "rtspSource", "id": "ext-1"}, "readers": [],
             }).encode())
-        if self.path == "/v3/paths/get/overlay":
-            if not self.server.path_ready:
+        if self.path.startswith("/v3/paths/get/overlay"):
+            name = self.path[len("/v3/paths/get/"):]
+            if not self.server.path_ready or name not in OVERLAY_PATH_NAMES:
                 return self._reply(404, {"Content-Type": "application/json"},
                                    b'{"error":"path not found"}')
+            # Each rendition path has its own reader: r1 on the view's own
+            # path, r1-half on overlay-half, and so on.
+            reader = "r1" if name == "overlay" else "r1" + name[len("overlay"):]
             return self._reply(200, {"Content-Type": "application/json"}, json.dumps({
-                "name": "overlay", "ready": True, "tracks": ["H264"],
+                "name": name, "ready": True, "tracks": ["H264"],
                 "bytesReceived": 4096, "source": {"type": "rtspSession", "id": "x"},
-                "readers": [{"type": "webRTCSession", "id": "r1"}],
+                "readers": [{"type": "webRTCSession", "id": reader}],
             }).encode())
         if self.path == "/v3/paths/get/cam":
             if not self.server.cam_ready:
@@ -202,15 +210,17 @@ class StubHandler(BaseHTTPRequestHandler):
 
 
 def test_route_recognises_the_seven_shapes_and_nothing_else():
-    assert route("/overlay/status") == ("status", None)
-    assert route("/overlay/whep") == ("whep", None)
+    assert route("/overlay/status") == ("status", None, None)
+    assert route("/overlay/whep") == ("whep", None, "overlay")
     assert route("/overlay/whep/0f8b2c1e-1111-2222-3333-444455556666") == (
-        "whep", "0f8b2c1e-1111-2222-3333-444455556666")
-    assert route("/ingest/status") == ("ingest-status", None)
-    assert route("/ingest/whip") == ("whip", None)
-    assert route(f"/ingest/whip/{WHIP_SECRET}") == ("whip", WHIP_SECRET)
-    assert route("/ingest/source") == ("source", None)
-    assert route("/ingest/view") == ("view", None)
+        "whep", "0f8b2c1e-1111-2222-3333-444455556666", "overlay")
+    assert route("/ingest/status") == ("ingest-status", None, None)
+    assert route("/ingest/whip") == ("whip", None, None)
+    assert route(f"/ingest/whip/{WHIP_SECRET}") == ("whip", WHIP_SECRET, None)
+    assert route("/ingest/source") == ("source", None, None)
+    assert route("/ingest/view") == ("view", None, None)
+    matched = route("/overlay/whep")
+    assert matched.kind == "whep" and matched.secret is None and matched.path == "overlay"
     for bad in ("/overlay", "/overlay/", "/overlay/whep/", "/overlay/whep/a/b",
                 "/overlay/whep/../other", "/overlay/whep/with space",
                 "/overlay/whip", "/other/whep", "/overlay/whep/" + "x" * 65,
@@ -219,6 +229,31 @@ def test_route_recognises_the_seven_shapes_and_nothing_else():
                 "/ingest/source/", "/ingest/source/x", "/overlay/source",
                 "/ingest/view/", "/ingest/view/x", "/overlay/view"):
         assert route(bad) is None, bad
+
+
+def test_route_knows_each_rendition_path_and_no_other():
+    """The view's renditions (overlay.RENDITIONS) are their own relay
+    paths: the route carries which, with the same secret shapes; a path
+    that is not one of them is nobody's."""
+    for name in ("half", "small", "lean"):
+        assert route(f"/overlay-{name}/whep") == ("whep", None, f"overlay-{name}")
+        assert route(f"/overlay-{name}/whep/{WHIP_SECRET}") == (
+            "whep", WHIP_SECRET, f"overlay-{name}")
+        assert route(f"/overlay-{name}/whep/") is None
+        assert route(f"/overlay-{name}/status") is None
+        assert route(f"/overlay-{name}/whip") is None
+    for bad in ("/overlay-huge/whep", "/overlay-/whep", "/overlay-hi/whep",
+                "/overlayhalf/whep", "/overlay-half", "/overlay-half/"):
+        assert route(bad) is None, bad
+    # The names and suffixes are the overlay module's, kept in step.
+    import overlay
+    from relay_proxy import RENDITION_SUFFIXES, rendition_whep_paths
+    assert RENDITION_SUFFIXES == {name: r.suffix for name, r in overlay.RENDITIONS.items()}
+    assert rendition_whep_paths() == {
+        "hi": "/overlay/whep", "half": "/overlay-half/whep",
+        "small": "/overlay-small/whep", "lean": "/overlay-lean/whep"}
+    assert rendition_whep_paths(("hi", "small")) == {
+        "hi": "/overlay/whep", "small": "/overlay-small/whep"}
 
 
 def test_own_location_brings_every_relay_shape_into_the_proxy_namespace():
@@ -235,6 +270,14 @@ def test_own_location_brings_every_relay_shape_into_the_proxy_namespace():
     # Anything else is left alone rather than guessed at.
     assert own_location("/somewhere/else", "whip") == "/somewhere/else"
     assert own_location("", "whip") == ""
+    # A rendition's answers live under its own path, whatever the relay
+    # said, absolute on the slot's origin when given one.
+    assert own_location("abc-123", "whep", path="overlay-half") == "/overlay-half/whep/abc-123"
+    assert own_location("/overlay-small/whep/abc", "whep", path="overlay-small") == (
+        "/overlay-small/whep/abc")
+    assert own_location("/overlay/whep/abc", "whep", "https://slot", "overlay-lean") == (
+        "https://slot/overlay-lean/whep/abc")
+    assert own_location(WHIP_SECRET, "whip", path="overlay-half") == f"/ingest/whip/{WHIP_SECRET}"
 
 
 def test_whep_post_is_forwarded_and_the_answer_comes_back_verbatim():
@@ -260,6 +303,49 @@ def test_whep_post_is_forwarded_and_the_answer_comes_back_verbatim():
         assert seen["headers"]["X-Forwarded-For"] == "203.0.113.9"
         assert "Authorization" not in seen["headers"]  # IAM's, not the relay's
         assert "X-Custom" not in seen["headers"]
+    finally:
+        relay.stop()
+
+
+def test_a_rendition_is_forwarded_to_its_own_path_and_evicted_by_it():
+    """/overlay-half/whep goes to the relay's overlay-half path, its
+    Location comes back under /overlay-half/whep/, and evicting that
+    path's reader leaves the view's own reader (and the other renditions')
+    alone: a phone opens the next rendition before it closes the one it
+    has, so the picture never gaps."""
+    relay = StubRelay()
+    try:
+        proxy = RelayProxy(relay.base, relay.base,
+                           renditions=("hi", "half", "small", "lean"))
+        code, headers, body = proxy.forward(
+            "POST", None, {"Content-Type": "application/sdp"}, b"v=0\r\noffer",
+            path="overlay-half")
+        assert code == 201 and body == b"v=0\r\nanswer-for:v=0\r\noffer"
+        assert relay.requests[-1]["path"] == "/overlay-half/whep"
+        assert dict(headers)["Location"] == "/overlay-half/whep/0f8b2c1e-1111-2222-3333-444455556666"
+        secret = "0f8b2c1e-1111-2222-3333-444455556666"
+        code, _, _ = proxy.forward("PATCH", secret, {"Content-Type": "application/trickle-ice-sdpfrag"},
+                                   b"a=candidate", path="overlay-half")
+        assert code == 204 and relay.requests[-1]["path"] == f"/overlay-half/whep/{secret}"
+        assert proxy.forward("DELETE", secret, {}, b"", path="overlay-lean")[0] == 200
+        assert relay.requests[-1]["path"] == f"/overlay-lean/whep/{secret}"
+        # Without a path the view's own, as before.
+        proxy.forward("POST", None, {"Content-Type": "application/sdp"}, b"v=0")
+        assert relay.requests[-1]["path"] == "/overlay/whep"
+        # Sessions and eviction are per path.
+        assert proxy.webrtc_sessions("whep") == ["r1"]
+        assert proxy.webrtc_sessions("whep", "overlay-half") == ["r1-half"]
+        assert proxy.webrtc_sessions("whep", "overlay-lean") == ["r1-lean"]
+        assert proxy.evict("whep", "overlay-small") == 1
+        assert relay.kicks == ["r1-small"]
+        assert proxy.evict("whep") == 1
+        assert relay.kicks == ["r1-small", "r1"]
+        # Where each is dialled.
+        assert proxy.rendition_paths() == {
+            "hi": "/overlay/whep", "half": "/overlay-half/whep",
+            "small": "/overlay-small/whep", "lean": "/overlay-lean/whep"}
+        assert RelayProxy(relay.base, relay.base).rendition_paths() == {"hi": "/overlay/whep"}
+        assert RelayProxy(relay.base, relay.base, renditions=("lean", "hi")).renditions == ("hi", "lean")
     finally:
         relay.stop()
 
@@ -377,17 +463,19 @@ class FakeOverlay:
 def test_status_says_not_yet_without_a_session_and_reports_with_one():
     relay = StubRelay()
     try:
-        proxy = RelayProxy(relay.base, relay.base)
+        proxy = RelayProxy(relay.base, relay.base, renditions=("hi", "half"))
         code, body = proxy.status(None)
         assert code == 503 and body["publishing"] is False
         assert body["relay"]["ready"] is True and body["relay"]["readers"] == 1
         assert body["whep"] == "/overlay/whep"
+        assert body["renditions"] == {"hi": "/overlay/whep", "half": "/overlay-half/whep"}
         session = argparse.Namespace(overlay=FakeOverlay(), run_name="session-1")
         code, body = proxy.status(session)
         assert code == 200
         assert body["session"] == "session-1" and body["publishing"] is True
         assert body["overlay"] == {"lastState": "exact"}
         assert body["relay"]["tracks"] == ["H264"]
+        assert body["renditions"] == {"hi": "/overlay/whep", "half": "/overlay-half/whep"}
         code, body = proxy.status(argparse.Namespace(overlay=None, run_name=""))
         assert code == 503 and body["error"] == "session has no overlay"
     finally:
@@ -451,10 +539,15 @@ def test_the_handler_proxies_whep_when_a_session_is_up_and_refuses_before():
     thread.start()
     try:
         port = server.server_address[1]
-        # Before the session: a clear 503, not the relay's 404.
+        # Before the session: a clear 503, not the relay's 404, naming
+        # where each rendition will be (hi alone: the default flag).
         code, _, body = request(port, "POST", "/overlay/whep", b"v=0",
                                 {"Content-Type": "application/sdp"})
         assert code == 503 and json.loads(body)["whep"] == "/overlay/whep"
+        assert json.loads(body)["renditions"] == {"hi": "/overlay/whep"}
+        code, _, body = request(port, "POST", "/overlay-half/whep", b"v=0",
+                                {"Content-Type": "application/sdp"})
+        assert code == 503
         code, _, body = request(port, "GET", "/overlay/status")
         assert code == 503 and json.loads(body)["relay"]["ready"] is True
         # Preflight works regardless (the subscriber's backend may probe).
@@ -477,6 +570,15 @@ def test_the_handler_proxies_whep_when_a_session_is_up_and_refuses_before():
         assert request(port, "PUT", location)[0] == 405
         assert request(port, "POST", "/overlay/whep", b"x" * (64 * 1024 + 1),
                        {"Content-Type": "application/sdp"})[0] == 413
+        # A rendition's path goes through the same handler to its own relay
+        # path, its Location under that path.
+        code, headers, body = request(port, "POST", "/overlay-small/whep", b"v=0\r\noffer",
+                                      {"Content-Type": "application/sdp"})
+        assert code == 201 and body.startswith(b"v=0\r\nanswer-for:")
+        assert headers["Location"].startswith("/overlay-small/whep/")
+        assert relay.requests[-1]["path"] == "/overlay-small/whep"
+        assert request(port, "DELETE", headers["Location"])[0] == 200
+        assert relay.requests[-1]["path"].startswith("/overlay-small/whep/")
         code, _, body = request(port, "GET", "/overlay/status")
         assert code == 200 and json.loads(body)["session"] == "session-live"
         code, _, body = request(port, "GET", "/statz")

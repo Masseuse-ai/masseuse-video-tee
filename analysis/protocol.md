@@ -54,7 +54,12 @@ not cross it.
   the decode grid's slots nearest each ideal instant (at 9 of 30 fps, the
   frames 0, 3, 7, 10, 13, 17, ...: a 3-4-3 pattern of frame gaps, nine
   per thirty frames), so consecutive `pose` rows are three or four frames
-  apart, not a fixed stride.
+  apart, not a fixed stride. A source slower than the grid arrives with
+  repeated frames, and a slot that lands on a repeat of the frame last
+  posed is posed on the next frame that differs instead, so a row may
+  carry the frame one or two after its slot (its `frame` and `atS` are
+  that frame's); a source whose picture stops changing keeps the cadence
+  with repeats after one slot's wait. Rows stay in frame order either way.
 - `postIntervalS`: how often the analysis is expected to emit a `post`.
 - `run`: the operator's name for a captured test session, or `null` in
   production.

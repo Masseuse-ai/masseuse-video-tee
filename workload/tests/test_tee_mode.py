@@ -163,6 +163,7 @@ class Slot:
                                    log=lambda *a, **k: None))
         self.server = producer.build_server(
             server_args(overlay_publish="rtsp://127.0.0.1:8554/overlay",
+                        overlay_renditions="hi,half,small,lean",
                         overlay_relay_webrtc=self.relay.base,
                         overlay_relay_api=self.relay.base),
             Telemetry(), tee=self.tee, external=self.external)
@@ -514,6 +515,36 @@ def test_lease_then_whip_with_the_capability_yields_signed_evidence():
         # was kicked before this offer went through, one subscriber per lease.
         assert slot.relay.kicks == ["cam-1", "r1"]
 
+        # A rendition of the view: the same capability and gate, the
+        # relay's overlay-half path, a Location under /overlay-half/whep/,
+        # evidence for the whep leg (the phone verifies it as it does the
+        # view's own), and only that path's reader evicted: the reader of
+        # the view the phone is moving away from lives on until it hangs
+        # up, so the picture never gaps.
+        code, headers, body = slot.request(
+            "POST", "/overlay-half/whep", OFFER,
+            {"Content-Type": "application/sdp", "Authorization": f"Bearer {cap}",
+             "X-Masseuse-Client-Nonce": "phone-nonce-0003"})
+        assert code == 201 and body.startswith(b"v=0\r\nanswer-for:")
+        assert headers["Location"].startswith(f"https://{HOST}/overlay-half/whep/")
+        assert slot.relay.requests[-1]["path"] == "/overlay-half/whep"
+        payload = tee_mode.verify_evidence(slot.tee.evidence.public_bytes,
+                                           headers["X-Masseuse-Evidence"])
+        assert payload["role"] == "whep" and payload["clientNonce"] == "phone-nonce-0003"
+        assert payload["fingerprint"] == tee_mode.parse_fingerprint(body)
+        assert slot.relay.kicks == ["cam-1", "r1", "r1-half"]
+        half = headers["Location"][len(f"https://{HOST}"):]
+        assert slot.request("DELETE", half, headers={"Authorization": f"Bearer {cap}"})[0] == 200
+        assert slot.relay.requests[-1]["path"].startswith("/overlay-half/whep/")
+        # Without the capability a rendition is as closed as the view.
+        assert slot.request("POST", "/overlay-lean/whep", OFFER,
+                            {"Content-Type": "application/sdp"})[0] == 401
+        # The status names every rendition's route.
+        code, _, body = slot.as_trainer("GET", "/overlay/status")
+        assert code == 200 and json.loads(body)["renditions"] == {
+            "hi": "/overlay/whep", "half": "/overlay-half/whep",
+            "small": "/overlay-small/whep", "lean": "/overlay-lean/whep"}
+
         # /stop clears the lease; the capability is dead.
         slot.server.current["session"] = None
         slot.as_trainer("POST", "/stop")  # 404: nothing running, lease untouched
@@ -526,9 +557,9 @@ def test_lease_then_whip_with_the_capability_yields_signed_evidence():
                              "Authorization": f"Bearer {cap}"})[0] == 401
         code, _, body = slot.as_trainer("GET", "/statz")
         counters = json.loads(body)["counters"]
-        assert counters["teeEvidenceIssued"] == 3
-        assert counters["teeLegEvicted"] == 2
-        assert counters["teeCapabilityRejects"] >= 4
+        assert counters["teeEvidenceIssued"] == 4
+        assert counters["teeLegEvicted"] == 3
+        assert counters["teeCapabilityRejects"] >= 5
 
 
 def test_lease_validation_and_stop_clearing():
