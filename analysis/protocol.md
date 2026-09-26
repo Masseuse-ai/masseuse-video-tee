@@ -373,15 +373,24 @@ Only when `hello` carried `faceFrameIntervalS`, from bundle 2026.09.25-6.
 ```
 
 A frame for the user's own display: the channel values the reading's
-`face` object carries (the same names, the same units, read from the
-same smoothed rows), sent between readings so the display can follow the
-face at the face rows' pace rather than once a second. `body.atS` is the
-newest face row's clock; `present` whether a face was on it and the rows
-are fresh; `confidence` the model's on that row; `baselineReady` whether
-the first-minute baseline the channels are measured against is in; and
-`channels` the twenty-seven channel values the display reads (the
-contract's rig channels and five more), or `null` before the baseline or
-while no face is present. Nothing else of the reading's `face` object is
+`face` object carries (the same names, read from the same smoothed rows),
+sent between readings so the display can follow the face at the face
+rows' pace rather than once a second. `body.atS` is the newest face row's
+clock; `present` whether a face is in view (from 2026.09.26-1, one placed
+within a second of the newest row: a row dropped under load or one the
+fit could not place is not the face gone; in 2026.09.25-6 it was whether
+the very last row was placed); `confidence` the model's on that row;
+`baselineReady` whether the first-minute baseline the channels are
+measured against is in; and `channels` the twenty-seven channel values
+the display reads (the contract's rig channels and five more), or `null`
+before the baseline or while no face is present. From 2026.09.26-1 the
+frame's unit channels are on the display's scale, 100 at a full movement
+in inner-canthal units (the `face` constants' `wire.displayRange`), where
+the reading's `channels` are a detector's, 100 at three robust units of
+the baseline minute's own jitter; the reading's `face` object carries the
+same twenty-seven on the display's scale as `wire` from that bundle, so a
+reading agrees with the frames around it, and `present` follows the same
+rule. Nothing else of the reading's `face` object is
 in it: no aggregate, clock, region, witness or hazard, and, like every
 message on this socket, no keypoint. The producer treats `body` as opaque
 JSON and sends it to the trainer alone, at the readings' URL with the last
