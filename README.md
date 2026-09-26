@@ -129,7 +129,7 @@ check that should hold and does not.
 
 | Path | What |
 | --- | --- |
-| `workload/pixel/` | Everything that reads frames: decode geometry and stream handling (`live_pose.py`), RT-DETRv4 person detection (`vendor/rtdetrv4/`, `pose_track.py`), Sapiens2-1B keypoints (`pose_rows.py`, `keypoints.py`), regional motion descriptors (`motion.py`) |
+| `workload/pixel/` | Everything that reads frames: decode geometry and stream handling (`live_pose.py`), RT-DETRv4 person detection (`vendor/rtdetrv4/`, `pose_track.py`), Sapiens2-1B keypoints (`pose_post.py`, `pose_rows.py`, `keypoints.py`), the captured CUDA graphs both forwards replay (`gpu_graph.py`), regional motion descriptors (`motion.py`) |
 | `workload/audio/` | Everything that reads sound: the audio track decoded to 16 kHz PCM (`audio_stage.py`), the CED non-speech vocalization classifier binding (`ced.py`; the library and weights are built into the image, `Dockerfile.tee`), level and pitch (`pitch.py`, `audio_features.py`) |
 | `workload/producer/` | The session shell (`producer.py`), the overlay drawn back to the phone, the WHIP/WHEP relay proxy with the capability and evidence checks, the external-camera and connector ingest, the enclave's boot helpers (attestation, ACME, weights and analysis bundle fetch), the socket client to the analysis module |
 | `workload/tee/` | The image: `Dockerfile` (base: Python, torch, ffmpeg), `Dockerfile.tee` (MediaMTX, Caddy, the connector gateway, the launch policy), `entrypoint.sh`, `Caddyfile`, `mediamtx.tee.yml` |

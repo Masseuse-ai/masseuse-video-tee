@@ -109,8 +109,12 @@ RUN /venv/bin/pip check > /tmp/pip-check.txt || true; \
     fi; rm -f /tmp/pip-check.txt
 
 # opencv headless because there is no display anywhere near this.
+# transformers is pinned: pixel/pose_post.py builds the pose graph's
+# post-processing from the Sapiens2 image processor's own functions, and
+# the processor's on-device crop is the pose preprocessing, so the version
+# the tests ran against is the version the enclave runs.
 RUN /venv/bin/pip install --no-cache-dir \
-        transformers pillow opencv-python-headless numpy \
+        transformers==5.17.0 pillow opencv-python-headless numpy \
         pyyaml scipy google-cloud-storage
 
 WORKDIR /app

@@ -163,6 +163,7 @@ ENV HF_HOME=/models/hf-bf16 \
     POSE_DETECT_STRIDE=3 \
     POSE_QUEUE_DEPTH=4 \
     POSE_FLIP_TTA=0 \
+    POSE_CUDA_GRAPHS=1 \
     POSE_PREFETCH=0
 # The audio classifier (workload/audio/ced.py), as the `ced` stage left it.
 ENV CED_LIBRARY_PATH=/opt/ced/libced.so \

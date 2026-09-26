@@ -396,7 +396,22 @@ class GpuPose:
                         Default 0: half
                         the inference buys the margin, and the keypoint
                         delta is bounded by the file-mode equivalence gate.
+      POSE_CUDA_GRAPHS=0  run the forwards eagerly instead of as captured
+                        CUDA graphs (gpu_graph). Debugging only: eager is
+                        launch-bound on a Confidential Computing GPU.
+
+    Each frame is uploaded once as a CHW uint8 tensor; the detector's
+    resize, the pose crop, both forwards and their post-processing run on
+    the device, and each model hands back one small tensor. At boot the
+    captured graphs are checked against their eager twins on a synthetic
+    frame (`check_parity`): a model whose graph disagrees runs eagerly.
     """
+
+    # The graph's keypoints may differ from the eager forward's by this much
+    # (image pixels, and score) before the graph is distrusted. bf16 kernels
+    # replayed are the same kernels; anything beyond rounding is a fault.
+    PARITY_PX = 0.5
+    PARITY_SCORE = 0.01
 
     def __init__(self, device: str = "cuda", model: str | None = None,
                  flip: bool | None = None, telemetry=None):
@@ -432,8 +447,6 @@ class GpuPose:
             self.tracker.scenery = []
 
     def boot(self) -> None:
-        from PIL import Image  # noqa: F401 - fail here, not mid-stream
-
         prefetch_model_store(self.telemetry)
         started = time.monotonic()
         import pose_track
@@ -444,10 +457,12 @@ class GpuPose:
         # this boot); everything up to here needed none of them.
         wait_for_model_store(self.telemetry)
         started = time.monotonic()
-        self._autocast_dtype = torch.bfloat16
+        # bf16 weights for Sapiens2, bf16 autocast for both forwards: the
+        # production numeric context, which the tracker applies itself so the
+        # captured graphs and their eager twins run the same kernels.
         self.tracker = pose_track.Tracker(
             self.device, self.model or pose_track.POSE_MODEL, self.flip,
-            dtype=torch.bfloat16)
+            dtype=torch.bfloat16, autocast_dtype=torch.bfloat16)
         if self.telemetry:
             self.telemetry.boot_phase("weights", started)
             backend = getattr(self.tracker, "detector_backend", None)
@@ -455,15 +470,114 @@ class GpuPose:
             for name, seconds in timings.items():
                 self.telemetry.boot_seconds(name, seconds)
         started = time.monotonic()
-        blank = Image.fromarray(np.zeros((256, 256, 3), np.uint8))
-        # Use the production numeric context for warmup too. RT-DETRv4's
-        # decoder derives FP32 reference points at runtime; BF16 weights rely
-        # on autocast to reconcile those just as they do on every live frame.
-        with self._autocast():
-            self.tracker.detect(blank)
+        # Warm up, capture both graphs (each falls back to eager on its own),
+        # then the first inference through the captured path against the
+        # eager twin on a synthetic frame.
+        self.tracker.capture(self.telemetry)
+        self.check_parity()
         if self.telemetry:
             self.telemetry.boot_phase("firstInference", started)
         self._log_gpu()
+
+    @staticmethod
+    def parity_frame(device: str, size: tuple[int, int] = (360, 640)):
+        """A synthetic CHW uint8 frame with some structure - a colour
+        gradient and a brighter block - so the detector's top queries and
+        the pose heatmaps are not degenerate. What it shows does not matter;
+        both paths see the identical tensor."""
+        import torch
+
+        height, width = size
+        rows = torch.linspace(0, 255, height).view(height, 1).expand(height, width)
+        cols = torch.linspace(0, 255, width).view(1, width).expand(height, width)
+        frame = torch.stack([rows, cols, (rows + cols) / 2]).round().to(torch.uint8)
+        frame[:, height // 4: 3 * height // 4, width // 3: 2 * width // 3] = 200
+        return frame.to(device)
+
+    def check_parity(self) -> dict[str, float]:
+        """Each captured graph against its eager twin on one synthetic frame.
+
+        Replaying the same kernels over the same input must reproduce the
+        eager result to rounding; a graph that does not (a stale buffer, a
+        mis-wired static input) is put back to eager for that model, counted
+        as `graphParityFailed`, and the slot serves at the old speed rather
+        than with wrong keypoints. The deltas are printed and reported as
+        gauges so a debug slot's log and the readings show which path runs.
+        """
+        import gpu_graph
+        import torch
+
+        tracker = self.tracker
+        detector = tracker.detector_backend
+        frame = self.parity_frame(self.device)
+        height, width = frame.shape[-2:]
+        box = [width / 3, height / 4, width / 3, height / 2]
+        report: dict[str, float] = {}
+
+        def demote(name: str) -> None:
+            if self.telemetry:
+                self.telemetry.count("graphParityFailed")
+            print(f"{name}: graph disagrees with eager, running eagerly",
+                  flush=True)
+
+        pixels = detector.pixels(frame)
+        if detector.graph.graphed:
+            graphed = detector.graph.replay(pixels).clone()
+            eager = detector.forward(pixels)
+            # Top queries are rows in score order; two with near-equal
+            # scores may swap between runs, so the boxes (with the label as
+            # a coordinate a mismatch cannot hide in) are matched nearest
+            # to nearest and the scores compared sorted.
+            scale = torch.tensor(
+                [width, height, width, height, max(width, height)],
+                dtype=torch.float32, device=graphed.device)
+            geometry = lambda rows: rows[:, [0, 1, 2, 3, 5]] * scale  # noqa: E731
+            # Largest coordinate difference between each row and its nearest
+            # counterpart, either way round (300x300x5: nothing to a GPU).
+            distance = (geometry(graphed)[:, None, :]
+                        - geometry(eager)[None, :, :]).abs().amax(dim=-1)
+            report["detectParityPx"] = float(max(
+                distance.amin(dim=1).amax(), distance.amin(dim=0).amax()))
+            report["detectParityScore"] = float((
+                graphed[:, 4].sort(descending=True).values
+                - eager[:, 4].sort(descending=True).values).abs().max())
+            if (report["detectParityPx"] > self.PARITY_PX
+                    or report["detectParityScore"] > self.PARITY_SCORE):
+                detector.graph = gpu_graph.Eager(
+                    detector.forward, detector.graph.static_inputs)
+                demote("detector")
+        else:
+            detector.graph.replay(pixels)  # eager: the warmup the boot always did
+
+        crop = tracker.pose_crop(frame, box)
+        box_tensor = torch.tensor(box, dtype=torch.float32, device=self.device)
+        if tracker.pose_graph.graphed:
+            graphed = tracker.pose_graph.replay(crop, box_tensor).clone()
+            eager = tracker.pose_forward(crop, box_tensor)
+            report["poseParityPx"] = float(
+                (graphed[:, :2] - eager[:, :2]).abs().max())
+            report["poseParityScore"] = float(
+                (graphed[:, 2] - eager[:, 2]).abs().max())
+            if (report["poseParityPx"] > self.PARITY_PX
+                    or report["poseParityScore"] > self.PARITY_SCORE):
+                tracker.pose_graph = gpu_graph.Eager(
+                    tracker.pose_forward, tracker.pose_graph.static_inputs)
+                demote("pose")
+        else:
+            tracker.pose_graph.replay(crop, box_tensor)
+
+        on = {"detectGraph": detector.graph.graphed,
+              "poseGraph": tracker.pose_graph.graphed}
+        print(" ".join(
+            [f"{name}={'on' if value else 'off'}" for name, value in on.items()]
+            + [f"{name}={value:.4f}" for name, value in report.items()]),
+            flush=True)
+        if self.telemetry:
+            for name, value in on.items():
+                self.telemetry.gauge(name, 1.0 if value else 0.0)
+            for name, value in report.items():
+                self.telemetry.gauge(name, round(value, 4))
+        return report
 
     def _log_gpu(self) -> None:
         """The driver and device, measured rather than assumed - the deploy
@@ -499,23 +613,18 @@ class GpuPose:
         self._scenery_done = True
         self._warmup.clear()
 
-    def _autocast(self):
-        import torch
-        return torch.autocast("cuda", dtype=self._autocast_dtype)
-
     def step(self, rgb: np.ndarray, frame_index: int, at_s: float) -> dict:
-        from PIL import Image
-
+        tracker = self.tracker
         started = time.monotonic()
-        image = Image.fromarray(rgb)
+        # The frame's one trip to the device; everything below reads it there.
+        frame = tracker.frame_tensor(rgb, self.device)
         if self.telemetry:
-            self.telemetry.observe("pil", time.monotonic() - started)
+            self.telemetry.observe("frameUpload", time.monotonic() - started)
         if not self._scenery_done:
             # Scenery learning needs every person candidate, before identity
             # selection; the detector backend owns preprocessing and label
             # mapping, so the candidates come through it.
-            with self._autocast():
-                candidates = self.tracker.detection_candidates(image)
+            candidates = tracker.detection_candidates(frame)
             boxes = [box for box, _ in candidates]
             small = cv2.resize(
                 cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY),
@@ -531,11 +640,11 @@ class GpuPose:
             box, score, people, unresolved = cached
         else:
             started = time.monotonic()
-            with self._autocast():
-                box, score, people, unresolved = self.tracker.detect(image)
+            box, score, people, unresolved = tracker.detect(frame)
             if self.telemetry:
                 # Cache hits are not observed; the stage reports what a real
-                # detect costs, not an average diluted by reuse.
+                # detect costs, not an average diluted by reuse. The copy
+                # back is inside, so this is the latency, not the enqueue.
                 self.telemetry.observe("detect", time.monotonic() - started)
             self._cached_detection = (box, score, people, unresolved)
             self._detect_countdown = self._detect_stride - 1
@@ -544,57 +653,16 @@ class GpuPose:
                               None, None, None, None, people, unresolved)
             return pose_rows.missing_row(frame_index, at_s)
         started = time.monotonic()
-        with self._autocast():
-            result = self._pose_tta(image, box)
+        # (K, 3) x, y, score in image pixels, already on the host: the row
+        # builder and the overlay read plain numpy from here on.
+        result = tracker.pose_keypoints(frame, box)
         if self.telemetry:
             self.telemetry.observe("poseInfer", time.monotonic() - started)
+        keypoints, scores = result[:, :2], result[:, 2]
         share_full_result(self.on_full, self.telemetry, frame_index, at_s,
-                          result["keypoints"], result["scores"], box, score,
-                          people, unresolved)
-        return pose_rows.row_for(frame_index, at_s, result["keypoints"],
-                                 result["scores"], box, score, people,
-                                 unresolved)
-
-    def _pose_tta(self, image, box: list[float]) -> dict:
-        """One forward, or the flip-TTA pair as one batched forward.
-
-        Running the model twice per frame for TTA measured ~945ms on the L4 -
-        the whole cadence budget. The model's own flip handling is
-        `flip_back` applied to the flipped forward's heatmaps
-        (modeling_sapiens2, applied when `flip_pairs` is passed), so one
-        batch-2 forward followed by the same public `flip_back` on the second
-        half is the identical computation, and the post-processor reads
-        nothing but `.heatmaps` from each output.
-        """
-        from types import SimpleNamespace
-
-        import torch
-        from transformers.models.sapiens2.modeling_sapiens2 import flip_back
-
-        tracker = self.tracker
-        nested = [[box]]
-        inputs = tracker.pose_processor([image], boxes=nested,
-                                        return_tensors="pt").to(self.device)
-        pixel_values = inputs["pixel_values"]
-        if tracker.dtype != torch.float32:
-            pixel_values = pixel_values.to(tracker.dtype)
-        if not tracker.flip:
-            with torch.inference_mode():
-                heatmaps = tracker.pose(pixel_values).heatmaps
-            if heatmaps.dtype == torch.bfloat16:
-                heatmaps = heatmaps.float()  # numpy has no bfloat16
-            return tracker.pose_processor.post_process_pose_estimation(
-                SimpleNamespace(heatmaps=heatmaps), boxes=nested)[0][0]
-        both = torch.cat([pixel_values, pixel_values.flip(-1)])
-        with torch.inference_mode():
-            heatmaps = tracker.pose(both).heatmaps
-        if heatmaps.dtype == torch.bfloat16:
-            heatmaps = heatmaps.float()  # numpy has no bfloat16
-        normal = SimpleNamespace(heatmaps=heatmaps[:1])
-        flipped = SimpleNamespace(
-            heatmaps=flip_back(heatmaps[1:], tracker.flip_pairs))
-        return tracker.pose_processor.post_process_pose_estimation(
-            normal, boxes=nested, outputs_flipped=flipped)[0][0]
+                          keypoints, scores, box, score, people, unresolved)
+        return pose_rows.row_for(frame_index, at_s, keypoints, scores, box,
+                                 score, people, unresolved)
 
 
 class SideloadPose:

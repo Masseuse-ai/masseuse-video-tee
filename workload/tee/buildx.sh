@@ -48,14 +48,29 @@ buildx_last_digest() {
     sed -n 's/.*"containerimage.digest": *"\([^"]*\)".*/\1/p' "$BUILDX_HOME/metadata.json"
 }
 
+# The tests that need torch and transformers (the CPU-only CI skips them):
+# the graph wrapper's contract, the packed post-processing against the
+# processor's own, the detector's host-side selection, and the pose step
+# and parity check around stub models. Run in the smoke stage, where the
+# libraries are the versions the enclave ships.
+SMOKE_TESTS="tests/test_gpu_graph.py tests/test_pose_post.py tests/test_detector_post.py tests/test_live_pose.py"
+
 # buildx_smoke <TEE image ref>: every import the enclave makes, on the
 # built image, CPU only, run by BuildKit (the daemon's own image store may
 # not take zstd layers). A system library the ubuntu base lacks fails here
-# rather than on an A3 boot.
+# rather than on an A3 boot. Then SMOKE_TESTS, with pytest installed into
+# this throwaway stage only (the image itself ships no test tooling; the
+# tests are outside the build context, so they are copied in here).
 buildx_smoke() {
     mkdir -p "$BUILDX_HOME/smoke"
+    rm -rf "$BUILDX_HOME/smoke/tests"
+    cp -R "$(dirname "${BASH_SOURCE[0]}")/../tests" "$BUILDX_HOME/smoke/tests"
+    rm -rf "$BUILDX_HOME/smoke/tests/__pycache__"
     cat > "$BUILDX_HOME/smoke/Dockerfile" <<EOF
 FROM $1
+COPY tests /app/workload/tests
+RUN /venv/bin/pip install --no-cache-dir pytest \\
+ && cd /app/workload && python3 -m pytest -q -p no:cacheprovider ${SMOKE_TESTS}
 RUN python3 -c "import sys; sys.path[:0] = ['/app/workload/audio', '/app/workload/pixel', '/app/workload/producer']; \\
 import torch, torchvision, torchvision.ops, transformers, cv2, scipy, numpy, PIL, yaml, cryptography, google.cloud.storage; \\
 import pose_track, live_pose, motion, tee_mode, tee_models, tee_eab, relay_proxy, analysis_link, camlink_gateway, external_source, overlay, sinks; \\

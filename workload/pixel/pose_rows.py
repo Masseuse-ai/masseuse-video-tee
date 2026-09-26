@@ -168,6 +168,26 @@ def _fuse_rtdetrv4_fragments(
     return accepted + fused
 
 
+def candidates_from_packed(
+    rows, width: float, height: float, person_label: int, threshold: float
+) -> list[Candidate]:
+    """The detector's packed output as person candidates, fragments fused.
+
+    `rows` are what the tracker copies back from the GPU in one piece: per
+    top query, xyxy normalised to the frame, score, label. Only the person
+    label at or above the continuity floor qualifies (the same selection
+    the tracker used to make with tensor indexing on the device), scaled
+    to image pixels here on the host.
+    """
+    floor = min(threshold, RTDETRV4_FRAGMENT_SCORE)
+    raw = [
+        ([x0 * width, y0 * height, x1 * width, y1 * height], float(score))
+        for x0, y0, x1, y1, score, label in rows
+        if int(round(label)) == person_label and score >= floor
+    ]
+    return _fuse_rtdetrv4_fragments(raw, threshold)
+
+
 def choose_person(
     candidates: list[Candidate],
     previous: Box | None,

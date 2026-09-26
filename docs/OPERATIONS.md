@@ -223,7 +223,13 @@ The enclave's own start overlaps what it can: the producer runs its
 warm-up as soon as it serves rather than waiting for the trainer's first
 poll, the entrypoint starts the producer before the weights have finished
 copying (the torch import overlaps the copy), and the model build waits on
-a `.complete` marker.
+a `.complete` marker. The warm-up (`bootMs.firstInference`) is where the
+two forwards are captured as CUDA graphs and each graph is checked against
+its eager twin on a synthetic frame; the log line
+`detectGraph=on poseGraph=on detectParityPx=... poseParityPx=...` (and the
+gauges of the same names) says which path the slot is running. A graph that
+fails to capture or to agree runs eagerly for that boot, counted as
+`graphCaptureFailed` or `graphParityFailed`; the slot serves either way.
 
 ## The stop/start rule
 

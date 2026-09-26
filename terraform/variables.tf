@@ -16,7 +16,7 @@ variable "region" {
 }
 
 variable "zone" {
-  description = "a3-highgpu-1g with TDX is offered in us-central1-a/b/c; the static IP is regional so any of them works."
+  description = "Where the slot VMs run. a3-highgpu-1g exists in us-central1-a/b/c, but its Confidential VM form (Intel TDX with NVIDIA Confidential Computing) is offered in three zones only: us-central1-a, us-east5-a and europe-west4-c (Confidential VM, Supported configurations). Within us-central1 that is us-central1-a. The zone must sit in var.region: the subnet and the static IPs (network.tf) are regional."
   type        = string
   default     = "us-central1-a"
 }
