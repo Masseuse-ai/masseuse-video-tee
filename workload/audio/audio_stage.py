@@ -66,9 +66,9 @@ NO_TRACK_RETRY_S = 5.0
 
 class AudioSource:
     """ffmpeg's 16 kHz mono s16le output off the same stream the frames come
-    from, in hop-sized chunks, with reconnect. `-vn` drops the video: the
-    decode for frames is the producer's own ffmpeg, this one reads only the
-    audio track."""
+    from, in hop-sized chunks, with reconnect for a stream and one pass, to
+    its end, for a file. `-vn` drops the video: the decode for frames is the
+    producer's own ffmpeg, this one reads only the audio track."""
 
     def __init__(self, url: str, telemetry, hop_s: float = HOP_S,
                  realtime: bool = False,
@@ -138,13 +138,23 @@ class AudioSource:
                 pass
 
     def chunks(self) -> Iterable[np.ndarray]:
-        """Yields float32 arrays of `hop_samples` samples in [-1, 1]."""
+        """Yields float32 arrays of `hop_samples` samples in [-1, 1].
+
+        One ffmpeg is read to the end of its pipe before anything is decided
+        about it: the short read is the end, whatever `poll()` says
+        meanwhile. ffmpeg exits with its last seconds still in the pipe,
+        and a loop that respawned on exit status read a stream's tail into
+        the void on every reconnect and started a file over from its first
+        second, forever (the ended child never got to say so). A file is
+        read once and the generator ends; a stream reconnects after its
+        short read, as before.
+        """
         hop_bytes = self.hop_samples * BYTES_PER_SAMPLE
         delivered = 0
         while True:
             if self._stopped():
                 return
-            if self.proc is None or self.proc.poll() is not None:
+            if self.proc is None:
                 self._spawn()
                 delivered = 0
             buffer = self.proc.stdout.read(hop_bytes)

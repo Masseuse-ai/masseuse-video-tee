@@ -316,7 +316,9 @@ class KeypointStream(PartStream):
                     frame_size=None, *, dropped: bool = False,
                     error: str | None = None, wall_s: float | None = None) -> bool:
         """One pose step of this view: the full result (keypoints `(308, 2)`,
-        scores `(308,)`, both None when nobody was found) or a gap."""
+        scores `(308,)`, both None when nobody was found; `box` the tracked
+        person's COCO xywh box in frame pixels, as the tracker emits it) or
+        a gap."""
         if keypoints is not None:
             xy = np.asarray(keypoints, dtype=np.float32).reshape(-1, 2)
             sc = np.asarray(scores, dtype=np.float32).reshape(-1)
@@ -368,10 +370,14 @@ def write_keypoint_part(path: Path, view: str, bank: list[tuple],
             except (TypeError, ValueError, IndexError):
                 pass
         if box is not None:
+            # The tracker's box is COCO xywh (pose_rows.choose_person), and
+            # so are the columns: origin, then width and height. Parts
+            # written before v0.10.1 read it as xyxy and stored w - x and
+            # h - y in boxW and boxH (docs/SESSION_RECORD.md).
             try:
-                x0, y0, x1, y1 = (float(v) for v in box)
-                box_cols[0][i], box_cols[1][i] = x0, y0
-                box_cols[2][i], box_cols[3][i] = x1 - x0, y1 - y0
+                x, y, w, h = (float(v) for v in box)
+                box_cols[0][i], box_cols[1][i] = x, y
+                box_cols[2][i], box_cols[3][i] = w, h
             except (TypeError, ValueError):
                 pass
         if box_score is not None:

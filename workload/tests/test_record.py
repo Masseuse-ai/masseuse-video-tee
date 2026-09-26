@@ -222,7 +222,7 @@ def test_a_keypoint_stream_writes_all_308_points_and_the_gaps_as_parquet(tmp_pat
     stream = KeypointStream("poses", "body", tmp_path, 30, metadata={"sessionId": "s1"},
                             clock=clock, on_part=lambda s, path, window: parts.append(path))
     xy0, sc0 = keypoints(0)
-    assert stream.append_step(0, 0.0, xy0, sc0, (100.0, 50.0, 700.0, 650.0), 0.91, 1, False,
+    assert stream.append_step(0, 0.0, xy0, sc0, (100.0, 50.0, 600.0, 600.0), 0.91, 1, False,
                               frame_size=(1280, 720))
     clock.now = T0 + 0.111
     # Nobody in the frame: the step said so with no keypoints.
@@ -233,7 +233,7 @@ def test_a_keypoint_stream_writes_all_308_points_and_the_gaps_as_parquet(tmp_pat
                               dropped=True, wall_s=T0 + 0.2)
     xy1, sc1 = keypoints(1)
     clock.now = T0 + 0.333
-    assert stream.append_step(10, 0.3333, xy1, sc1, (110.0, 55.0, 710.0, 655.0), 0.93, 2, True,
+    assert stream.append_step(10, 0.3333, xy1, sc1, (110.0, 55.0, 600.0, 600.0), 0.93, 2, True,
                               frame_size=(1280, 720))
     # A model with another layout is kept keypoint-less and said in `error`.
     clock.now = T0 + 0.444
@@ -251,7 +251,11 @@ def test_a_keypoint_stream_writes_all_308_points_and_the_gaps_as_parquet(tmp_pat
     assert cols["wallS"] == [T0, round(T0 + 0.111, 3), round(T0 + 0.2, 3),
                              round(T0 + 0.333, 3), round(T0 + 0.444, 3)]
     assert cols["frameW"] == [1280, 1280, None, 1280, None]
-    assert cols["boxX"][0] == 100.0 and cols["boxW"][0] == 600.0 and cols["boxH"][0] == 600.0
+    # The box columns are the tracker's COCO xywh as given: origin, then
+    # width and height (not a second corner).
+    assert cols["boxX"][0] == 100.0 and cols["boxY"][0] == 50.0
+    assert cols["boxW"][0] == 600.0 and cols["boxH"][0] == 600.0
+    assert cols["boxX"][3] == 110.0 and cols["boxW"][3] == 600.0 and cols["boxH"][3] == 600.0
     assert cols["boxScore"][0] == pytest.approx(0.91) and cols["boxX"][1] is None
     assert cols["people"] == [1, 0, None, 2, 1]
     assert cols["identityUnresolved"] == [False, False, False, True, False]
@@ -555,7 +559,7 @@ def test_a_leased_session_records_both_views_and_every_stream(monkeypatch, tmp_p
             state.frame_size = (int(rgb.shape[1]), int(rgb.shape[0]))
             xy, sc = keypoints(index)
             share_full_result(state.taps(), None, index, at_s, xy, sc,
-                              (1.0, 2.0, 11.0, 12.0), 0.8, 1, False)
+                              (1.0, 2.0, 10.0, 10.0), 0.8, 1, False)
             return super().step(rgb, index, at_s, view=view)
 
     gcs = FakeGcs()
@@ -677,7 +681,7 @@ def test_a_sessions_production_runs_share_the_leases_record(monkeypatch, tmp_pat
             state.frame_size = (int(rgb.shape[1]), int(rgb.shape[0]))
             xy, sc = keypoints(index)
             share_full_result(state.taps(), None, index, at_s, xy, sc,
-                              (1.0, 2.0, 11.0, 12.0), 0.8, 1, False)
+                              (1.0, 2.0, 10.0, 10.0), 0.8, 1, False)
             return super().step(rgb, index, at_s, view=view)
 
     gcs = FakeGcs()

@@ -251,6 +251,63 @@ def test_source_stop_ends_the_loop_instead_of_reconnecting(monkeypatch):
     assert len(spawned) <= 1
 
 
+class _ExitedProc:
+    """An ffmpeg that has already exited (poll() says so from the first
+    call) with `hops` hops of samples still unread in its pipe: the shape
+    every child has at its end, since it exits before its last bytes are
+    consumed."""
+
+    def __init__(self, hop_bytes: int, hops: int):
+        self.stdout = io.BytesIO(bytes(range(256)) * (hop_bytes * hops // 256 + 1))
+        self.stdout.truncate(hop_bytes * hops)
+        self.stdout.seek(0)
+        self.stderr = io.BytesIO(b"")
+
+    def poll(self):
+        return 0
+
+    def wait(self):
+        return 0
+
+    def kill(self):
+        pass
+
+
+def test_source_reads_an_exited_child_to_its_end_before_deciding(monkeypatch):
+    """The pipe's short read is the end of a child, not its exit status: a
+    file is read once, to its last hop, and the generator ends; a stream
+    delivers its tail and then reconnects. Respawning on exit status read
+    a stream's tail into the void and started a file over, forever."""
+    telemetry = Telemetry()
+    hop_bytes = AudioSource("x.wav", telemetry).hop_samples * 2
+    spawned = []
+
+    def fake_popen(argv, **kwargs):
+        spawned.append(argv)
+        return _ExitedProc(hop_bytes, 3)
+
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+
+    file_source = AudioSource("/tmp/clip.wav", telemetry, sleep=lambda s: None)
+    chunks = list(file_source.chunks())
+    assert len(chunks) == 3 and all(len(c) == file_source.hop_samples for c in chunks)
+    assert len(spawned) == 1, "a file is read once"
+    assert telemetry.snapshot()["counters"].get("audioReconnects", 0) == 0
+
+    spawned.clear()
+    stream = AudioSource("rtsp://127.0.0.1:8554/cam", telemetry, sleep=lambda s: None)
+    delivered = []
+    for chunk in stream.chunks():
+        delivered.append(chunk)
+        if len(spawned) == 2:
+            # The tail of the first child came through whole before the
+            # second was started.
+            assert len(delivered) >= 4
+            stream.stop()
+    assert len(delivered) >= 4 and len(spawned) == 2
+    assert telemetry.snapshot()["counters"]["audioReconnects"] == 1
+
+
 def test_source_relays_the_input_streams_and_warnings_only(capsys):
     lines = (
         b"Input #0, rtsp, from 'rtsp://127.0.0.1:8554/cam':\n"

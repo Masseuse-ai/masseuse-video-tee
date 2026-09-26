@@ -78,7 +78,7 @@ encoding on the float columns, one row group per part.
 | `wallS` | float64 | Unix time the row was written |
 | `view` | string | `body` or `face` (also the stream's name) |
 | `frameW`, `frameH` | int16, nullable | the decoded frame's size in pixels; null when the step never saw a frame (a drop) |
-| `boxX`, `boxY`, `boxW`, `boxH` | float32, nullable | the tracked person's box, pixels, origin top-left; null when nobody was found |
+| `boxX`, `boxY`, `boxW`, `boxH` | float32, nullable | the tracked person's box in frame pixels: its top-left corner, then its width and height (the tracker's COCO xywh as given); null when nobody was found. Parts written before v0.10.1 read that box as two corners and stored `w - x` and `h - y` here: for them `w = boxW + boxX` and `h = boxH + boxY` (`producer.imageVersion` in the file's metadata says which) |
 | `boxScore` | float32, nullable | the detector's score for that box |
 | `people` | int8, nullable | how many person candidates the detector saw; null for a drop or error |
 | `identityUnresolved` | bool | the tracker could not tell which candidate was the session's person |
