@@ -184,12 +184,17 @@ ENV LD_LIBRARY_PATH=/usr/local/nvidia/lib64 \
 # The model store as tee_models.py lays it out on the /models tmpfs.
 # POSE_PREFETCH stays off: there is no mount to prefetch from, the store is
 # already in place when the producer starts.
+# POSE_DETECT_STRIDE 5: the person detector on every fifth pose step, 1.8 Hz
+# per view at 9 fps (it was every third at 6 fps, 2 Hz). A detect costs the
+# GPU about 8 ms on top of the 48 ms pose step; with two views at 9 fps the
+# load bench (docs/OPERATIONS.md) measured busy 0.916 at stride 3, over the
+# 0.90 the gate allows, and the stride is the first rung of its ladder.
 ENV HF_HOME=/models/hf-bf16 \
     HF_HUB_OFFLINE=1 \
     TRANSFORMERS_OFFLINE=1 \
     POSE_MODELS_MOUNT=/models \
     POSE_DETECTOR_CHECKPOINT=/models/detectors/rtdetrv4/rtv4_hgnetv2_x_coco_ema.safetensors \
-    POSE_DETECT_STRIDE=3 \
+    POSE_DETECT_STRIDE=5 \
     POSE_QUEUE_DEPTH=4 \
     POSE_FLIP_TTA=0 \
     POSE_CUDA_GRAPHS=1 \

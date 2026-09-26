@@ -124,6 +124,29 @@ def test_steps_run_under_the_shared_lock():
 # -- the run -------------------------------------------------------------------
 
 
+IDLE = "1755 MHz, 70.12 W, 38, 0 %, 0x0000000000000000"
+LOADED = "1980 MHz, 652.12 W, 61, 100 %, 0x0000000000000000"
+CAPPED = "1740 MHz, 700.05 W, 66, 100 %, 0x0000000000000004"
+
+
+def test_the_gpu_line_is_parsed_into_numbers():
+    sample = pose_load.parse_gpu_status(CAPPED)
+    assert sample == {"clockMhz": 1740.0, "powerW": 700.05, "tempC": 66.0,
+                      "utilPct": 100.0, "throttle": 4,
+                      "text": "[1740 MHz/700.05 W/66/100 %/0x0000000000000004]"}
+    assert pose_load.parse_gpu_status("N/A, N/A, 61, 100 %, 0x0")["clockMhz"] is None
+    assert pose_load.parse_gpu_status("garbage") is None
+    # Under load: the lowest clock, the highest power and temperature, the
+    # mean utilization, every throttle reason seen.
+    summary = pose_load._gpu_summary([pose_load.parse_gpu_status(LOADED),
+                                      pose_load.parse_gpu_status(CAPPED)])
+    assert summary == {"samples": 2, "clockMinMhz": 1740.0, "powerMaxW": 700.05,
+                       "tempMaxC": 66.0, "utilMeanPct": 100.0, "throttle": 4}
+    assert pose_load._gpu_summary([]) == {
+        "samples": 0, "clockMinMhz": None, "powerMaxW": None, "tempMaxC": None,
+        "utilMeanPct": None, "throttle": None}
+
+
 def test_a_run_submits_the_schedule_steps_it_all_and_reports(capsys):
     telemetry = Telemetry()
     stepped = []
@@ -133,9 +156,13 @@ def test_a_run_submits_the_schedule_steps_it_all_and_reports(capsys):
         with guard:
             stepped.append((view, k))
 
-    probes = iter(["[before]", "[after]"])
+    # Before, the samples under load, after.
+    probes = iter([pose_load.parse_gpu_status(IDLE),
+                   pose_load.parse_gpu_status(LOADED), pose_load.parse_gpu_status(CAPPED),
+                   pose_load.parse_gpu_status(IDLE)])
     report = pose_load.run(step, LoadSpec(9.0, 9.0, 1.0), depth=4,
-                           telemetry=telemetry, gpu_probe=lambda: next(probes))
+                           telemetry=telemetry, gpu_probe=lambda: next(probes),
+                           gpu_fractions=(0.3, 0.6))
     assert report["steps"] == 18 and report["errors"] == 0 and report["drained"]
     assert report["views"]["body"]["submitted"] == 9 and report["views"]["face"]["submitted"] == 9
     assert report["views"]["body"]["drops"] == report["views"]["face"]["drops"] == 0
@@ -145,32 +172,48 @@ def test_a_run_submits_the_schedule_steps_it_all_and_reports(capsys):
     # The run is paced by the wall clock: about a second.
     assert 0.85 <= report["seconds"] <= 3.0
     assert report["stepsPerS"] == pytest.approx(18 / report["seconds"])
-    assert report["gpuBefore"] == "[before]" and report["gpuAfter"] == "[after]"
+    assert report["gpuBefore"]["clockMhz"] == 1755.0 and report["gpuAfter"]["powerW"] == 70.12
+    assert report["gpuUnderLoad"] == {
+        "samples": 2, "clockMinMhz": 1740.0, "powerMaxW": 700.05, "tempMaxC": 66.0,
+        "utilMeanPct": 100.0, "throttle": 4}
     line = capsys.readouterr().out
     assert line.startswith("poseLoad views=body@9,face@9 seconds=")
     assert " depth=4 steps=18 drops=0/0 stepMs=" in line
-    assert "busy=" in line and "gpu=[before] -> [after]" in line
+    assert "busy=" in line
+    assert "gpuUnderLoad=clockMin=1740MHz/powerMax=700W/tempMax=66C/utilMean=100%/throttle=0x4" in line
+    assert ("gpu=[1755 MHz/70.12 W/38/0 %/0x0000000000000000] -> "
+            "[1755 MHz/70.12 W/38/0 %/0x0000000000000000]") in line
     gauges = telemetry.snapshot()["gauges"]
     assert {"poseLoadBodyDrops", "poseLoadFaceDrops", "poseLoadStepP50Ms",
             "poseLoadStepP95Ms", "poseLoadQueueWaitP95Ms", "poseLoadBusy",
             "poseLoadStepsPerS", "poseLoadSeconds", "poseLoadErrors"} <= set(gauges)
     assert gauges["poseLoadBodyDrops"] == 0 and gauges["poseLoadFaceDrops"] == 0
     assert gauges["poseLoadErrors"] == 0
-    # Nothing survives: the workers are gone.
+    # The GPU under load, as gauges: what a production-posture slot shows.
+    assert gauges["poseLoadGpuClockMinMhz"] == 1740.0
+    assert gauges["poseLoadGpuPowerMaxW"] == 700.05
+    assert gauges["poseLoadGpuTempMaxC"] == 66.0
+    assert gauges["poseLoadGpuUtilMeanPct"] == 100.0
+    assert gauges["poseLoadGpuThrottle"] == 4.0
+    # Nothing survives: the workers and the sampler are gone.
     assert not any(t.name.startswith("poseLoad-") for t in threading.enumerate())
 
 
-def test_busy_is_the_step_time_over_the_run():
+def test_busy_is_the_step_time_over_the_run(capsys):
     def step(view, k):
         time.sleep(0.01)
 
     report = pose_load.run(step, LoadSpec(9.0, 0.0, 1.0), depth=4,
-                           gpu_probe=lambda: "[gpu]")
+                           telemetry=Telemetry(), gpu_probe=lambda: None)
     assert report["steps"] == 9 and report["views"]["body"]["drops"] == 0
     # Nine steps of ~10 ms over ~1 s.
     assert 0.05 <= report["busy"] <= 0.3
     assert report["stepP50Ms"] >= 9.0
     assert "face" not in report["views"] and report["label"] == "body@9"
+    # No nvidia-smi: no GPU figures, said so, and no GPU gauges.
+    assert report["gpuUnderLoad"]["samples"] == 0
+    line = capsys.readouterr().out
+    assert "gpuUnderLoad=" not in line and "gpu=[gpu unavailable] -> [gpu unavailable]" in line
 
 
 def test_a_step_slower_than_the_cadence_drops_and_says_so(capsys):
@@ -180,7 +223,7 @@ def test_a_step_slower_than_the_cadence_drops_and_says_so(capsys):
         time.sleep(0.08)
 
     report = pose_load.run(step, LoadSpec(9.0, 9.0, 1.0), depth=1,
-                           gpu_probe=lambda: "[gpu]")
+                           gpu_probe=lambda: None)
     drops = report["views"]["body"]["drops"] + report["views"]["face"]["drops"]
     assert drops > 0
     assert report["steps"] + drops == 18

@@ -384,17 +384,29 @@ posture.
   `POSE_DETECT_STRIDE`-th step, one frame at a time through the graphs -
   and prints one line: `poseLoad views=body@9,face@9 seconds=120.0
   depth=4 steps=2160 drops=0/0 stepMs=p50/p95 lockWaitMs=p50/p95
-  queueWaitMs=p50/p95 busy=0.85 stepsPerS=18.0 gpu=[clock/power/temp/
-  util/throttle reasons before] -> [after]`. The same numbers are gauges on
-  `/statz` (`poseLoadBodyDrops`, `poseLoadFaceDrops`, `poseLoadStepP95Ms`,
-  `poseLoadQueueWaitP95Ms`, `poseLoadBusy`, `poseLoadStepsPerS`,
-  `poseLoadSeconds`, `poseLoadErrors`), which is how a production-posture
-  slot, whose stdout goes nowhere, reports it. A slot holds the 9 + 9 fps
-  load when, over 120 s, `drops` is `0/0`, `stepMs` p95 is at or under
-  52 ms (the H100's 46 ms replay plus the upload and a share of the
-  detects), `queueWaitMs` p95 is at or under 60 ms (a step behind the
-  other view's), `busy` is at or under 0.90 and the throttle reasons stay
-  at zero (`0x0000000000000000`; `0x4` is the software power cap, and the
+  queueWaitMs=p50/p95 busy=0.85 stepsPerS=18.0 gpuUnderLoad=clockMin=
+  1980MHz/powerMax=652W/tempMax=61C/utilMean=100%/throttle=0x0 gpu=[clock/
+  power/temp/util/throttle reasons before] -> [after]`; `gpuUnderLoad` is
+  nvidia-smi sampled at a quarter, half, three quarters and 95% of the run,
+  the lowest SM clock, the highest power and temperature, the mean
+  utilization and every throttle reason seen. The same numbers are gauges
+  on `/statz` (`poseLoadBodyDrops`, `poseLoadFaceDrops`, `poseLoadStepP50Ms`,
+  `poseLoadStepP95Ms`, `poseLoadQueueWaitP95Ms`, `poseLoadBusy`,
+  `poseLoadStepsPerS`, `poseLoadSeconds`, `poseLoadErrors`,
+  `poseLoadGpuClockMinMhz`, `poseLoadGpuPowerMaxW`, `poseLoadGpuTempMaxC`,
+  `poseLoadGpuUtilMeanPct`, `poseLoadGpuThrottle`), which is how a
+  production-posture slot, whose stdout goes nowhere, reports it (its
+  control routes take the trainer's token: an operator reads `/statz` with
+  an ID token minted for the trainer's service account, which needs
+  `roles/iam.serviceAccountTokenCreator` on it for the time of the read).
+  A slot holds the 9 + 9 fps load when, over 120 s, `drops` is `0/0`,
+  `stepMs` p50 is at or under 52 ms (the H100's 46 ms replay plus the
+  upload, crop and copy back; a step that also carries a detect costs
+  about 8 ms more, and since one step in `POSE_DETECT_STRIDE` does, the p95
+  is that step's cost - 56 ms - at any stride under 20, so it says what a
+  detect costs, not whether the GPU keeps up), `queueWaitMs` p95 is at or
+  under 60 ms (a step behind the other view's), `busy` is at or under 0.90
+  and `poseLoadGpuThrottle` is 0 (`0x4` is the software power cap, and the
   slot runs near its 700 W under this load). Run it twice, one of them a
   cold boot: the first minute after a
   cold start has shown a pose step at 105 ms once. A bench of 120 s
@@ -407,7 +419,11 @@ posture.
   a lost boot. If the gate fails, the ladder is: `POSE_DETECT_STRIDE` 3 to
   5 (six detects a second fewer), then the face view to 6 fps
   (`--face-pose-fps 6` in `tee/entrypoint.sh`, the phone's face moves
-  little), then the body to 7.5; each step is a new image roll.
+  little), then the body to 7.5; each step is a new image roll. Measured
+  so far, `9,9,120` on the H100, two boots each: v0.5.0 (stride 3) held
+  `drops=0/0` at `stepMs=48.4/56.3`, `queueWaitMs` p95 61 ms, `busy=0.916`,
+  `stepsPerS=18.0`, over the busy line, which is what took the image to
+  stride 5.
 
 ## Image signing (`terraform/signing.tf`)
 

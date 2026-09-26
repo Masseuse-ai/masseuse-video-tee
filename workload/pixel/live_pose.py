@@ -429,8 +429,10 @@ class GpuPose:
                         (33ms on Blackwell, 8ms on the H100) on every pose
                         frame is budget spent re-finding a box that has not
                         moved. A lost person always re-detects on the next
-                        frame. Default 3: at 9 fps, three detects a second
-                        per view.
+                        frame. Default 3 (three detects a second per view
+                        at 9 fps); the TEE image sets 5 (1.8 a second), the
+                        first rung of the load gate's ladder in
+                        docs/OPERATIONS.md.
       POSE_FLIP_TTA=1   the flip-TTA pair instead of a single forward. With
                         TTA the Blackwell worker ran at ~93% of the then
                         6fps budget and queue bursts dropped ~11% of poses -

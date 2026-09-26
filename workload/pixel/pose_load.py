@@ -33,16 +33,22 @@ production-posture slot, whose stdout goes nowhere, shows the result on
 /statz:
 
     poseLoad views=body@9,face@9 seconds=120.0 depth=4 steps=2160
-        drops=0/0 stepMs=47.1/49.8 lockWaitMs=0.1/46.9
+        drops=0/0 stepMs=48.4/56.4 lockWaitMs=0.1/46.9
         queueWaitMs=0.3/47.4 busy=0.85 stepsPerS=18.0
-        gpu=[1980 MHz/652 W/61 C/100 %/0x0] -> [...]
+        gpuUnderLoad=clockMin=1980MHz/powerMax=652W/tempMax=61C/utilMean=100%/throttle=0x0
+        gpu=[1755 MHz/70.12 W/38/0 %/0x0000000000000000] -> [...]
 
 `stepMs` is the time under the lock (upload to copy back), `lockWaitMs`
 the wait for the other view's step, `queueWaitMs` the time from submission
 to the start of the step, each p50/p95; `drops` is body/face; `busy` is
-the summed step time over the run's length. A slot holds the load when
-drops stay at zero, `busy` leaves a margin under 1.0 and the p95 step is
-under the two views' shared interval.
+the summed step time over the run's length; `gpuUnderLoad` is nvidia-smi
+sampled while the load is on (GPU_SAMPLE_FRACTIONS of the run): the lowest
+SM clock, the highest power and temperature, the mean utilization and the
+throttle reasons seen, OR-ed (0x4 is the software power cap). A slot holds
+the load when drops stay at zero, `busy` leaves a margin under 1.0 and the
+clock holds without a throttle reason. The p95 step is the cost of a step
+that carries a detect (every POSE_DETECT_STRIDE-th does), the p50 the cost
+of one that does not.
 """
 
 from __future__ import annotations
@@ -70,6 +76,8 @@ BODY, FACE = "body", "face"
 DRAIN_TIMEOUT_S = 10.0
 GPU_QUERY = ("clocks.sm,power.draw,temperature.gpu,utilization.gpu,"
              "clocks_throttle_reasons.active")
+# When, as fractions of the run, the GPU is sampled under the load.
+GPU_SAMPLE_FRACTIONS = (0.25, 0.5, 0.75, 0.95)
 
 
 @dataclass(frozen=True)
@@ -143,19 +151,116 @@ def schedule(spec: LoadSpec, grid_fps: float = GRID_FPS) -> list[tuple[float, st
     return [(due, view, index) for due, view, index, _ in out]
 
 
-def gpu_status() -> str:
-    """The GPU's SM clock, power, temperature, utilization and active
-    throttle reasons in one bracketed string, or why not."""
+def gpu_status() -> dict | None:
+    """The GPU's SM clock (MHz), power (W), temperature (C), utilization
+    (%) and active throttle reasons (nvidia-smi's bitmask: 0x4 is the
+    software power cap, 0x8 a hardware slowdown, 0x40 a software thermal
+    slowdown) as numbers, plus the raw `text`; None when nvidia-smi is not
+    there or fails."""
     try:
         out = subprocess.run(
             ["nvidia-smi", f"--query-gpu={GPU_QUERY}", "--format=csv,noheader"],
             capture_output=True, text=True, timeout=10)
     except (OSError, subprocess.TimeoutExpired):
-        return "[nvidia-smi unavailable]"
+        return None
     if out.returncode != 0:
-        return "[nvidia-smi failed]"
-    fields = [f.strip() for f in out.stdout.strip().split(",")]
-    return "[" + "/".join(fields) + "]"
+        return None
+    return parse_gpu_status(out.stdout)
+
+
+def parse_gpu_status(line: str) -> dict | None:
+    """`nvidia-smi --query-gpu=GPU_QUERY --format=csv,noheader`'s line
+    ("1980 MHz, 652.12 W, 61, 100 %, 0x0000000000000004") as numbers."""
+    fields = [f.strip() for f in line.strip().split(",")]
+    if len(fields) != 5:
+        return None
+
+    def number(field: str) -> float | None:
+        token = field.split(" ")[0]
+        try:
+            return float(token)
+        except ValueError:
+            return None
+
+    try:
+        throttle = int(fields[4], 16)
+    except ValueError:
+        throttle = None
+    return {
+        "clockMhz": number(fields[0]),
+        "powerW": number(fields[1]),
+        "tempC": number(fields[2]),
+        "utilPct": number(fields[3]),
+        "throttle": throttle,
+        "text": "[" + "/".join(fields) + "]",
+    }
+
+
+def _gpu_text(sample: dict | None) -> str:
+    return sample["text"] if sample else "[gpu unavailable]"
+
+
+class GpuSampler(threading.Thread):
+    """`probe` called at the given fractions of the run, on its own thread
+    so the calls (tens of milliseconds each) never delay a submission;
+    `samples` afterwards, in order. What the GPU does under the load -
+    clocks, power, throttle reasons - is only visible while the load is
+    on, and a production-posture slot has no stdout, so these become
+    gauges."""
+
+    def __init__(self, probe, seconds: float, fractions: tuple[float, ...],
+                 clock=time.monotonic, sleep=time.sleep):
+        super().__init__(daemon=True, name="poseLoad-gpu")
+        self.probe = probe
+        self.seconds = seconds
+        self.fractions = fractions
+        self.clock = clock
+        self.sleep = sleep
+        self.samples: list[dict] = []
+        self.stopping = threading.Event()
+
+    def run(self) -> None:
+        start = self.clock()
+        for fraction in self.fractions:
+            target = start + fraction * self.seconds
+            while not self.stopping.is_set():
+                remaining = target - self.clock()
+                if remaining <= 0:
+                    break
+                self.sleep(min(0.25, remaining))
+            if self.stopping.is_set():
+                return
+            sample = self.probe()
+            if sample:
+                self.samples.append(sample)
+
+    def finish(self, timeout_s: float = 15.0) -> list[dict]:
+        self.stopping.set()
+        self.join(timeout=timeout_s)
+        return list(self.samples)
+
+
+def _gpu_summary(samples: list[dict]) -> dict:
+    """Over the samples taken under load: the lowest SM clock, the highest
+    power and temperature, the mean utilization, and every throttle reason
+    seen (OR-ed)."""
+    def values(key):
+        return [s[key] for s in samples if s.get(key) is not None]
+
+    clocks, power, temp, util, throttle = (
+        values("clockMhz"), values("powerW"), values("tempC"),
+        values("utilPct"), values("throttle"))
+    reasons = 0
+    for bits in throttle:
+        reasons |= int(bits)
+    return {
+        "samples": len(samples),
+        "clockMinMhz": min(clocks) if clocks else None,
+        "powerMaxW": max(power) if power else None,
+        "tempMaxC": max(temp) if temp else None,
+        "utilMeanPct": (sum(util) / len(util)) if util else None,
+        "throttle": reasons if throttle else None,
+    }
 
 
 def _percentile(values: list[float], q: float) -> float:
@@ -276,18 +381,29 @@ def _format(report: dict) -> str:
         parts.append(f"errors={report['errors']}")
     if not report["drained"]:
         parts.append("drained=no")
-    parts.append(f"gpu={report['gpuBefore']} -> {report['gpuAfter']}")
+    under = report["gpuUnderLoad"]
+    if under["samples"]:
+        parts.append(
+            "gpuUnderLoad="
+            f"clockMin={under['clockMinMhz']:.0f}MHz/"
+            f"powerMax={under['powerMaxW']:.0f}W/"
+            f"tempMax={under['tempMaxC']:.0f}C/"
+            f"utilMean={under['utilMeanPct']:.0f}%/"
+            f"throttle={under['throttle']:#x}")
+    parts.append(f"gpu={_gpu_text(report['gpuBefore'])} -> {_gpu_text(report['gpuAfter'])}")
     return "poseLoad " + " ".join(parts)
 
 
 def run(step, spec: LoadSpec, *, lock: threading.Lock | None = None,
         depth: int | None = None, telemetry=None, clock=time.monotonic,
         sleep=time.sleep, gpu_probe=gpu_status,
+        gpu_fractions: tuple[float, ...] = GPU_SAMPLE_FRACTIONS,
         grid_fps: float = GRID_FPS) -> dict:
     """The load bench: `spec`'s submissions, on the wall clock, through
-    one Worker per view calling `step(view, k)` under `lock`. Returns the
-    report, printed as a `poseLoad` line and reported as gauges. Nothing
-    of it survives: the workers are joined before it returns."""
+    one Worker per view calling `step(view, k)` under `lock`, the GPU
+    sampled at `gpu_fractions` of the run. Returns the report, printed as
+    a `poseLoad` line and reported as gauges. Nothing of it survives: the
+    workers and the sampler are joined before it returns."""
     lock = lock if lock is not None else threading.Lock()
     depth = depth if depth is not None else queue_depth()
     before = gpu_probe()
@@ -296,7 +412,10 @@ def run(step, spec: LoadSpec, *, lock: threading.Lock | None = None,
     for worker in workers.values():
         worker.start()
     plan = schedule(spec, grid_fps)
+    sampler = GpuSampler(gpu_probe, spec.seconds, gpu_fractions,
+                         clock=clock, sleep=sleep)
     start = clock()
+    sampler.start()
     for due, view, index in plan:
         target = start + due
         now = clock()
@@ -305,6 +424,7 @@ def run(step, spec: LoadSpec, *, lock: threading.Lock | None = None,
         workers[view].submit(index)
     drained = all(worker.finish() for worker in workers.values())
     elapsed = max(clock() - start, 1e-6)
+    under_load = _gpu_summary(sampler.finish())
     after = gpu_probe()
 
     order = [view for view, _ in spec.views()]
@@ -338,6 +458,7 @@ def run(step, spec: LoadSpec, *, lock: threading.Lock | None = None,
         "stepsPerS": steps / elapsed,
         "gpuBefore": before,
         "gpuAfter": after,
+        "gpuUnderLoad": under_load,
     }
     print(_format(report), flush=True)
     if telemetry is not None:
@@ -352,6 +473,16 @@ def run(step, spec: LoadSpec, *, lock: threading.Lock | None = None,
             "poseLoadSeconds": round(elapsed, 1),
             "poseLoadErrors": report["errors"],
         }
+        # The GPU under the load, when nvidia-smi answered: the lowest SM
+        # clock, the highest power and temperature, the mean utilization
+        # and the throttle reasons seen (0 is none; 0x4 the power cap).
+        for key, name in (("clockMinMhz", "poseLoadGpuClockMinMhz"),
+                          ("powerMaxW", "poseLoadGpuPowerMaxW"),
+                          ("tempMaxC", "poseLoadGpuTempMaxC"),
+                          ("utilMeanPct", "poseLoadGpuUtilMeanPct"),
+                          ("throttle", "poseLoadGpuThrottle")):
+            if under_load.get(key) is not None:
+                gauges[name] = under_load[key]
         for name, value in gauges.items():
             telemetry.gauge(name, float(value))
     return report
