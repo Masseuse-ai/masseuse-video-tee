@@ -41,7 +41,12 @@ webrtcIPsFromInterfaces: no
 webrtcAdditionalHosts: []
 webrtcICEServers2: []
 webrtcHandshakeTimeout: 10s
-webrtcTrackGatherTimeout: 2s
+# How long after the handshake the relay waits for the first packet of each
+# track the offer declared before the path goes online with the tracks it
+# has. The phone's video encoder can take more than the default 2 s to
+# start after its microphone is already sending, and a path finalised as
+# audio-only cannot pick the video up later.
+webrtcTrackGatherTimeout: 15s
 webrtcSTUNGatherTimeout: 5s
 
 api: yes

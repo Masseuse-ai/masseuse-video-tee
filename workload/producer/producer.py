@@ -193,7 +193,13 @@ class Decoder:
              *self._input_flags(), self.url],
             capture_output=True, text=True, timeout=30,
         )
-        stream = json.loads(out.stdout)["streams"][0]
+        streams = json.loads(out.stdout or "{}").get("streams") or []
+        if not streams:
+            # The relay finalised the path without a video track: the
+            # publisher's video packets came after its gather timeout, or
+            # it never sent any. Nothing to decode; said plainly.
+            raise RuntimeError(f"no video track on {self.url}")
+        stream = streams[0]
         return int(stream["width"]), int(stream["height"])
 
     def _input_flags(self) -> list[str]:
@@ -525,6 +531,9 @@ class Session:
         self.run_name = getattr(args, "run", "") or ""
         self.capture = Capture(capture_dir(args.sink_dir, self.run_name))
         self.summary: dict | None = None
+        # Why run() ended early, if it did not end on its own terms: said
+        # over the /produce stream as an `error` event ahead of the summary.
+        self.error: str | None = None
         self.poster = (Poster(args.post_url, telemetry)
                        if args.post_url else None)
         self.post_interval_s = float(
@@ -1017,6 +1026,9 @@ def pump_session(session, runner: threading.Thread, wfile, subscription,
             line = messages.popleft()
             wfile.write(f"data: {line}\n\n".encode())
         summary = session.summary or {}
+        if session.error:
+            wfile.write(
+                f"data: {json.dumps({'kind': 'error', 'error': session.error})}\n\n".encode())
         final = {
             "kind": "summary",
             "run": session.run_name or None,
@@ -1829,6 +1841,10 @@ def build_server(args, telemetry: Telemetry,
                     # into the bucket when the session winds down.
                     try:
                         session.run()
+                    except Exception as error:  # noqa: BLE001 - said aloud
+                        session.error = f"{type(error).__name__}: {error}"
+                        print(f"produce: session ended early: {session.error}",
+                              flush=True)
                     finally:
                         upload["result"] = session.upload_capture(
                             getattr(args, "capture_bucket", ""))

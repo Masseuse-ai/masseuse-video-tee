@@ -36,6 +36,7 @@ class FakeSession:
         self.stopping = threading.Event()
         self.summary = None
         self.run_name = run_name
+        self.error = None
 
 
 class Wire:
@@ -217,3 +218,24 @@ def test_gpu_pose_state_reads_booted_and_not_mid_boot_as_ready():
         assert gpu_pose_state() == "ready"
     finally:
         producer._GPU_POSE["pose"] = saved
+
+
+def test_a_session_that_ended_early_says_why_ahead_of_its_summary():
+    """run() raising (the stream had no video track, say) reaches the
+    client as an `error` event the trainer shows as lastError, then the
+    summary as usual."""
+    telemetry = Telemetry()
+    session = FakeSession(run_name="session-xyz")
+    subscription = telemetry.subscribe()
+    runner = start_runner(session, telemetry, frames=1)
+    runner.join()
+    session.error = "RuntimeError: no video track on rtsp://127.0.0.1:8554/cam"
+    wire = Wire()
+
+    outcome = pump_session(session, runner, wire, subscription, telemetry,
+                           wait_s=0.02, upload_result=lambda: None)
+
+    assert outcome == "ended"
+    kinds = [event["kind"] for event in wire.events()]
+    assert kinds[-2:] == ["error", "summary"]
+    assert wire.events()[-2]["error"] == session.error

@@ -216,3 +216,30 @@ def test_a_file_keeps_its_own_geometry_and_only_the_cadence_filter():
     argv = decoder._argv()
     assert argv[argv.index("-vf") + 1] == "fps=30"
     assert "-re" in argv  # -re stands in for the camera on a file
+
+
+def test_probe_names_a_stream_without_a_video_track(monkeypatch):
+    """A relay path finalised as audio-only (the publisher's video packets
+    came after the gather timeout) is said plainly, not as an IndexError
+    from ffprobe's empty stream list."""
+    import json
+    import subprocess
+
+    import producer as producer_module
+    import pytest
+
+    class Done:
+        def __init__(self, stdout):
+            self.stdout = stdout
+            self.returncode = 0
+
+    monkeypatch.setattr(producer_module.subprocess, "run",
+                        lambda *a, **k: Done(json.dumps({"programs": [], "streams": []})))
+    decoder = Decoder("rtsp://127.0.0.1:8554/cam", Telemetry())
+    with pytest.raises(RuntimeError, match="no video track on rtsp://127.0.0.1:8554/cam"):
+        decoder._probe()
+
+    monkeypatch.setattr(producer_module.subprocess, "run",
+                        lambda *a, **k: Done(json.dumps({"streams": [{"width": 960, "height": 540}]})))
+    assert decoder._probe() == (960, 540)
+    assert subprocess is producer_module.subprocess
