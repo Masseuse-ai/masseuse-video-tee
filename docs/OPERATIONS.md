@@ -128,6 +128,25 @@ behind the renderer's tick, and `overlayPublisherRestarts` says whether
 the process died. With `--overlay-renditions hi` (the default outside the
 image) the command is what it always was.
 
+The connector's tunnel gateway (`masseuse-camlink-gateway`, pinned in
+`camlink.lock`) has two relay listeners beside its WebSocket (8090) and its
+control API (8091), both loopback. The relay listener, `127.0.0.1:7441`,
+follows the one target the producer sets (`POST /target`): a camera on the
+person's home network as the body view. The own listener,
+`127.0.0.1:7442` (`-own` in `tee/entrypoint.sh`), carries every connection
+to the connector's own endpoint `127.0.0.1:7443` whatever the target: the
+connector's camera (`camera`) and front-facing camera (`face`, MediaMTX
+pulling through it on the `face-ext` path, `workload/producer/external_source.py`),
+and the phone's picture published into the connector's `phone` path
+(`workload/producer/share.py`, one `ffmpeg -c copy` through a pinned TLS
+bridge of the producer's). `GET /status` on the control API says
+`ownStreams`, how many such connections are being relayed; `/ingest/status`
+says `share` (the picture going to the computer) and `faceSource` (the
+connector's camera as the inset), and `/statz` the same plus `views.faceView`
+(the third decoder, present only while a face source is attached) and
+`overlay.view.faceSource`. With nothing chosen in the connector both are
+off and the slot runs as it did without them.
+
 Put the digest into `terraform.tfvars` (`container_image` and
 `container_image_digest`): that is the deployment's pin, what the VM boots
 and which principal may read the weights. The trainer's policy does not

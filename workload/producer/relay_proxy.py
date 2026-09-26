@@ -108,6 +108,8 @@ def route(path: str) -> Route | None:
     ('egress', None)                   PUT/GET/DELETE /ingest/egress  (the live stream, the phone's)
     ('egress-stop', None)              POST /egress/stop              (the trainer's)
     ('hud', None)                      PUT /overlay/hud               (the trainer's HUD card state)
+    ('face-source', None)              PUT/GET/DELETE /ingest/face-source (the connector's front-facing camera, the phone's)
+    ('share', None)                    PUT/GET/DELETE /ingest/share   (the phone's picture to the connector, the phone's)
     """
     if path == "/overlay/status":
         return Route("status", None)
@@ -125,6 +127,10 @@ def route(path: str) -> Route | None:
         return Route("egress-stop", None)
     if path == "/overlay/hud":
         return Route("hud", None)
+    if path == "/ingest/face-source":
+        return Route("face-source", None)
+    if path == "/ingest/share":
+        return Route("share", None)
     if path.startswith("/ingest/whip/") and WHEP_SECRET.match(path[len("/ingest/whip/"):]):
         return Route("whip", path[len("/ingest/whip/"):])
     for relay_path in OVERLAY_PATHS:
@@ -360,7 +366,8 @@ class RelayProxy:
             return 503, body
         return 200, body
 
-    def ingest_status(self, external=None, egress=None, view=None) -> tuple[int, dict]:
+    def ingest_status(self, external=None, egress=None, view=None, *,
+                      share=None, face_source=None) -> tuple[int, dict]:
         """(status code, body) for GET /ingest/status: the relay's view of
         the session's camera, flattened so `ready` and `tracks` sit at the
         top, plus which camera that is, plus the live stream (`egress`:
@@ -368,7 +375,12 @@ class RelayProxy:
         a stream is on and to which host, never where exactly, plus how
         the view is drawn (`view`: the phone's standing `mirror` and
         `overlay` from /ingest/view, producer.view_prefs) so the trainer
-        can show what the slot draws.
+        can show what the slot draws, plus, on a slot that has them, the
+        phone's picture to the connector (`share`: share.Share.status)
+        and the connector's front-facing camera (`faceSource`: the second
+        ExternalSource's status, with `streamUrl` when attached, which
+        the trainer restarts the production on as it does on the body
+        camera's).
 
         The camera is the phone's (`cam`) unless `external` (an
         external_source.ExternalSource) is active, in which case the top
@@ -415,4 +427,11 @@ class RelayProxy:
         if view is not None:
             body["view"] = {"mirror": bool(view.get("mirror", False)),
                             "overlay": str(view.get("overlay", "clean"))}
+        if share is not None:
+            body["share"] = share.status()
+        if face_source is not None:
+            face = dict(face_source.status())
+            face["streamUrl"] = (f"{self.rtsp_base}/{face_source.path}"
+                                 if face_source.active else None)
+            body["faceSource"] = face
         return 200, body

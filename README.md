@@ -56,7 +56,13 @@ Inside the enclave, in code that is in this repository:
   same cadence, and drawn as an inset in the top-right corner of the view
   (with its keypoints when they are on), cropped to follow the face and
   mirrored the way the phone's own preview was when its camera faces the
-  user (the phone says which, `PUT /ingest/view`). The two pictures are
+  user (the phone says which, `PUT /ingest/view`). When the person has
+  chosen a front-facing camera in their connector (OBS's virtual camera
+  working on the phone's own picture, say; the trust boundary below), that
+  camera's stream is decoded in place of the phone's for the inset alone,
+  fitted whole and drawn on by nothing; the keypoints still come from the
+  phone's picture, and its own camera is back as the inset the moment the
+  choice is undone. The two pictures are
   lined up by the time each frame was taken - both senders time their
   frames with their own clocks (RTCP sender reports), the relay keeps
   those times, and `workload/reader/` reads them beside the frames - so
@@ -194,16 +200,49 @@ kind makes plain:
   nothing else. That the connector does what it says is checked the way
   this image is: it is open source, and its releases are reproducible and
   signed.
+- **The phone's picture to that computer, and a front-facing camera back
+  (masseuse-camlink, both ways; opt-in twice).** A person who wants to
+  work on their own face picture with OBS before it is shown asks for
+  it on the computer (`masseuse-camlink -share-phone on`, which is the
+  only thing that makes the connector accept it, and which the connector
+  reports to the service) and their phone, seeing that, asks the enclave
+  to send it (`PUT /ingest/share`, the capability bearer). One `ffmpeg`
+  in this image then copies the phone's own video track off the relay's
+  loopback path - no decoding, no re-encoding - and publishes it into the
+  connector's `phone` path, through the gateway's own-endpoint listener
+  (`127.0.0.1:7442`, every connection of which is a tunnel stream to the
+  connector's own `127.0.0.1:7443`), inside TLS to the connector whose
+  certificate is pinned by the SHA-256 the enclave probed through that
+  same listener: the bridge that completes that TLS refuses any other
+  leaf and relays nothing. So the picture leaves the enclave only inside
+  the connector's own verified tunnel, to the one connector the session is
+  bound to, on the computer the person is at; the connector serves it on
+  that computer alone (masseuse-camlink docs/PROTOCOL.md, section 6.1).
+  What the computer sends back - OBS's virtual camera, or any camera of
+  its own, chosen there with `-face-camera` and served at the fixed link
+  `rtsps://127.0.0.1:7443/face` - the phone hands the enclave as a second
+  source (`PUT /ingest/face-source`, the same checks as the body camera:
+  `rtsps://` only, a private host through the tunnel, the leaf pinned), and
+  the enclave decodes it for one purpose: the face inset, shown and, when a
+  live stream is on, streamed. It is never analysed. The person and face
+  keypoints, the vocalizations, everything the analysis derives, come from
+  the phone's own picture, which keeps publishing over WHIP as before; the
+  face keypoint detector keeps reading it while the connector's picture is
+  what is shown. With nothing chosen in the connector, none of this runs:
+  the phone's picture is the face view by the path it always was, through
+  the one decoder, with no trip through the computer.
 
-With any of the three, the phone keeps publishing its own camera to the
+With any of these, the phone keeps publishing its own camera to the
 slot over WHIP as before, and the two pictures meet only inside this
-image: the fixed camera's as the body view, the phone's as the face inset
+image: the fixed camera's as the body view, the phone's (or, at the
+person's asking, the connector's front-facing camera) as the face inset
 drawn over it, both returned over the one WHEP leg to the same phone. The
 phone's capability is what opens `PUT /ingest/view`, the one control over
 how the view is drawn (its picture mirrored or not; the keypoints on or
 off); the masseuse learns the layout and the inset's place from the slot's
-status (`overlay.view`), what is drawn from `/ingest/status` (`view`), and
-nothing of either picture.
+status (`overlay.view`), what is drawn from `/ingest/status` (`view`),
+whether the picture is being sent to the computer (`share`) and whether
+the inset is the connector's (`faceSource`), and nothing of any picture.
 
 **One session per slot.** A slot serves one session at a time: the lease
 holds a single capability hash, and the publish and overlay routes accept

@@ -556,3 +556,75 @@ def test_a_relay_that_is_down_is_a_503_and_a_refused_add_says_so():
         assert relay.ext_deletes == 1
     finally:
         relay.stop()
+
+
+# -- the connector's own endpoint --------------------------------------------------------
+
+CONNECTOR_FACE = "rtsps://127.0.0.1:7443/face"
+CONNECTOR_CAMERA = "rtsps://127.0.0.1:7443/camera"
+
+
+def test_the_connectors_own_endpoint_goes_through_the_own_listener_without_a_target():
+    assert es.is_connector_endpoint("127.0.0.1", 7443) is True
+    assert es.is_connector_endpoint("127.0.0.1", 7441) is False
+    assert es.is_connector_endpoint("192.168.1.108", 7443) is False
+    # The link keeps its path; the host becomes the gateway's own listener.
+    assert es.tunnel_source_url(CONNECTOR_FACE) == "rtsps://127.0.0.1:7442/face"
+    assert es.tunnel_source_url(CONNECTOR_CAMERA) == "rtsps://127.0.0.1:7442/camera"
+    # Everything else on the home network still goes to the relay listener.
+    assert es.tunnel_source_url(UNIFI) == "rtsps://127.0.0.1:7441/SGSV8hfdHpQXGyIz?enableSrtp"
+    assert es.tunnel_source_url("rtsps://127.0.0.1:8554/x") == "rtsps://127.0.0.1:7441/x"
+
+
+def test_the_connectors_face_camera_is_a_second_source_that_leaves_the_connector_attached():
+    relay, gateway = StubRelay(), FakeGateway(connected=True, since_ms=1_699_999_000_000)
+    try:
+        proxy, face = make_tunnel_source(relay, gateway, path="face-ext", owns_gateway=False)
+        relay.face_ready_after = 2
+        answer = face.connect(CONNECTOR_FACE, "sess-1")
+        assert answer == {"status": "connected", "kind": "external", "path": "face-ext",
+                          "tracks": ["H264"], "since": 1_700_000_000, "mode": "tunnel"}
+        # The gateway was asked whether a connector is there and nothing
+        # more: no target for the connector's own endpoint. The probe went
+        # to the own listener, no SNI.
+        assert gateway.paths() == ["/status"]
+        assert gateway.target is None
+        assert face.probes == [("127.0.0.1", 7442, "127.0.0.1", 5.0, {"sni": False})]
+        assert relay.face_config == {
+            "source": "rtsps://127.0.0.1:7442/face",
+            "sourceFingerprint": FINGERPRINT, "rtspTransport": "tcp",
+            "sourceOnDemand": False, "useAbsoluteTimestamp": True}
+        assert face.stream_url == "rtsp://127.0.0.1:8554/face-ext"
+        assert face.active and face.mode == "tunnel" and face.session_id == "sess-1"
+        # The body camera's path is untouched.
+        assert relay.ext_config is None
+        # Removing the face camera does not drop the connector: the body
+        # camera may still be its.
+        assert face.clear("the phone asked") is True
+        assert gateway.paths("POST") == []
+        assert gateway.connected is True
+        assert relay.face_config is None and relay.face_deletes == 1
+        # The body camera's own instance still owns the connector.
+        _, body = make_tunnel_source(relay, gateway)
+        relay.ext_ready_after = 1
+        body.connect(CONNECTOR_CAMERA, "sess-1")
+        assert gateway.target is None  # the own endpoint needs no target either
+        assert relay.ext_config["source"] == "rtsps://127.0.0.1:7442/camera"
+        body.clear("the phone asked")
+        assert gateway.paths("POST") == ["/clear"] and gateway.connected is False
+    finally:
+        gateway.stop()
+        relay.stop()
+
+
+def test_the_connectors_face_camera_is_refused_until_the_connector_is_there():
+    relay, gateway = StubRelay(), FakeGateway(connected=False)
+    try:
+        _, face = make_tunnel_source(relay, gateway, path="face-ext", owns_gateway=False)
+        with pytest.raises(es.SourceError) as excinfo:
+            face.connect(CONNECTOR_FACE, "sess-1")
+        assert excinfo.value.reason == "tunnel-offline"
+        assert face.probes == [] and relay.face_config is None
+    finally:
+        gateway.stop()
+        relay.stop()

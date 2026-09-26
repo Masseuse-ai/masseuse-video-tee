@@ -869,7 +869,7 @@ class OverlayRenderer(threading.Thread):
                  delay_s: float = 1.0, source_fps: float = 30.0,
                  clock=time.monotonic, capacity: int | None = None,
                  mirror: bool = False, sync=None, face_mirror: bool = False,
-                 overlay: str = DEFAULT_OVERLAY):
+                 overlay: str = DEFAULT_OVERLAY, face_source: str = "phone"):
         super().__init__(daemon=True, name="overlay")
         self.publisher = publisher
         self.telemetry = telemetry
@@ -891,7 +891,14 @@ class OverlayRenderer(threading.Thread):
         self.face_frames = FrameStore(
             window + (int(2 * sync.tolerance_s * source_fps) if sync else 0))
         self.face_track = PoseTrack(frame_s=1.0 / source_fps)
-        self.face_mirror = bool(face_mirror)
+        # Whose picture the inset is: the phone's (`phone`: cropped to
+        # follow the face the phone's keypoints find, mirrored as asked,
+        # the keypoints drawn when the layer is on) or the connector's
+        # front-facing camera (`connector`: the whole frame fitted as the
+        # person framed it, never mirrored, never drawn on - the phone's
+        # keypoints do not map onto another camera's picture).
+        self.face_source = "connector" if face_source == "connector" else "phone"
+        self.face_mirror = bool(face_mirror) and self.face_source == "phone"
         self.stopping = threading.Event()
         self._lock = threading.Lock()
         self._context: dict[str, object] = {}
@@ -1055,19 +1062,26 @@ class OverlayRenderer(threading.Thread):
             return
         frame_w = face_frame.yuv.shape[1]
         frame_h = face_frame.yuv.shape[0] * 2 // 3
-        target = face_crop_target(face_pose.points, face_pose.scores, frame_w, frame_h)
-        if self._crop is None or self._crop_frame != (frame_w, frame_h):
-            self._crop = target
-            self._crop_frame = (frame_w, frame_h)
-        else:
-            self._crop = tuple(
-                old + (new - old) * INSET_SMOOTH for old, new in zip(self._crop, target))
-        box = crop_box(*self._crop, frame_w, frame_h)
         x, y, w, h = self._inset
-        fit = fit_geometry(box[2], box[3], w, h)
-        inset = downscale_i420(crop_i420(face_frame.yuv, box), fit)
-        painter = KeypointPainter(CropGeometry(fit, box[0], box[1]), mirror=mirror)
-        painter.paint(inset, face_pose, keypoints=keypoints)
+        if self.face_source == "connector":
+            # The connector's picture, whole: the person framed it (OBS's
+            # canvas, or their camera's), and the phone's keypoints are
+            # another picture's.
+            fit = fit_geometry(frame_w, frame_h, w, h)
+            inset = downscale_i420(face_frame.yuv, fit)
+        else:
+            target = face_crop_target(face_pose.points, face_pose.scores, frame_w, frame_h)
+            if self._crop is None or self._crop_frame != (frame_w, frame_h):
+                self._crop = target
+                self._crop_frame = (frame_w, frame_h)
+            else:
+                self._crop = tuple(
+                    old + (new - old) * INSET_SMOOTH for old, new in zip(self._crop, target))
+            box = crop_box(*self._crop, frame_w, frame_h)
+            fit = fit_geometry(box[2], box[3], w, h)
+            inset = downscale_i420(crop_i420(face_frame.yuv, box), fit)
+            painter = KeypointPainter(CropGeometry(fit, box[0], box[1]), mirror=mirror)
+            painter.paint(inset, face_pose, keypoints=keypoints)
         if state == "stale":
             self._count("overlayFaceStale")
         # A border, then the inset over the body picture.
@@ -1142,6 +1156,8 @@ class OverlayRenderer(threading.Thread):
                 "skewMs": round(skew * 1000) if skew is not None else None,
                 "mirror": face_mirror,
                 "timing": self.sync.timing if self.sync is not None else None,
+                # Whose picture the inset is: `phone` or `connector`.
+                "faceSource": self.face_source if self.sync is not None else None,
             },
         }
 
@@ -1161,7 +1177,9 @@ def build_renderer(args, telemetry, source_fps: float = 30.0,
     configured (the default: zero overhead). `sync` (sync.ViewSync) makes
     it the two-camera layout, the face inset mirrored as `args.face_mirror`
     says to begin with; `args.overlay_layers` (OVERLAYS) is what is drawn
-    to begin with, clean when unsaid."""
+    to begin with, clean when unsaid; `args.face_view_stream`, when set,
+    makes the inset the connector's picture (OverlayRenderer, face_source)
+    rather than the phone's."""
     url = getattr(args, "overlay_publish", "") or ""
     if not url:
         return None
@@ -1182,4 +1200,5 @@ def build_renderer(args, telemetry, source_fps: float = 30.0,
         source_fps=source_fps,
         mirror=bool(getattr(args, "overlay_mirror", False)),
         sync=sync, face_mirror=bool(getattr(args, "face_mirror", False)),
-        overlay=parse_overlay(getattr(args, "overlay_layers", None)))
+        overlay=parse_overlay(getattr(args, "overlay_layers", None)),
+        face_source=("connector" if getattr(args, "face_view_stream", "") else "phone"))

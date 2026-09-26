@@ -33,6 +33,11 @@ against production, and a check that should hold but does not is a report.
   live-streaming destination the user names from their phone when they
   open a live stream (README, "The live stream"; the destination and its
   key reach the enclave alone, and the trainer may only stop the stream),
+  the phone's own camera picture copied, unchanged, to that user's own
+  connector on their computer when they ask for it there and from their
+  phone (README, "Trust boundary": through the connector's verified tunnel
+  alone, to a certificate the enclave pinned, for OBS to work on; what
+  comes back is shown as their face and never analysed),
   and, for a signed-in session, the session record (README,
   "Session records"): the keypoints, motion descriptors, audio
   measurements and the analysis's rows, written to the one bucket the

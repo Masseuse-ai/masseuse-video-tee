@@ -127,7 +127,7 @@ def session_args(tmp_path, **overrides):
     return args
 
 
-def run_session(monkeypatch, tmp_path, scripts=None, **overrides):
+def run_session(monkeypatch, tmp_path, scripts=None, epochs=None, **overrides):
     pose = StubPose()
     links = []
 
@@ -143,7 +143,7 @@ def run_session(monkeypatch, tmp_path, scripts=None, **overrides):
     StubDecoder.scripts = scripts or {
         BODY_URL: [(0, 0.0), (1, 1 / 30), (2, 2 / 30)],
         FACE_URL: [(0, 0.0), (10, 10 / 30)]}
-    StubDecoder.epochs = {BODY_URL: 1_000.0, FACE_URL: 1_002.0}
+    StubDecoder.epochs = epochs or {BODY_URL: 1_000.0, FACE_URL: 1_002.0}
     session = producer.Session(session_args(tmp_path, **overrides), Telemetry())
     session.run()
     return session, pose, links[0]
@@ -372,3 +372,90 @@ def test_a_broken_analysis_link_is_reconnected_with_backoff_and_said_on_the_stre
     first.join(5.0)
     assert not first.is_alive()
     assert telemetry.snapshot()["counters"]["analysisErrors"] == 3
+
+
+# -- the connector's camera as the face view ------------------------------------------
+
+FACE_VIEW_URL = "rtsp://127.0.0.1:8554/face-ext"
+
+
+class FakeFaceSource:
+    def __init__(self, active: bool):
+        self.active = active
+        self.stream_url = FACE_VIEW_URL
+
+
+def test_external_view_args_name_the_connectors_camera_only_while_one_is_attached():
+    class External:
+        stream_url = "rtsp://127.0.0.1:8554/ext"
+        phone_stream_url = "rtsp://127.0.0.1:8554/cam"
+
+    # With none attached the args are today's: no face_view_stream at all.
+    args = argparse.Namespace(stream="rtsp://127.0.0.1:8554/ext")
+    assert producer.external_view_args(args, External(), FakeFaceSource(False)) is True
+    assert args.face_stream == "rtsp://127.0.0.1:8554/cam"
+    assert args.audio_stream == "rtsp://127.0.0.1:8554/cam"
+    assert not hasattr(args, "face_view_stream")
+    args = argparse.Namespace(stream="rtsp://127.0.0.1:8554/ext")
+    assert producer.external_view_args(args, External(), None) is True
+    assert not hasattr(args, "face_view_stream")
+    # Attached: the face view shown is the connector's; the face stream
+    # (the keypoints', the microphone's) stays the phone's.
+    args = argparse.Namespace(stream="rtsp://127.0.0.1:8554/ext")
+    assert producer.external_view_args(args, External(), FakeFaceSource(True)) is True
+    assert args.face_view_stream == FACE_VIEW_URL
+    assert args.face_stream == "rtsp://127.0.0.1:8554/cam"
+    assert args.audio_stream == "rtsp://127.0.0.1:8554/cam"
+    # Not the external camera's stream: nothing is touched.
+    args = argparse.Namespace(stream="rtsp://127.0.0.1:8554/cam")
+    assert producer.external_view_args(args, External(), FakeFaceSource(True)) is False
+    assert not hasattr(args, "face_view_stream")
+
+
+def test_without_a_face_source_the_session_runs_exactly_two_decoders(monkeypatch, tmp_path):
+    session, pose, link = run_session(monkeypatch, tmp_path)
+    assert session.face_view_stream == "" and session.face_view_decoder is None
+    assert {d.url for d in StubDecoder.made} == {BODY_URL, FACE_URL}
+    assert link.fields["faceView"] == "phone"
+    assert session.views()["faceViewSource"] == "phone"
+    assert "faceView" not in session.views()
+
+
+def test_the_connectors_camera_is_decoded_for_the_inset_alone_and_the_face_pose_reads_the_phone(monkeypatch, tmp_path):
+    scripts = {
+        BODY_URL: [(0, 0.0), (1, 1 / 30), (2, 2 / 30)],
+        FACE_URL: [(0, 0.0), (10, 10 / 30)],
+        FACE_VIEW_URL: [(0, 0.0), (5, 5 / 30), (6, 6 / 30)],
+    }
+    session, pose, link = run_session(
+        monkeypatch, tmp_path, scripts=scripts,
+        epochs={BODY_URL: 1_000.0, FACE_URL: 1_002.0, FACE_VIEW_URL: 1_003.0},
+        face_view_stream=FACE_VIEW_URL)
+    assert session.face_view_stream == FACE_VIEW_URL and session.face_stream == FACE_URL
+    # Three decoders: the connector's waits for its track like the phone's.
+    by_url = {d.url: d for d in StubDecoder.made}
+    assert set(by_url) == {BODY_URL, FACE_URL, FACE_VIEW_URL}
+    assert by_url[FACE_VIEW_URL].kwargs["wait_for_track"] is True
+    assert by_url[FACE_VIEW_URL].stopped
+    # The face pose still reads the phone's frames, and only those: the
+    # connector's frames were never posed.
+    face_steps = [(index, at) for view, index, at in pose.steps if view == "face"]
+    assert face_steps == [(0, 0.0), (10, round(10 / 30, 4))]
+    assert all(view in ("body", "face") for view, _, _ in pose.steps)
+    # The analysis was told which picture the face view is.
+    assert link.fields["views"] == ["body", "face"] and link.fields["faceView"] == "connector"
+    counters = session.telemetry.snapshot()["counters"]
+    assert counters["faceFramesIn"] == 2 and counters["faceViewFramesIn"] == 3
+    # The face clock is the connector's (the frames shown), not the phone's.
+    views = session.views()
+    assert views["faceView"] == {"timing": "ntp", "epoch": 1_003.0, "url": FACE_VIEW_URL}
+    assert views["faceViewSource"] == "connector"
+    assert views["sync"] == {"timing": "ntp", "skewMs": 3000}
+
+
+def test_a_face_view_stream_that_is_the_phones_or_the_bodys_is_no_third_view(monkeypatch, tmp_path):
+    session, _, link = run_session(monkeypatch, tmp_path, face_view_stream=FACE_URL)
+    assert session.face_view_stream == "" and link.fields["faceView"] == "phone"
+    assert {d.url for d in StubDecoder.made} == {BODY_URL, FACE_URL}
+    session, _, _ = run_session(monkeypatch, tmp_path, face_view_stream=BODY_URL)
+    assert session.face_view_stream == ""

@@ -806,7 +806,7 @@ from sync import ViewSync  # noqa: E402
 
 
 def dual_renderer(publisher, clock, telemetry=None, size=(1280, 720),
-                  face_mirror=False, overlay="clean"):
+                  face_mirror=False, overlay="clean", face_source="phone"):
     """A two-camera view whose clocks are anchored: the face view's
     timeline starts 2 s after the body's on the senders' clock."""
     sync = ViewSync(clock=clock)
@@ -814,7 +814,8 @@ def dual_renderer(publisher, clock, telemetry=None, size=(1280, 720),
     sync.face.anchor(1_002.0)
     view = OverlayRenderer(publisher, telemetry, size=size, fps=15.0,
                            delay_s=0.0, source_fps=FPS, clock=clock,
-                           sync=sync, face_mirror=face_mirror, overlay=overlay)
+                           sync=sync, face_mirror=face_mirror, overlay=overlay,
+                           face_source=face_source)
     return view, sync
 
 
@@ -910,6 +911,45 @@ def test_the_inset_shows_the_face_frame_at_the_same_moment_with_its_keypoints():
     patch2 = inset2[max(0, py - 3):py + 4, max(0, px - 3):px + 4]
     assert (patch2[..., 0] == patch2[..., 2]).all()  # grey: the picture alone
     assert inset2[h // 2:, :w // 4].mean() > 150 and inset2[h // 2:, 3 * w // 4:].mean() < 60
+
+
+def test_the_connectors_picture_fills_the_inset_whole_without_keypoints_or_mirror():
+    """With the connector's front-facing camera as the face view the inset
+    is that picture fitted whole - no face-follow crop, since the person
+    framed it - and the keypoints layer, mirror included, leaves it alone:
+    the phone's keypoints are another picture's."""
+    clock, publisher, telemetry = Clock(), FakePublisher(), Telemetry()
+    view, sync = dual_renderer(publisher, clock, telemetry, overlay="keypoints",
+                               face_mirror=True, face_source="connector")
+    assert view.face_source == "connector" and view.face_mirror is False
+    body = gray_frame(640, 360, value=0)
+    # A landscape frame from OBS: bright in its left half.
+    fw, fh = 640, 360
+    face = face_frame(fw, fh)
+    view.offer_frame(90, 3.0, body)
+    view.offer_face_frame(30, 1.0, face)
+    points, scores = head_points(fw, fh, fw * 0.8, fh / 2)  # a face far right: a crop would follow it
+    view.offer_face_pose(30, 1.0, points, scores, [400, 100, 200, 200], 0.8, 1, False)
+    assert view.tick() == "emitted"
+    canvas = publisher.frames[0]
+    x, y, w, h = view.snapshot()["view"]["inset"]
+    inset = canvas[y:y + h, x:x + w]
+    # The whole frame, fitted: the bright half is the inset's left half
+    # (letterboxed top and bottom, since the inset is portrait), not a
+    # crop around the face on the right.
+    fit = fit_geometry(fw, fh, w, h)
+    band = inset[fit.oy + fit.fit_h // 4:fit.oy + 3 * fit.fit_h // 4]
+    assert band[:, :w // 4].mean() > 150 and band[:, 3 * w // 4:].mean() < 60
+    # No keypoint drawn anywhere in the inset: grey through and through.
+    assert (inset[..., 0] == inset[..., 2]).all()
+    snap = view.snapshot()["view"]
+    assert snap["layout"] == "inset" and snap["faceSource"] == "connector"
+    assert snap["mirror"] is False
+    # The phone's picture, same renderer settings otherwise, is the crop
+    # with the marks, as before.
+    clock2, publisher2, telemetry2 = Clock(), FakePublisher(), Telemetry()
+    phone, _ = dual_renderer(publisher2, clock2, telemetry2, overlay="keypoints")
+    assert phone.face_source == "phone" and phone.snapshot()["view"]["faceSource"] == "phone"
 
 
 def test_no_face_frame_within_the_tolerance_leaves_the_inset_out():

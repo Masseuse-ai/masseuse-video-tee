@@ -76,8 +76,9 @@ from cadence import CadencePicker, FreshPicker  # noqa: E402
 from camlink_gateway import (CamlinkGateway, GatewayError,  # noqa: E402
                              parse_expectation)
 from egress import Egress, EgressError  # noqa: E402
-from external_source import ExternalSource, SourceError  # noqa: E402
+from external_source import FACE_EXTERNAL_PATH, ExternalSource, SourceError  # noqa: E402
 from hud_card import HudCard  # noqa: E402
+from share import Share, ShareError  # noqa: E402
 from live_pose import GpuPose, SideloadPose, prefetch_model_store  # noqa: E402
 from motion import FRAMES_PER_POSE, DescriptorWorker, RowAssembler  # noqa: E402
 from overlay import (DEFAULT_OVERLAY, OVERLAYS, build_renderer,  # noqa: E402
@@ -952,6 +953,16 @@ class Session:
         if face_stream == args.stream:
             face_stream = ""  # one camera is one view
         self.face_stream = face_stream
+        # The face view shown, when it is not the phone's: the connector's
+        # front-facing camera (`args.face_view_stream`, producer
+        # external_view_args), decoded on its own for the inset alone. The
+        # face keypoints and the microphone stay the phone's
+        # (`face_stream`) whatever is shown. Empty, and nothing more runs,
+        # unless a face source is attached.
+        face_view_stream = getattr(args, "face_view_stream", "") or ""
+        if not face_stream or face_view_stream in ("", face_stream, args.stream):
+            face_view_stream = ""
+        self.face_view_stream = face_view_stream
         self.audio_stream = getattr(args, "audio_stream", "") or args.stream
         # The two views' clocks, on this host's wall clock - the scale the
         # decoders' sender-time epochs are on (sync.py).
@@ -1008,6 +1019,7 @@ class Session:
         # The views' decoders, once run() has made them (views()).
         self.decoder: Decoder | None = None
         self.face_decoder: Decoder | None = None
+        self.face_view_decoder: Decoder | None = None
         self.audio_classifier = (acquire_audio_classifier(telemetry)
                                  if getattr(args, "audio", False) else None)
         self.audio: AudioStage | None = None
@@ -1032,7 +1044,9 @@ class Session:
             audioModel=(self.audio_classifier.version
                         if self.audio_classifier is not None else None),
             views=(["body", "face"] if self.face_stream else ["body"]),
-            facePoseFps=(self.face_pose_fps if self.face_stream else None))
+            facePoseFps=(self.face_pose_fps if self.face_stream else None),
+            faceView=(("connector" if self.face_view_stream else "phone")
+                      if self.face_stream else None))
         self._relink_lock = threading.Lock()
         self._relink_thread: threading.Thread | None = None
         try:
@@ -1282,15 +1296,20 @@ class Session:
         picker = FreshPicker(CadencePicker(FPS, self.face_pose_fps))
         deferred = 0
         width = None
+        # With the connector's camera as the face view, the phone's frames
+        # are the keypoints' alone: the inset and the face clock are the
+        # face view decoder's (_face_view_loop).
+        shown = not self.face_view_stream
         try:
             for index, at_s, yuv in decoder.frames():
                 if self.stopping.is_set():
                     break
-                self._clock_view(self.sync.face, decoder, at_s)
+                if shown:
+                    self._clock_view(self.sync.face, decoder, at_s)
                 self.telemetry.count("faceFramesIn")
                 if width is None:
                     width = yuv.shape[1]
-                if self.overlay is not None:
+                if shown and self.overlay is not None:
                     self.overlay.offer_face_frame(index, at_s, yuv)
                 taken = picker.take(index, yuv)
                 if picker.deferred != deferred:
@@ -1304,6 +1323,28 @@ class Session:
         except Exception as error:  # noqa: BLE001 - said aloud; the body goes on
             self.telemetry.count("faceViewErrors")
             print(f"face view failed: {error!r}", flush=True)
+        finally:
+            decoder.stop()
+
+    def _face_view_loop(self, decoder: "Decoder") -> None:
+        """The connector's front-facing camera as the face view: its frames
+        to the overlay's inset and its clock kept, nothing else - no pose,
+        no descriptors, no analysis. On its own thread; ends with the
+        session or the stream. The frames are paired with the body view
+        by their own sender time (the connector's capture clock), so a
+        picture that went through OBS shows the moment OBS emitted it, a
+        loop's latency behind the body view."""
+        try:
+            for index, at_s, yuv in decoder.frames():
+                if self.stopping.is_set():
+                    break
+                self._clock_view(self.sync.face, decoder, at_s)
+                self.telemetry.count("faceViewFramesIn")
+                if self.overlay is not None:
+                    self.overlay.offer_face_frame(index, at_s, yuv)
+        except Exception as error:  # noqa: BLE001 - said aloud; the body goes on
+            self.telemetry.count("faceViewErrors")
+            print(f"face view (connector) failed: {error!r}", flush=True)
         finally:
             decoder.stop()
 
@@ -1348,10 +1389,13 @@ class Session:
         its grid starts, for /statz; with two views, how they stand to each
         other."""
         out = {}
-        for name, decoder in (("body", self.decoder), ("face", self.face_decoder)):
+        for name, decoder in (("body", self.decoder), ("face", self.face_decoder),
+                              ("faceView", self.face_view_decoder)):
             if decoder is not None:
                 out[name] = {"timing": decoder.timing, "epoch": decoder.epoch,
                              "url": decoder.url}
+        if self.face_stream:
+            out["faceViewSource"] = "connector" if self.face_view_stream else "phone"
         if self.sync is not None:
             skew = self.sync.skew_s()
             out["sync"] = {"timing": self.sync.timing,
@@ -1386,6 +1430,17 @@ class Session:
             face_thread = threading.Thread(
                 target=self._face_loop, args=(self.face_decoder, face_worker),
                 daemon=True)
+        face_view_thread: threading.Thread | None = None
+        if self.face_stream and self.face_view_stream:
+            # The connector's camera as the face view: a third decoder,
+            # for the inset alone (the face pose reads the phone's).
+            self.face_view_decoder = Decoder(
+                self.face_view_stream, self.telemetry,
+                realtime=self.args.pose == "gpu", stopping=self.stopping,
+                wait_for_track=True)
+            face_view_thread = threading.Thread(
+                target=self._face_view_loop, args=(self.face_view_decoder,),
+                daemon=True)
         record_taps: list[tuple] = []
         if self.record is not None:
             # The record hears every view's full result - all 308
@@ -1408,12 +1463,17 @@ class Session:
                   f"{self.overlay.snapshot()['size']}@{self.overlay.fps:g} "
                   f"{self.overlay.publisher.encoder}, {self.overlay.delay_s:.1f}s "
                   f"behind decode"
-                  + (f", face inset from {self.face_stream}" if self.face_stream else ""),
+                  + (f", face inset from {self.face_view_stream or self.face_stream}"
+                     if self.face_stream else "")
+                  + (" (the connector's camera; the face keypoints read the phone's)"
+                     if self.face_view_stream else ""),
                   flush=True)
         worker.start()
         if face_worker is not None:
             face_worker.start()
             face_thread.start()
+        if face_view_thread is not None:
+            face_view_thread.start()
         if self.audio is not None:
             self.audio.start()
         # Descriptors off the decode thread. Measuring a frame pair costs
@@ -1517,6 +1577,9 @@ class Session:
                 face_worker.stopping.set()
                 self.face_decoder.stop()
                 face_thread.join(timeout=5.0)
+            if face_view_thread is not None:
+                self.face_view_decoder.stop()
+                face_view_thread.join(timeout=5.0)
             if self.audio is not None:
                 # Its ffmpeg dies with the decoder's; the thread finishes
                 # the hop it is on, answers pending requests "closed" and
@@ -1944,33 +2007,45 @@ LEASE_BODY_CAP = 4096
 EXTERNAL_VIEW_SIZE = "1280x720"
 
 
-def external_view_args(session_args, external) -> bool:
+def external_view_args(session_args, external, face_source=None) -> bool:
     """Retune a /produce when its stream is the external camera's path: a
     fixed camera behind the user is landscape and not a selfie, so the view
     goes out 16:9 and unmirrored, whatever the phone's own camera is
     published as (--overlay-size/--overlay-mirror in tee/entrypoint.sh);
     and the phone's camera stays live beside it - its stream is the face
     view drawn as an inset, its microphone the one the audio stage listens
-    to (Session). True when it did."""
+    to (Session). With `face_source` (a second ExternalSource, the
+    connector's front-facing camera) attached, its path is the face view
+    shown - `face_view_stream` - while `face_stream` stays the phone's for
+    the keypoints and the microphone; with none attached the args are
+    exactly what they were, and nothing else runs. True when it did."""
     if external is None or getattr(session_args, "stream", "") != external.stream_url:
         return False
     session_args.overlay_mirror = False
     session_args.overlay_size = EXTERNAL_VIEW_SIZE
     session_args.face_stream = external.phone_stream_url
     session_args.audio_stream = external.phone_stream_url
+    if face_source is not None and face_source.active:
+        session_args.face_view_stream = face_source.stream_url
     return True
 
 
 def build_server(args, telemetry: Telemetry,
                  tee: TeeMode | None = None,
                  external: ExternalSource | None = None,
-                 egress: Egress | None = None) -> ThreadingHTTPServer:
+                 egress: Egress | None = None,
+                 share: Share | None = None,
+                 face_source: ExternalSource | None = None) -> ThreadingHTTPServer:
     """The session server, bound and ready for serve_forever. `tee` (built
     by serve() from the environment, or handed in by a test) switches the
     handler into TEE mode; its attestation loop is the caller's to start.
     `external` is the slot's external camera (built here in TEE mode when
     the relay is configured; a test hands in one with its network calls
-    replaced); `egress` the slot's live stream (egress.py), the same way."""
+    replaced); `egress` the slot's live stream (egress.py), `share` the
+    phone's picture to the connector (share.py) and `face_source` the
+    connector's front-facing camera (a second ExternalSource on the
+    `face-ext` path, shown as the face view and never analysed), the same
+    way."""
     busy = threading.Lock()
     # The session behind the busy lock, for /stop; set and cleared by the
     # /produce handler while it holds the lock.
@@ -2086,6 +2161,22 @@ def build_server(args, telemetry: Telemetry,
             telemetry=telemetry)
     if tee is None:
         egress = None
+    # The connector's front-facing camera (external_source.py, a second
+    # instance on its own relay path): shown as the face view in place of
+    # the phone's picture while attached, never analysed; its clear does
+    # not take the connector with it (the body camera may be its too).
+    if face_source is None and tee is not None and relay is not None:
+        face_source = ExternalSource(relay, own_ip=os.environ.get("TEE_PUBLIC_IP", ""),
+                                     path=FACE_EXTERNAL_PATH, rtsp_base=rtsp_base,
+                                     gateway=gateway, owns_gateway=False)
+    if tee is None:
+        face_source = None
+    # The phone's picture to the connector (share.py): TEE only, since it
+    # goes through the connector's tunnel and nowhere else.
+    if share is None and tee is not None and relay is not None:
+        share = Share(f"{rtsp_base}/cam", gateway=gateway, telemetry=telemetry)
+    if tee is None:
+        share = None
 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *_):
@@ -2204,6 +2295,14 @@ def build_server(args, telemetry: Telemetry,
                 if (egress is not None and egress.active
                         and egress.session_id != answer["sessionId"]):
                     egress.clear("lease for another session")
+                # Nor the last one's face camera, nor the picture it sent
+                # to its computer.
+                if (face_source is not None and face_source.active
+                        and face_source.session_id != answer["sessionId"]):
+                    face_source.clear("lease for another session")
+                if (share is not None and share.active
+                        and share.session_id != answer["sessionId"]):
+                    share.clear("lease for another session")
                 # Nor the last one's home connector: an expectation posted
                 # for another session is dropped with it.
                 if (gateway is not None and gateway.session_id
@@ -2457,6 +2556,128 @@ def build_server(args, telemetry: Telemetry,
 
         # -- the live stream --------------------------------------------------
 
+        def _face_source(self) -> None:
+            """/ingest/face-source: the connector's front-facing camera as
+            the face view (external_source.py, the `face-ext` path). PUT
+            {url} attaches it - the same checks as the body camera: rtsps
+            only, a private host through the connector's tunnel, the leaf
+            pinned; the connector's fixed link is rtsps://127.0.0.1:7443/face
+            - GET says whether one is attached, DELETE puts the phone's own
+            camera back. The production restarts on either, as on a body
+            camera switch (the trainer sees the change in /ingest/status).
+            Gated by the phone's capability like WHIP.
+            """
+            cors = self._cors()
+            if self.command == "OPTIONS":
+                self.send_response(204)
+                for name, value in cors:
+                    self.send_header(name, value)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            if self.command not in ("PUT", "GET", "DELETE"):
+                self._json(405, {"error": "method not allowed"},
+                           cors + [("Allow", "OPTIONS, PUT, GET, DELETE")])
+                return
+            session_id = self._tee_signalling_gate("face-source")
+            if session_id is None:
+                return
+            if self.command == "GET":
+                self._json(200, face_source.status(),
+                           cors + [("Cache-Control", "no-store")])
+                return
+            if self.command == "DELETE":
+                had = face_source.clear("the phone asked")
+                if had:
+                    telemetry.count("faceSourceRemoved")
+                body = dict(face_source.status())
+                body["status"] = "removed" if had else "none"
+                self._json(200, body, cors)
+                return
+            length = int(self.headers.get("Content-Length") or 0)
+            if length > LEASE_BODY_CAP:
+                self._json(413, {"status": "failed", "reason": "bad-url",
+                                 "error": "body too large"}, cors)
+                return
+            try:
+                body = json.loads(self.rfile.read(length) or b"{}")
+                if not isinstance(body, dict):
+                    raise ValueError("not an object")
+            except ValueError as error:
+                self._json(400, {"status": "failed", "reason": "bad-url",
+                                 "error": f"invalid JSON: {error}"}, cors)
+                return
+            try:
+                answer = face_source.connect(body.get("url"), session_id)
+            except SourceError as error:
+                telemetry.count("faceSourceFailed")
+                print(f"face camera: not connected ({error.reason}) for "
+                      f"session {session_id}", flush=True)
+                self._json(error.status, error.body(), cors)
+                return
+            except Exception as error:  # noqa: BLE001 - never the link itself
+                telemetry.count("faceSourceFailed")
+                print(f"face camera: failed ({type(error).__name__}) for "
+                      f"session {session_id}", flush=True)
+                self._json(500, {"status": "failed", "reason": "internal",
+                                 "error": "the slot could not attach the camera"},
+                           cors)
+                return
+            telemetry.count("faceSourceConnected")
+            self._json(200, answer, cors)
+
+        def _share(self) -> None:
+            """/ingest/share: the phone's picture to the connector on the
+            person's computer (share.py). PUT starts it (the connector
+            must be attached, and must have been asked for it there), GET
+            says whether it is on, DELETE stops it. Gated by the phone's
+            capability like WHIP: the picture is the phone's to send.
+            """
+            cors = self._cors()
+            if self.command == "OPTIONS":
+                self.send_response(204)
+                for name, value in cors:
+                    self.send_header(name, value)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            if self.command not in ("PUT", "GET", "DELETE"):
+                self._json(405, {"error": "method not allowed"},
+                           cors + [("Allow", "OPTIONS, PUT, GET, DELETE")])
+                return
+            session_id = self._tee_signalling_gate("share")
+            if session_id is None:
+                return
+            if self.command == "GET":
+                self._json(200, share.status(), cors + [("Cache-Control", "no-store")])
+                return
+            if self.command == "DELETE":
+                had = share.clear("the phone asked")
+                body = dict(share.status())
+                body["status"] = "removed" if had else "none"
+                self._json(200, body, cors)
+                return
+            length = int(self.headers.get("Content-Length") or 0)
+            if 0 < length <= LEASE_BODY_CAP:
+                self.rfile.read(length)
+            try:
+                answer = share.connect(session_id)
+            except ShareError as error:
+                telemetry.count("shareRefusedStart")
+                print(f"share: not started ({error.reason}) for session {session_id}",
+                      flush=True)
+                self._json(error.status, error.body(), cors)
+                return
+            except Exception as error:  # noqa: BLE001
+                telemetry.count("shareFailed")
+                print(f"share: failed ({type(error).__name__}) for session {session_id}",
+                      flush=True)
+                self._json(500, {"status": "failed", "reason": "internal",
+                                 "error": "the slot could not start sending the picture"},
+                           cors)
+                return
+            self._json(200, answer, cors)
+
         def _egress(self) -> None:
             """/ingest/egress: the live stream the phone opens (egress.py).
             PUT {url, audio?, hud?} starts it to the rtmps:// destination
@@ -2605,6 +2826,20 @@ def build_server(args, telemetry: Telemetry,
                 else:
                     self._view()
                 return True
+            if kind == "face-source":
+                if face_source is None:
+                    self._json(404, {"error": "a front-facing camera from the "
+                                              "computer needs a Confidential Space slot"})
+                else:
+                    self._face_source()
+                return True
+            if kind == "share":
+                if share is None:
+                    self._json(404, {"error": "sending the phone's picture to the "
+                                              "computer needs a Confidential Space slot"})
+                else:
+                    self._share()
+                return True
             if kind in ("egress", "egress-stop", "hud"):
                 if egress is None:
                     self._json(404, {"error": "a live stream needs a "
@@ -2625,7 +2860,9 @@ def build_server(args, telemetry: Telemetry,
                 if not self._control_gate():
                     return True
                 code, body = (relay.status(current["session"])
-                              if kind == "status" else relay.ingest_status(external, egress, view_prefs))
+                              if kind == "status"
+                              else relay.ingest_status(external, egress, view_prefs,
+                                                       share=share, face_source=face_source))
                 self._json(code, body)
                 return True
             leg = "whip" if kind == "whip" else "whep"
@@ -2796,8 +3033,12 @@ def build_server(args, telemetry: Telemetry,
                     records.close_in_background("teardown")
                 if external is not None:
                     external.clear("teardown")
+                if face_source is not None:
+                    face_source.clear("teardown")
                 if egress is not None:
                     egress.clear("teardown")
+                if share is not None:
+                    share.clear("teardown")
                 if gateway is not None:
                     # The slot is ending: the connector is dropped so it is
                     # free for the next one (a no-op if the camera's clear
@@ -2835,6 +3076,11 @@ def build_server(args, telemetry: Telemetry,
                 snapshot["views"] = views() if callable(views) else None
                 # The live stream: on or off, its host, its restarts; never the address.
                 snapshot["egress"] = egress.status() if egress is not None else None
+                # The phone's picture to the connector, and the connector's
+                # front-facing camera: on or off, since when.
+                snapshot["share"] = share.status() if share is not None else None
+                snapshot["faceSource"] = (face_source.status()
+                                          if face_source is not None else None)
                 # The lease's record, open between runs or not: its prefix
                 # is the trainer's opaque ids, never a person.
                 snapshot["records"] = [
@@ -2941,7 +3187,7 @@ def build_server(args, telemetry: Telemetry,
                     # lease named one (tee_mode.Lease.record_for).
                     session_args.record = tee.lease.record_for()
                     tee.lease.note_run()
-                if external_view_args(session_args, external):
+                if external_view_args(session_args, external, face_source):
                     session_args.face_mirror = view_prefs["mirror"]
                 # What the view draws over the pictures is the phone's
                 # standing choice (/ingest/view), whatever the layout.
@@ -3032,6 +3278,10 @@ def build_server(args, telemetry: Telemetry,
     server.gateway = gateway  # type: ignore[attr-defined]
     # TEE: the live stream, for tests and /statz.
     server.egress = egress  # type: ignore[attr-defined]
+    # TEE: the phone's picture to the connector and the connector's
+    # front-facing camera, for tests and /statz.
+    server.share = share  # type: ignore[attr-defined]
+    server.face_source = face_source  # type: ignore[attr-defined]
     # The GPU boot, for serve() to start ahead of the first /warmup.
     server.start_warmup = start_warmup  # type: ignore[attr-defined]
     # The slot's open session records, for serve()'s SIGTERM flush, tests

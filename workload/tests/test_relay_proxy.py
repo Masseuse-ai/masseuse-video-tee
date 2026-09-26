@@ -41,6 +41,12 @@ OVERLAY_PATH_NAMES = ("overlay", "overlay-half", "overlay-small", "overlay-lean"
 OVERLAY_WHEP_PATHS = tuple(f"/{name}/whep" for name in OVERLAY_PATH_NAMES)
 
 
+# The external camera paths the stub takes (external_source.py): the body
+# camera's `ext` under the `ext_` attributes, the connector's front-facing
+# camera's `face-ext` under the `face_` ones.
+EXT_PREFIXES = {"ext": "ext", "face-ext": "face"}
+
+
 class StubRelay(ThreadingHTTPServer):
     """MediaMTX's WHEP/WHIP surface and paths API, just enough to be
     forwarded to. `cam_ready` is whether a phone is publishing to cam.
@@ -59,6 +65,13 @@ class StubRelay(ThreadingHTTPServer):
         self.ext_polls = 0
         self.ext_tracks: list[str] = ["H264"]
         self.ext_deletes = 0
+        # The connector's front-facing camera's path (`face-ext`), the same
+        # way, under the `face_` names.
+        self.face_config: dict | None = None
+        self.face_ready_after = 1
+        self.face_polls = 0
+        self.face_tracks: list[str] = ["H264"]
+        self.face_deletes = 0
         super().__init__(("127.0.0.1", 0), StubHandler)
         self.thread = threading.Thread(target=self.serve_forever, daemon=True)
         self.thread.start()
@@ -107,13 +120,15 @@ class StubHandler(BaseHTTPRequestHandler):
             if session_id == "cam-1":
                 self.server.cam_ready = False
             return self._reply(200, {}, b"")
-        if self.path == "/v3/config/paths/add/ext":
-            if self.server.ext_config is not None:
-                return self._reply(400, {"Content-Type": "application/json"},
-                                   b'{"error":"path already exists"}')
-            self.server.ext_config = json.loads(body or b"{}")
-            self.server.ext_polls = 0
-            return self._reply(200, {"Content-Type": "application/json"}, b"{}")
+        if self.path.startswith("/v3/config/paths/add/"):
+            prefix = EXT_PREFIXES.get(self.path[len("/v3/config/paths/add/"):])
+            if prefix is not None:
+                if getattr(self.server, f"{prefix}_config") is not None:
+                    return self._reply(400, {"Content-Type": "application/json"},
+                                       b'{"error":"path already exists"}')
+                setattr(self.server, f"{prefix}_config", json.loads(body or b"{}"))
+                setattr(self.server, f"{prefix}_polls", 0)
+                return self._reply(200, {"Content-Type": "application/json"}, b"{}")
         if self.path == "/cam/whip":
             # MediaMTX's WHIP answer: the Location is the bare session
             # secret, a relative reference the proxy must own.
@@ -153,33 +168,38 @@ class StubHandler(BaseHTTPRequestHandler):
 
     def do_DELETE(self):
         self._record()
-        if self.path == "/v3/config/paths/delete/ext":
-            if self.server.ext_config is None:
-                return self._reply(404, {"Content-Type": "application/json"},
-                                   b'{"error":"path not found"}')
-            self.server.ext_config = None
-            self.server.ext_deletes += 1
-            return self._reply(200, {"Content-Type": "application/json"}, b"{}")
+        if self.path.startswith("/v3/config/paths/delete/"):
+            prefix = EXT_PREFIXES.get(self.path[len("/v3/config/paths/delete/"):])
+            if prefix is not None:
+                if getattr(self.server, f"{prefix}_config") is None:
+                    return self._reply(404, {"Content-Type": "application/json"},
+                                       b'{"error":"path not found"}')
+                setattr(self.server, f"{prefix}_config", None)
+                setattr(self.server, f"{prefix}_deletes", getattr(self.server, f"{prefix}_deletes") + 1)
+                return self._reply(200, {"Content-Type": "application/json"}, b"{}")
         if self.path.startswith("/cam/whip/"):
             self.server.cam_ready = False
         self._reply(200, {"Content-Type": "application/json"}, b'{"status":"ok"}')
 
     def do_GET(self):
         self._record()
-        if self.path == "/v3/paths/get/ext":
-            if self.server.ext_config is None:
+        if self.path.startswith("/v3/paths/get/") and self.path[len("/v3/paths/get/"):] in EXT_PREFIXES:
+            name = self.path[len("/v3/paths/get/"):]
+            prefix = EXT_PREFIXES[name]
+            if getattr(self.server, f"{prefix}_config") is None:
                 return self._reply(404, {"Content-Type": "application/json"},
                                    b'{"error":"path not found"}')
-            self.server.ext_polls += 1
-            if self.server.ext_polls < self.server.ext_ready_after:
+            polls = getattr(self.server, f"{prefix}_polls") + 1
+            setattr(self.server, f"{prefix}_polls", polls)
+            if polls < getattr(self.server, f"{prefix}_ready_after"):
                 return self._reply(200, {"Content-Type": "application/json"}, json.dumps({
-                    "name": "ext", "ready": False, "tracks": [], "bytesReceived": 0,
+                    "name": name, "ready": False, "tracks": [], "bytesReceived": 0,
                     "source": None, "readers": [],
                 }).encode())
             return self._reply(200, {"Content-Type": "application/json"}, json.dumps({
-                "name": "ext", "ready": True, "tracks": list(self.server.ext_tracks),
+                "name": name, "ready": True, "tracks": list(getattr(self.server, f"{prefix}_tracks")),
                 "bytesReceived": 1 << 20,
-                "source": {"type": "rtspSource", "id": "ext-1"}, "readers": [],
+                "source": {"type": "rtspSource", "id": f"{name}-1"}, "readers": [],
             }).encode())
         if self.path.startswith("/v3/paths/get/overlay"):
             name = self.path[len("/v3/paths/get/"):]

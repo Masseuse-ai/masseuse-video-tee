@@ -51,6 +51,18 @@ bytes a direct dial would see, so the pin is the same pin. The relay is
 pointed at `rtsps://[user:pass@]127.0.0.1:7441/<path>?<query>`: the
 camera's address goes to the gateway and nowhere else. A public host
 keeps the direct dial above, unchanged.
+
+The connector's own endpoint. The connector serves streams of its own at
+`rtsps://127.0.0.1:7443/<path>` (its camera at `camera`, its front-facing
+camera at `face`; masseuse-camlink docs/PROTOCOL.md section 6), answered
+inside the connector process. Those go through the gateway's own-endpoint
+listener, 127.0.0.1:7442, whose every connection reaches that endpoint
+without a target being set, so a camera at home as the body view (the
+relay listener's, one target per tunnel) and the connector's own streams
+travel the same tunnel. A second instance of ExternalSource on the
+`face-ext` path is the connector's front-facing camera as the face view
+(producer.py); it does not own the gateway, so removing it leaves the
+connector attached for the body camera.
 """
 
 from __future__ import annotations
@@ -69,6 +81,14 @@ from urllib.parse import urlsplit, urlunsplit
 from camlink_gateway import OFFLINE, RELAY_HOST, RELAY_PORT, GatewayError
 
 EXTERNAL_PATH = "ext"
+# The connector's front-facing camera's relay path (producer.py, the face
+# view shown in place of the phone's picture).
+FACE_EXTERNAL_PATH = "face-ext"
+# The connector's own endpoint, and the gateway listener that reaches it.
+CONNECTOR_HOST = "127.0.0.1"
+CONNECTOR_PORT = 7443
+OWN_HOST = "127.0.0.1"
+OWN_PORT = 7442
 URL_CAP = 2048
 DEFAULT_RTSPS_PORT = 322
 PROBE_TIMEOUT_S = 5.0
@@ -212,14 +232,27 @@ def validate(url: str, own_ip: str = "",
     return host, port, resolve_public(host, port, own_ip, resolver)
 
 
+def is_connector_endpoint(host: str, port: int) -> bool:
+    """Whether host:port is the connector's own endpoint (127.0.0.1:7443):
+    reached through the gateway's own-endpoint listener, no target set."""
+    return host == CONNECTOR_HOST and int(port) == CONNECTOR_PORT
+
+
 def tunnel_source_url(url: str) -> str:
-    """The pasted link with the camera's address replaced by the gateway's
-    relay listener, `rtsps://[user:pass@]127.0.0.1:7441/<path>?<query>`:
-    what the relay pulls in tunnel mode. Credentials, path and query go
-    through as they were; the host does not go to the relay at all."""
+    """The pasted link with the camera's address replaced by the gateway
+    listener that reaches it: the relay listener,
+    `rtsps://[user:pass@]127.0.0.1:7441/<path>?<query>`, for a camera on
+    the home network (the tunnel's one target), or the own-endpoint
+    listener, `127.0.0.1:7442`, for the connector's own endpoint. What the
+    relay pulls in tunnel mode. Credentials, path and query go through as
+    they were; the host does not go to the relay at all."""
     parts = urlsplit(url.strip())
     userinfo, at, _ = parts.netloc.rpartition("@")
-    netloc = f"{RELAY_HOST}:{RELAY_PORT}"
+    try:
+        own = is_connector_endpoint(parts.hostname or "", parts.port or DEFAULT_RTSPS_PORT)
+    except ValueError:
+        own = False
+    netloc = f"{OWN_HOST}:{OWN_PORT}" if own else f"{RELAY_HOST}:{RELAY_PORT}"
     if at:
         netloc = f"{userinfo}@{netloc}"
     return urlunsplit(("rtsps", netloc, parts.path, parts.query, parts.fragment))
@@ -278,11 +311,16 @@ class ExternalSource:
                  connect_timeout_s: float = CONNECT_TIMEOUT_S,
                  probe_timeout_s: float = PROBE_TIMEOUT_S, poll_s: float = POLL_S,
                  resolver=socket.getaddrinfo, probe=tls_fingerprint, gateway=None,
+                 owns_gateway: bool = True,
                  clock=time.time, monotonic=time.monotonic, sleep=time.sleep,
                  log=print):
         self.relay = relay
         self.own_ip = own_ip or ""
         self.path = path
+        # Whether clearing a camera reached through the connector drops
+        # the connector too (the body camera's instance) or leaves it for
+        # the other streams (the face camera's).
+        self.owns_gateway = bool(owns_gateway)
         self.rtsp_base = rtsp_base.rstrip("/")
         self.stream_url = f"{self.rtsp_base}/{path}"
         self.connect_timeout_s = float(connect_timeout_s)
@@ -415,7 +453,7 @@ class ExternalSource:
             self._delete_path()
         if had:
             self.log(f"external camera: removed ({reason or 'cleared'})", flush=True)
-            if mode == "tunnel" and self.gateway is not None:
+            if mode == "tunnel" and self.gateway is not None and self.owns_gateway:
                 self.gateway.clear_quietly(reason or "external camera cleared")
         return had
 
@@ -438,6 +476,16 @@ class ExternalSource:
             raise SourceError("tunnel-offline", "the connector is not attached: run "
                               "masseuse-camlink on a computer in the camera's network "
                               "and pair it with this session", 502)
+        if is_connector_endpoint(host, port):
+            # The connector's own streams: through the own-endpoint
+            # listener, which needs no target and takes none.
+            try:
+                return self.probe(OWN_HOST, OWN_PORT, OWN_HOST, self.probe_timeout_s,
+                                  sni=False)
+            except SourceError as error:
+                raise SourceError(error.reason,
+                                  TUNNEL_PROBE_WORDING.get(error.reason, error.message),
+                                  error.status) from None
         try:
             gateway.target(host, port)
         except GatewayError as error:

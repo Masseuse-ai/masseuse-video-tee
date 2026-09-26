@@ -751,9 +751,12 @@ def cors_headers(config: TeeConfig, request_origin: str | None,
     out = [("Cross-Origin-Resource-Policy", "cross-origin"),
            ("Vary", "Origin")]
     origin = (request_origin or "").rstrip("/")
-    if origin and origin in config.allowed_origins:
+    # The header carries the configured origin the request's one equals,
+    # never the request's own bytes.
+    allowed = next((o for o in config.allowed_origins if origin and o == origin), None)
+    if allowed is not None:
         out.extend([
-            ("Access-Control-Allow-Origin", origin),
+            ("Access-Control-Allow-Origin", allowed),
             # PUT is /ingest/source, the external camera's link.
             ("Access-Control-Allow-Methods", "OPTIONS, GET, PUT, POST, PATCH, DELETE"),
             ("Access-Control-Allow-Headers", ALLOWED_REQUEST_HEADERS),

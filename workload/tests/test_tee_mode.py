@@ -41,6 +41,7 @@ from egress import Egress  # noqa: E402
 from external_source import ExternalSource  # noqa: E402
 from hud_card import HudCard  # noqa: E402
 from relay_proxy import RelayProxy  # noqa: E402
+from share import Share  # noqa: E402
 from telemetry import Telemetry  # noqa: E402
 from test_camlink_gateway import CONNECTOR_KEY, TICKET_HASH, FakeGateway  # noqa: E402
 from test_external_source import FINGERPRINT, GLOBAL, resolver_for  # noqa: E402
@@ -179,6 +180,24 @@ class FakeEgressProc:
         pass
 
 
+class FakeBridge:
+    """The share's TLS bridge without a socket: the URL alone."""
+
+    def __init__(self, pin, log=print):
+        self.pin = pin
+        self.stopped = False
+
+    def start(self):
+        return 5555
+
+    @property
+    def url(self):
+        return "rtsp://127.0.0.1:5555/phone"
+
+    def stop(self):
+        self.stopped = True
+
+
 class Slot:
     """A TEE-mode producer server over a stub relay and a fake connector
     gateway, for one test. Its external camera resolves every name to a
@@ -215,12 +234,33 @@ class Slot:
             "rtsp://127.0.0.1:8554/overlay", "rtsp://127.0.0.1:8554/cam", own_ip="34.1.2.3",
             hud_card=HudCard(), resolver=resolver_for(GLOBAL), popen=popen,
             clock=lambda: 1_700_000_000.0, log=lambda *a, **k: None)
+        # The phone's picture to the connector: the same scripted ffmpeg,
+        # the connector's leaf found without a network, the bridge a stub.
+        self.share_procs: list[FakeEgressProc] = []
+
+        def share_popen(argv, **kwargs):
+            proc = FakeEgressProc(argv)
+            self.share_procs.append(proc)
+            return proc
+
+        self.share = Share(
+            "rtsp://127.0.0.1:8554/cam", gateway=self.external.gateway,
+            probe=lambda: FINGERPRINT.lower(), bridge_factory=FakeBridge, popen=share_popen,
+            clock=lambda: 1_700_000_000.0, log=lambda *a, **k: None)
+        # The connector's front-facing camera: a second external source on
+        # the face path, which does not own the connector.
+        self.face_source = ExternalSource(
+            RelayProxy(self.relay.base, self.relay.base), own_ip="34.1.2.3", path="face-ext",
+            resolver=resolver_for(GLOBAL), probe=probe, sleep=lambda s: None,
+            connect_timeout_s=0.5, log=lambda *a, **k: None,
+            gateway=self.external.gateway, owns_gateway=False)
         self.server = producer.build_server(
             server_args(overlay_publish="rtsp://127.0.0.1:8554/overlay",
                         overlay_renditions="hi,half,small,lean",
                         overlay_relay_webrtc=self.relay.base,
                         overlay_relay_api=self.relay.base),
-            Telemetry(), tee=self.tee, external=self.external, egress=self.egress)
+            Telemetry(), tee=self.tee, external=self.external, egress=self.egress,
+            share=self.share, face_source=self.face_source)
         # The process exits a slot may ask for (a `/teardown?mode=now`, the
         # idle exit) are recorded here, never taken: taken, os._exit(0)
         # ends the test runner half way with a clean exit code and no
@@ -239,6 +279,7 @@ class Slot:
     def __exit__(self, *exc):
         self.server.current["session"] = None
         self.egress.clear("test over")
+        self.share.clear("test over")
         self.server.shutdown()
         self.server.server_close()
         self.relay.stop()
@@ -1339,3 +1380,144 @@ def test_a_lease_for_another_session_takes_the_live_stream_with_it():
         slot.lease("sess-2")
         assert slot.egress.active is False
         assert slot.egress_procs[0].returncode == -15
+
+
+def test_the_phone_sends_its_picture_to_the_connector_with_its_capability_when_the_connector_is_there():
+    with Slot() as slot:
+        # Without a lease, nothing; the preflight is answered.
+        cap0, _ = capability()
+        code, headers, body = slot.as_phone(cap0, "PUT", "/ingest/share")
+        assert code == 401 and json.loads(body)["reason"] == "no lease"
+        assert headers["Access-Control-Allow-Origin"] == ORIGIN
+        code, headers, _ = slot.request(
+            "OPTIONS", "/ingest/share", b"",
+            {"Origin": ORIGIN, "Access-Control-Request-Method": "PUT",
+             "Access-Control-Request-Headers": "authorization"})
+        assert code == 204 and "PUT" in headers["Access-Control-Allow-Methods"]
+
+        cap = slot.lease()
+        code, headers, body = slot.as_phone(cap, "GET", "/ingest/share")
+        assert code == 200 and json.loads(body)["active"] is False
+        assert headers["Cache-Control"] == "no-store"
+        assert slot.as_phone(cap, "PATCH", "/ingest/share")[0] == 405
+        # No connector attached: refused before anything is probed or spawned.
+        code, _, body = slot.as_phone(cap, "PUT", "/ingest/share")
+        assert code == 502 and json.loads(body)["reason"] == "connector-offline"
+        assert slot.share_procs == []
+        # The trainer has no PUT here, nor anyone without the capability.
+        assert slot.as_trainer("PUT", "/ingest/share")[0] == 401
+        assert slot.request("PUT", "/ingest/share")[0] == 401
+
+        # The connector attached: the picture goes, copied off the phone's
+        # path into the bridge to the connector's phone path.
+        slot.gateway.connected = True
+        code, headers, body = slot.as_phone(cap, "PUT", "/ingest/share")
+        assert code == 200, body
+        answer = json.loads(body)
+        assert answer["status"] == "connected" and answer["active"] is True
+        assert answer["since"] == 1_700_000_000.0 and answer["refused"] is False
+        assert headers["Access-Control-Allow-Origin"] == ORIGIN
+        deadline = time.time() + 3.0
+        while len(slot.share_procs) < 1 and time.time() < deadline:
+            time.sleep(0.02)
+        assert len(slot.share_procs) == 1
+        argv = slot.share_procs[0].argv
+        assert argv[argv.index("-i") + 1] == "rtsp://127.0.0.1:8554/cam"
+        assert argv[-1] == "rtsp://127.0.0.1:5555/phone" and "copy" in argv and "-an" in argv
+        assert slot.share.pin == FINGERPRINT.lower()
+        # The gateway was asked whether the connector is there; it was not
+        # given a target (the own listener needs none).
+        assert slot.gateway.target is None
+
+        # The trainer's poll says the picture is going; the statz too.
+        code, _, body = slot.as_trainer("GET", "/ingest/status")
+        status = json.loads(body)
+        assert code == 200 and status["share"]["active"] is True
+        assert status["share"]["since"] == 1_700_000_000.0
+        assert status["faceSource"]["kind"] == "phone" and status["faceSource"]["streamUrl"] is None
+        code, _, body = slot.as_trainer("GET", "/statz")
+        assert json.loads(body)["share"]["active"] is True
+
+        # The phone's DELETE stops it; it survives /stop; a teardown ends it.
+        code, _, body = slot.as_phone(cap, "DELETE", "/ingest/share")
+        assert code == 200 and json.loads(body)["status"] == "removed"
+        assert slot.share_procs[0].returncode == -15
+        code, _, body = slot.as_phone(cap, "DELETE", "/ingest/share")
+        assert json.loads(body)["status"] == "none"
+        assert slot.as_phone(cap, "PUT", "/ingest/share")[0] == 200
+        slot.as_trainer("POST", "/stop")
+        assert slot.share.active is True, "a /stop restarts a production; the share stays"
+        code, _, _ = slot.as_trainer("POST", "/teardown?mode=now")
+        assert code == 200
+        assert slot.share.active is False
+        deadline = time.time() + 3.0
+        while not slot.exits and time.time() < deadline:
+            time.sleep(0.05)
+        assert slot.exits == [0]
+
+
+def test_a_lease_for_another_session_takes_the_share_and_the_face_camera_with_it():
+    json_type = {"Content-Type": "application/json"}
+    with Slot() as slot:
+        slot.gateway.connected = True
+        cap = slot.lease("sess-1")
+        assert slot.as_phone(cap, "PUT", "/ingest/share")[0] == 200
+        slot.relay.face_ready_after = 1
+        code, _, body = slot.as_phone(cap, "PUT", "/ingest/face-source",
+                                      b'{"url": "rtsps://127.0.0.1:7443/face"}', json_type)
+        assert code == 200, body
+        assert slot.share.active and slot.face_source.active
+        # The same session leasing again (a trainer restart) keeps both.
+        slot.lease("sess-1")
+        assert slot.share.active and slot.face_source.active
+        # Another session's lease inherits neither.
+        slot.lease("sess-2")
+        assert not slot.share.active and not slot.face_source.active
+        assert slot.relay.face_config is None
+
+
+def test_the_connectors_face_camera_is_the_face_view_while_attached_and_never_the_body():
+    json_type = {"Content-Type": "application/json"}
+    with Slot() as slot:
+        cap = slot.lease()
+        code, _, body = slot.as_phone(cap, "GET", "/ingest/face-source")
+        assert code == 200 and json.loads(body)["kind"] == "phone"
+        # Not while the connector is away.
+        code, _, body = slot.as_phone(cap, "PUT", "/ingest/face-source",
+                                      b'{"url": "rtsps://127.0.0.1:7443/face"}', json_type)
+        assert code == 502 and json.loads(body)["reason"] == "tunnel-offline"
+        # A link that is not rtsps, or not JSON, says why.
+        code, _, body = slot.as_phone(cap, "PUT", "/ingest/face-source",
+                                      b'{"url": "rtsp://127.0.0.1:7443/face"}', json_type)
+        assert code == 400
+        assert slot.as_phone(cap, "PUT", "/ingest/face-source", b"nope", json_type)[0] == 400
+        assert slot.as_trainer("PUT", "/ingest/face-source", b"{}", json_type)[0] == 401
+
+        slot.gateway.connected = True
+        slot.relay.face_ready_after = 2
+        code, _, body = slot.as_phone(cap, "PUT", "/ingest/face-source",
+                                      b'{"url": "rtsps://127.0.0.1:7443/face"}', json_type)
+        assert code == 200, body
+        answer = json.loads(body)
+        assert answer["status"] == "connected" and answer["path"] == "face-ext" and answer["mode"] == "tunnel"
+        # Through the own listener, pinned; no target set for it.
+        assert slot.probes[-1] == ("127.0.0.1", 7442, "127.0.0.1", {"sni": False})
+        assert slot.gateway.target is None
+        assert slot.relay.face_config["source"] == "rtsps://127.0.0.1:7442/face"
+        # The body camera is still the phone's: the top of /ingest/status is
+        # the phone's path, and the face source rides beside it with its
+        # stream for /produce.
+        code, _, body = slot.as_trainer("GET", "/ingest/status")
+        status = json.loads(body)
+        assert status["path"] == "cam" and status["source"]["kind"] == "phone"
+        assert status["faceSource"]["kind"] == "external" and status["faceSource"]["path"] == "face-ext"
+        assert status["faceSource"]["streamUrl"] == "rtsp://127.0.0.1:8554/face-ext"
+        assert status["faceSource"]["mode"] == "tunnel"
+        # The phone puts its own camera back; the connector stays attached
+        # (the body camera may be its), and the path is gone.
+        code, _, body = slot.as_phone(cap, "DELETE", "/ingest/face-source")
+        assert code == 200 and json.loads(body)["status"] == "removed"
+        assert slot.gateway.connected is True and slot.relay.face_config is None
+        code, _, body = slot.as_trainer("GET", "/ingest/status")
+        assert json.loads(body)["faceSource"]["streamUrl"] is None
+        assert json.loads(slot.as_phone(cap, "DELETE", "/ingest/face-source")[2])["status"] == "none"

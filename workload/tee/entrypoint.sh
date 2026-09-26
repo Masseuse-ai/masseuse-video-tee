@@ -153,13 +153,17 @@ pids+=($!)
 
 # The home-camera tunnel gateway (github.com/FemLed/masseuse-camlink): Caddy
 # hands it /ingest/tunnel on 8090; MediaMTX dials 127.0.0.1:7441 as the
-# camera when the producer puts an external source into tunnel mode; the
-# producer drives it on 8091 (external_source.py, camlink_gateway.py). All
-# three are loopback: nothing about the tunnel is reachable except through
-# Caddy's TLS and the ticket the trainer brokered.
+# camera when the producer puts an external source into tunnel mode, and
+# 127.0.0.1:7442 - the own listener, every connection of which reaches the
+# connector's own endpoint whatever the target - for the connector's own
+# camera and face streams, which is also where the producer publishes the
+# phone's picture to the connector (share.py); the producer drives it on
+# 8091 (external_source.py, camlink_gateway.py). All four are loopback:
+# nothing about the tunnel is reachable except through Caddy's TLS and
+# the ticket the trainer brokered.
 export CAMLINK_GATEWAY_CONTROL=http://127.0.0.1:8091
-log "camlink gateway $(masseuse-camlink-gateway --version) (ws 8090, relay 7441, control 8091)"
-masseuse-camlink-gateway -ws 127.0.0.1:8090 -relay 127.0.0.1:7441 -control 127.0.0.1:8091 &
+log "camlink gateway $(masseuse-camlink-gateway --version) (ws 8090, relay 7441, own 7442, control 8091)"
+masseuse-camlink-gateway -ws 127.0.0.1:8090 -relay 127.0.0.1:7441 -own 127.0.0.1:7442 -control 127.0.0.1:8091 &
 pids+=($!)
 
 # The slot's lifetime is one session: the trainer's /teardown after the

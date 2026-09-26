@@ -74,7 +74,7 @@ RUN /venv/bin/pip install --no-cache-dir pytest \\
  && cd /app/workload && python3 -m pytest -q -p no:cacheprovider ${SMOKE_TESTS}
 RUN python3 -c "import sys; sys.path[:0] = ['/app/workload/audio', '/app/workload/pixel', '/app/workload/producer']; \\
 import torch, torchvision, torchvision.ops, transformers, cv2, scipy, numpy, PIL, yaml, cryptography, google.cloud.storage; \\
-import pose_track, live_pose, motion, tee_mode, tee_models, tee_eab, relay_proxy, analysis_link, camlink_gateway, external_source, overlay, sinks; \\
+import pose_track, live_pose, motion, tee_mode, tee_models, tee_eab, relay_proxy, analysis_link, camlink_gateway, external_source, share, egress, overlay, sinks; \\
 import audio_stage, audio_features, pitch, ced; \\
 engine = ced.CedEngine(); scores = engine.classify(numpy.zeros(16000, dtype=numpy.float32)); \\
 assert set(scores) == set(ced.TARGET_LABELS), scores; print('ced', engine.version, len(engine.labels), 'labels'); \\
