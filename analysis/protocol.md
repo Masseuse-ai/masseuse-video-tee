@@ -260,13 +260,17 @@ bundle's version. Numbers and names, kept in `hello.json` the same way.
 From 2026.09.22-1 (`face/v4`) the reading's `face` object also carries the
 head's speed (`headSpeed`, `headSpeed5s`: the rigid landmarks' centroid's
 step between rows, in inter-ocular distances a second, over the last
-second and the last five), `regions` (per face region of the keypoint
+second of face rows and the last five seconds of readings), `regions` (per face region of the keypoint
 definition, the mean displacement of its landmarks in the baseline's pose
 from their baseline-minute positions, inter-ocular units, `dy` downward
-and `dx` outward), and a signed channel, `browOuterZ` (the outer brows'
+and `dx` outward, over the last second of face rows), and a signed channel, `browOuterZ` (the outer brows'
 distance from the outer canthi against the baseline, in robust units); the
 `face` constants name the regions' landmarks and the speed's rule. The
-fields from before are computed as before.
+fields from before are computed as before. The per-second aggregates are
+read by the newest face row's clock, not the reading's: a face row's
+`bodyAtS` leads the body clock the readings are posted on by several
+seconds (2026.09.22-2; 2026.09.22-1 read them by the reading's clock and
+posted `regions` as `null`).
 
 ### `post`, at the post cadence
 
