@@ -83,12 +83,18 @@ class AudioSource:
         self.realtime = realtime and not self.network
         self.stopping = stopping
         self.sleep = sleep
+        self.closed = False
         self.proc: subprocess.Popen | None = None
 
     def _argv(self) -> list[str]:
         pacing = ["-re"] if self.realtime else []
         transport = ["-rtsp_transport", "tcp"] if self.network else []
-        return ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error",
+        # -loglevel info so that ffmpeg describes the input's streams once
+        # per connection (codec, rate, channels: what the track is as it
+        # arrives); -nostats keeps the progress line out. _relay_stderr
+        # passes on the stream lines and the warnings, nothing else.
+        return ["ffmpeg", "-nostdin", "-hide_banner", "-nostats",
+                "-loglevel", "info",
                 *pacing, *transport, "-i", self.url,
                 "-vn", "-sn", "-dn", "-map", "0:a:0",
                 "-ac", "1", "-ar", str(SAMPLE_RATE),
@@ -96,14 +102,47 @@ class AudioSource:
 
     def _spawn(self) -> None:
         self.proc = subprocess.Popen(self._argv(), stdout=subprocess.PIPE,
-                                     stderr=subprocess.DEVNULL)
+                                     stderr=subprocess.PIPE)
+        threading.Thread(target=self._relay_stderr, args=(self.proc.stderr,),
+                         daemon=True, name="audio-ffmpeg-log").start()
+
+    @staticmethod
+    def _relay_stderr(pipe) -> None:
+        """ffmpeg's stderr into the producer's log, prefixed: the input's
+        stream lines (the audio track as ffmpeg sees it) and anything a
+        component reports (`[rtsp @ ...]`, `[opus @ ...]`: losses, decode
+        errors), capped so a failing connection cannot flood the log."""
+        kept = 0
+        try:
+            for raw in pipe:
+                line = raw.decode("utf-8", "replace").rstrip()
+                stripped = line.strip()
+                if not (stripped.startswith("Stream #0:")
+                        or stripped.startswith("Input #0")
+                        or stripped.startswith("[")):
+                    continue
+                if stripped.startswith("Stream #0:") and (
+                        "->" in stripped or "pcm_s16le" in stripped):
+                    continue  # the output side: ours already
+                kept += 1
+                if kept <= 40:
+                    print(f"audio ffmpeg: {stripped}", flush=True)
+                elif kept == 41:
+                    print("audio ffmpeg: (further lines dropped)", flush=True)
+        except Exception:  # noqa: BLE001 - a log relay never takes the stage down
+            pass
+        finally:
+            try:
+                pipe.close()
+            except Exception:  # noqa: BLE001
+                pass
 
     def chunks(self) -> Iterable[np.ndarray]:
         """Yields float32 arrays of `hop_samples` samples in [-1, 1]."""
         hop_bytes = self.hop_samples * BYTES_PER_SAMPLE
         delivered = 0
         while True:
-            if self.stopping is not None and self.stopping.is_set():
+            if self._stopped():
                 return
             if self.proc is None or self.proc.poll() is not None:
                 self._spawn()
@@ -130,11 +169,17 @@ class AudioSource:
     def _wait(self, seconds: float) -> None:
         deadline = time.monotonic() + seconds
         while time.monotonic() < deadline:
-            if self.stopping is not None and self.stopping.is_set():
+            if self._stopped():
                 return
             self.sleep(min(0.25, deadline - time.monotonic()))
 
+    def _stopped(self) -> bool:
+        return self.closed or (self.stopping is not None and self.stopping.is_set())
+
     def stop(self) -> None:
+        """No more chunks: the loop ends instead of reconnecting once the
+        killed ffmpeg's short read comes back."""
+        self.closed = True
         if self.proc is not None:
             self.proc.kill()
 
@@ -222,6 +267,9 @@ class AudioStage(threading.Thread):
         self.hops += 1
         self.telemetry.count("audioHops")
         self.telemetry.gauge("audioS", end_s)
+        # The level of the window the classifier just saw: what the stage
+        # is hearing at all, in the telemetry line. -90 is digital silence.
+        self.telemetry.gauge("audioDbfs", float(pitch.get("loudnessDbfs") or -90.0))
         stream_s = self.stream_clock()
         if stream_s is not None:
             self.telemetry.gauge("audioLagS", float(stream_s) - end_s)

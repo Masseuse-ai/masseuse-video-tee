@@ -9,8 +9,10 @@ against the rolling history.
 
 from __future__ import annotations
 
+import io
 import json
 import math
+import subprocess
 
 import numpy as np
 import pytest
@@ -211,6 +213,71 @@ def test_source_argv_reads_only_the_audio_track():
     assert "-rtsp_transport" in argv and "-re" not in argv
     file_source = AudioSource("/tmp/clip.mp4", Telemetry(), realtime=True)
     assert "-re" in file_source._argv() and "-rtsp_transport" not in file_source._argv()
+    assert "-nostats" in argv and argv[argv.index("-loglevel") + 1] == "info"
+
+
+def test_source_stop_ends_the_loop_instead_of_reconnecting(monkeypatch):
+    """A network source whose ffmpeg was killed by stop() must not spawn
+    another: the short read that follows the kill is the end."""
+    spawned = []
+
+    class Proc:
+        def __init__(self):
+            self.stdout = io.BytesIO(b"\0" * 4)  # shorter than a hop: the end
+            self.stderr = io.BytesIO(b"")
+            self.killed = False
+
+        def poll(self):
+            return 0 if self.killed else None
+
+        def wait(self):
+            return 0
+
+        def kill(self):
+            self.killed = True
+
+    def fake_popen(argv, **kwargs):
+        spawned.append(argv)
+        return Proc()
+
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+    telemetry = Telemetry()
+    source = AudioSource("rtsp://127.0.0.1:8554/cam", telemetry, sleep=lambda s: None)
+    chunks = source.chunks()
+    # Nothing arrives, the source is told to stop while it waits to retry:
+    # the generator ends and no second ffmpeg is started.
+    source.stop()
+    assert list(chunks) == []
+    assert len(spawned) <= 1
+
+
+def test_source_relays_the_input_streams_and_warnings_only(capsys):
+    lines = (
+        b"Input #0, rtsp, from 'rtsp://127.0.0.1:8554/cam':\n"
+        b"  Metadata:\n    title           : Stream\n"
+        b"  Duration: N/A, start: 0.000000, bitrate: N/A\n"
+        b"  Stream #0:0: Video: h264 (High), yuv420p, 1280x720, 90k tbn\n"
+        b"  Stream #0:1: Audio: opus, 48000 Hz, stereo, fltp\n"
+        b"Stream mapping:\n  Stream #0:1 -> #0:0 (opus (native) -> pcm_s16le (native))\n"
+        b"Output #0, s16le, to 'pipe:1':\n"
+        b"  Stream #0:0: Audio: pcm_s16le, 16000 Hz, mono, s16, 256 kb/s\n"
+        b"[rtsp @ 0x1] Keyframe missing\n"
+    )
+    AudioSource._relay_stderr(io.BytesIO(lines))
+    out = capsys.readouterr().out.splitlines()
+    assert out == [
+        "audio ffmpeg: Input #0, rtsp, from 'rtsp://127.0.0.1:8554/cam':",
+        "audio ffmpeg: Stream #0:0: Video: h264 (High), yuv420p, 1280x720, 90k tbn",
+        "audio ffmpeg: Stream #0:1: Audio: opus, 48000 Hz, stereo, fltp",
+        "audio ffmpeg: [rtsp @ 0x1] Keyframe missing",
+    ]
+
+
+def test_stage_reports_the_window_level():
+    _, _, _, telemetry = run_stage(hops(tone(3.0, hz=200.0, amplitude=0.1)))
+    assert telemetry.snapshot()["gauges"]["audioDbfs"] == pytest.approx(-23.0, abs=1.0)
+    _, _, _, quiet_telemetry = run_stage(hops(silence(3.0)))
+    assert quiet_telemetry.snapshot()["gauges"]["audioDbfs"] == -90.0
 
 
 # -- the measurements themselves ---------------------------------------------
