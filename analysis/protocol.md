@@ -274,7 +274,9 @@ count and type classes of the fixed classifier that judges each measured
 span from the `segment` and the trailing `audio.all` tables (`null` when
 the producer sent no `audioLabels`, and the classifier's top label decides
 as before), and `contextGroups`, the label groups the trailing background
-is read as.
+is read as. Bundle 2026.09.25-4 carries a newer such classifier, fitted on
+a third more reviewed spans than the one before it, over the same feature
+list; `head.version` tells them apart, the fields are the same.
 `face`, when present (a bundle from 2026.09.18-1 on), is the same for what
 the readings carry about a `face` view: the keypoint indices and thresholds
 it is computed from, the names of its channels, and that part of the
