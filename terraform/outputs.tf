@@ -41,6 +41,16 @@ output "models_bucket" {
   value = google_storage_bucket.models.name
 }
 
+output "capture_bucket" {
+  description = "The bucket the slots write session records to (TEE_CAPTURE_BUCKET), or \"\" when they keep none; the trainer's TEE policy pins the same name."
+  value       = var.capture_bucket
+}
+
+output "capture_writer_principals" {
+  description = "Image digest -> the Workload Identity Federation principal an enclave running that digest authenticates as (the deployed image and the candidates). The trainer's Terraform (masseuse-trainer/terraform/records.tf) grants exactly these roles/storage.objectCreator on the session-records bucket, so only an attested enclave of a released image can write a record there, and nothing can delete one."
+  value       = local.wif_principals
+}
+
 output "artifact_registry" {
   value = "${var.region}-docker.pkg.dev/${var.project_id}/${google_artifact_registry_repository.images.repository_id}"
 }

@@ -161,6 +161,17 @@ variable "trainer_url" {
   default     = "https://masseuse-trainer-125139120897.us-central1.run.app"
 }
 
+variable "capture_bucket" {
+  description = "The bucket a leased session's record is written to (TEE_CAPTURE_BUCKET; workload/producer/record.py): the trainer's session-records bucket, in the trainer's project, whose IAM grants this deployment's WIF principals (output capture_writer_principals) objectCreator. The trainer pins the same name in its TEE policy (expectedCaptureBucket) and refuses a slot attesting another; the verifier checks it too (-capture-bucket). \"\" keeps no record and refuses a lease that asks for one."
+  type        = string
+  default     = "masseuse-ai-prod"
+
+  validation {
+    condition     = var.capture_bucket == "" || can(regex("^[a-z0-9][a-z0-9._-]{1,220}[a-z0-9]$", var.capture_bucket))
+    error_message = "capture_bucket must be a bucket name or empty."
+  }
+}
+
 variable "phone_origins" {
   description = "Page origins the phone signals from (CORS allow-list for the slot's WHIP/WHEP and /attestation, TEE_ALLOWED_ORIGINS). The Cloudflare front door(s); trainer_url is added for the direct-to-Cloud-Run path used during the soak."
   type        = list(string)

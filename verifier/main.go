@@ -17,8 +17,10 @@
 //  4. Pins the workload: a signature by the release KMS key in
 //     image_signatures[] (the launcher verified it before starting the
 //     image; only the release workflow can sign with that key), the image
-//     reference under the project's Artifact Registry, TRAINER_URL env as
-//     expected, and the release stamp the workflow baked into the image
+//     reference under the project's Artifact Registry, TRAINER_URL and
+//     TEE_CAPTURE_BUCKET env as expected (where readings go, and the one
+//     bucket a leased session's record may be written to), and the
+//     release stamp the workflow baked into the image
 //     (TEE_IMAGE_VERSION, TEE_IMAGE_COMMIT in the attested environment):
 //     which release is running, held to -expect-release / -min-release
 //     when given. The digest is reported, and pinned only if a list is
@@ -90,6 +92,7 @@ type config struct {
 	imageRefPrefix  string
 	allowedDigests  []string
 	trainerURL      string
+	captureBucket   string
 	signerKeyIDs    []string
 	minRelease      string
 	expectRelease   string
@@ -277,6 +280,7 @@ func parseFlags() (*config, error) {
 	flag.StringVar(&cfg.imageRefPrefix, "image-ref-prefix", "us-central1-docker.pkg.dev/prod-masseuse-video-tee/masseuse-video-tee/", "expected prefix of submods.container.image_reference")
 	flag.StringVar(&digests, "allowed-digests", "", "comma-separated sha256:... digests to pin the slot to; empty (the norm) reports the digest and relies on the signature and the release stamp")
 	flag.StringVar(&cfg.trainerURL, "trainer-url", "https://masseuse-trainer-125139120897.us-central1.run.app", "expected TRAINER_URL in the workload env (where readings go)")
+	flag.StringVar(&cfg.captureBucket, "capture-bucket", "masseuse-ai-prod", "expected TEE_CAPTURE_BUCKET in the workload env (the bucket a leased session's record is written to, under the prefix the trainer's lease names); \"\" requires the slot to keep no record at all")
 	flag.StringVar(&signers, "signer-key-ids", "", "comma-separated hex sha256 fingerprints of accepted cosign signing keys (terraform output image_signer_fingerprint, or VERIFY.md); empty skips the signature check")
 	flag.StringVar(&cfg.minRelease, "min-release", "", "the lowest release (vX.Y.Z) the image may be, held against its attested TEE_IMAGE_VERSION; empty accepts any, including images built before the stamp")
 	flag.StringVar(&cfg.expectRelease, "expect-release", "", "the exact release (vX.Y.Z) the image must be stamped with (a roll's check that the new image is what booted)")
@@ -425,6 +429,16 @@ func run(ctx context.Context, cfg *config, r *report) error {
 	env, _ := nestedAny(claims.Submods, "container", "env").(map[string]any)
 	trainer, _ := env["TRAINER_URL"].(string)
 	r.add("image.env.TRAINER_URL", strings.TrimRight(trainer, "/") == strings.TrimRight(cfg.trainerURL, "/"), trainer)
+	// Where a leased session's record goes (workload/producer/record.py):
+	// the one bucket, or none. The trainer holds the same expectation
+	// before it leases (expectedCaptureBucket in its policy); this is the
+	// outsider's copy of that check.
+	capture, _ := env["TEE_CAPTURE_BUCKET"].(string)
+	captureDetail := capture
+	if capture == "" {
+		captureDetail = "(unset: the slot keeps no session record)"
+	}
+	r.add("image.env.TEE_CAPTURE_BUCKET", capture == cfg.captureBucket, captureDetail)
 	r.Release = releaseOf(env)
 	relOK, relDetail := releaseCheck(cfg, r.Release)
 	r.add("image.release", relOK, relDetail)

@@ -63,8 +63,9 @@ Inside the enclave, in code that is in this repository:
   breathing, groan, gasp, sigh, and "speech" so that talk can be told apart
   and set aside) along with its level and pitch. No speech recognition or
   transcription runs; nothing identifies the voice.
-- Frames and audio are then discarded. Nothing is written to disk; the VM
-  has no persistent storage and nobody at masseuse.ai can read its memory.
+- Frames and audio are then discarded. Nothing of them is written to disk;
+  the VM has no persistent storage and nobody at masseuse.ai can read its
+  memory.
 
 The keypoints (the face view's included, as their own rows), descriptors
 and vocalization labels, which identify nobody, go to an analysis module
@@ -75,6 +76,17 @@ no audio, and its logic is not published; its exact version is pinned by
 hash in this repository so the attested image says which one is running.
 The numbers, never frames or sound, are what leaves the enclave, over TLS to
 the masseuse's address that is itself part of the attestation.
+
+For a signed-in session the enclave also keeps the session's record: the
+keypoints of both views (all 308 the model emits, with their scores), the
+motion descriptors, the vocalization scores, level and pitch, and the
+analysis module's own rows, written every thirty seconds as files into one
+storage bucket whose name is part of the attestation too, under a folder
+the masseuse named for the account and the session. The record is the
+same numbers the analysis sees, kept whole so the service can be improved
+and the person can be shown their own session later; it holds no frame, no
+audio sample, no name, address or voice. "Session records" below says what
+is in it and how its destination is bound.
 
 All of that is `workload/`: `pixel/` is the decode geometry, person
 detection, keypoint detection and motion descriptors; `audio/` is the audio
@@ -192,6 +204,51 @@ SPKI hash. The same kind of token is exchanged at STS for the only credential
 that can read the model weights; the VM's service account has no data
 access.
 
+## Session records
+
+A session run for a signed-in account is written down, by both sides. The
+masseuse writes its half (the readings it received, the device's settings
+and telemetry, the conversation) and names, in the lease it grants the
+slot, the folder the enclave's half goes beside:
+`{account uuid}/estim_sessions/{session uuid}/enclave/` in the bucket
+`TEE_CAPTURE_BUCKET` names. Both halves are files of thirty-second
+windows named by the UTC second the window starts
+(`part-20260915T051230Z`), so the two line up by name.
+
+What the enclave writes (`workload/producer/record.py`):
+
+| Stream | Content | Format |
+| --- | --- | --- |
+| `poses/`, `faces/` | Every keypoint-model result of the body and face views: all 308 keypoints with scores, the person box, the frame size, the flags (`dropped`, `error`, `identityUnresolved`); one row per pose step, keypoint-less rows where a step had none | Parquet (zstd), one file per window |
+| `frames/` | The assembler's 21-point rows at the frame rate with the regional motion descriptors (the `frame` message of `analysis/protocol.md`) | gzipped JSONL |
+| `audio/`, `segments/` | The audio stage's half-second measurements (class scores, level, pitch) and the spans the analysis asked it to type | gzipped JSONL |
+| `vocal/` | The analysis module's vocalization judgements, one row each | gzipped JSONL |
+| `onsets/`, `events/`, `payloads/`, `posts/` | What the analysis decided, and the readings it posted | gzipped JSONL |
+| `telemetry/` | The process's counters and gauges once a second | gzipped JSONL |
+| `hello.json`, `summary.json` | What the session was (the two processes' `hello`/`ready`, the keypoint layout, the image's release stamp) and how it ended | JSON |
+
+Every row is stamped with the wall clock at the moment it was written. The
+record has no frame, no audio sample and nothing about the person but the
+numbers above; the account and session identifiers in its path are
+opaque ids the masseuse minted.
+
+How the destination is bound:
+
+- The bucket's name is in the attested environment (`TEE_CAPTURE_BUCKET`).
+  The masseuse's policy pins it and refuses to lease a slot attesting
+  another; `tee-verify` checks it (`image.env.TEE_CAPTURE_BUCKET`).
+- The enclave writes as its attested identity: a Workload Identity
+  Federation principal keyed to the running image digest, granted only
+  `objectCreator` on that bucket. It can add a file; it cannot read, list,
+  overwrite (every part is created once) or delete one. No service
+  account and no person holds a delete on the bucket.
+- The prefix is validated against its shape and comes from the lease; a
+  slot without a bucket refuses a lease that asks for a record, so a
+  session is never silently unrecorded.
+- A test run's capture (`--capture-bucket`, `runs/<name>/`) stays
+  forbidden in `--tee` mode; the record is the only thing a leased
+  session writes out, and only for sessions the masseuse names one for.
+
 ## Verify it yourself
 
 `VERIFY.md` walks through it: build `verifier/` (Go), point it at a live
@@ -208,7 +265,7 @@ report a check that should hold and does not.
 | --- | --- |
 | `workload/pixel/` | Everything that reads frames: decode geometry and stream handling (`live_pose.py`), RT-DETRv4 person detection (`vendor/rtdetrv4/`, `pose_track.py`), Sapiens2-1B keypoints (`pose_post.py`, `pose_rows.py`, `keypoints.py`), the captured CUDA graphs both forwards replay (`gpu_graph.py`) and the debug-slot bench of the pose graph over batches of crops (`pose_bench.py`), regional motion descriptors (`motion.py`) |
 | `workload/audio/` | Everything that reads sound: the audio track decoded to 16 kHz PCM (`audio_stage.py`), the CED non-speech vocalization classifier binding (`ced.py`; the library and weights are built into the image, `Dockerfile.tee`), level and pitch (`pitch.py`, `audio_features.py`) |
-| `workload/producer/` | The session shell (`producer.py`), the overlay drawn back to the phone, the WHIP/WHEP relay proxy with the capability and evidence checks, the external-camera and connector ingest, the two views' clocks (`sync.py`), the enclave's boot helpers (attestation, ACME, weights and analysis bundle fetch), the socket client to the analysis module |
+| `workload/producer/` | The session shell (`producer.py`), the overlay drawn back to the phone, the WHIP/WHEP relay proxy with the capability and evidence checks, the external-camera and connector ingest, the two views' clocks (`sync.py`), the enclave's boot helpers (attestation, ACME, weights and analysis bundle fetch), the socket client to the analysis module, the session record's parts and uploader (`record.py`) |
 | `workload/reader/` | `stream-reader` (Go): reads a live stream's video track off the relay and hands the producer each decoded frame with the time its sender gave it, so two cameras' views line up on their senders' clocks; the frame record it writes is documented in `record/record.go` |
 | `workload/tee/` | The image: `Dockerfile` (base: Python, torch, ffmpeg, `stream-reader`), `Dockerfile.tee` (MediaMTX, Caddy, the connector gateway, the launch policy), `entrypoint.sh`, `Caddyfile`, `mediamtx.tee.yml` |
 | `workload/tests/` | The workload's tests, CPU only |

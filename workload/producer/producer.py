@@ -77,6 +77,7 @@ from external_source import ExternalSource, SourceError  # noqa: E402
 from live_pose import GpuPose, SideloadPose, prefetch_model_store  # noqa: E402
 from motion import DescriptorWorker, RowAssembler  # noqa: E402
 from overlay import build_renderer, parse_renditions  # noqa: E402
+from record import DEFAULT_PART_S, Record  # noqa: E402
 from relay_proxy import (RelayProxy, location_secret,  # noqa: E402
                          route as relay_route)
 from sinks import Capture, Poster  # noqa: E402
@@ -845,6 +846,33 @@ def capture_dir(sink_dir: str, run_name: str) -> Path:
     return root / run_name if run_name else root
 
 
+def open_record(args, telemetry: Telemetry) -> Record | None:
+    """The record a leased session writes (record.py), from what the
+    /produce handler put on the args (`args.record`: the lease's prefix and
+    part length, the slot's bucket, the session id). None without one; a
+    record that cannot be opened is said aloud and the session runs
+    without it, counted, rather than not at all."""
+    spec = getattr(args, "record", None)
+    if not isinstance(spec, dict) or not spec.get("prefix") or not spec.get("bucket"):
+        return None
+    directory = Path(args.sink_dir) / "record" / str(spec.get("sessionId") or "session")
+    provenance = {
+        "imageVersion": os.environ.get("TEE_IMAGE_VERSION") or None,
+        "imageCommit": os.environ.get("TEE_IMAGE_COMMIT") or None,
+        "slot": os.environ.get("SLOT_NAME") or None,
+    }
+    try:
+        return Record(directory, str(spec["bucket"]), str(spec["prefix"]),
+                      str(spec.get("sessionId") or ""),
+                      part_s=int(spec.get("partSeconds") or DEFAULT_PART_S),
+                      telemetry=telemetry, provenance=provenance)
+    except Exception as error:  # noqa: BLE001 - said aloud, counted
+        telemetry.count("recordErrors")
+        print(f"record: could not open {spec.get('bucket')}/{spec.get('prefix')}: "
+              f"{error!r}", flush=True)
+        return None
+
+
 class Session:
     """One stream, start to stop - or two.
 
@@ -901,7 +929,12 @@ class Session:
         self.assembler_lock = threading.Lock()
         self.descriptors = DescriptorWorker()
         self.run_name = getattr(args, "run", "") or ""
-        self.capture = Capture(capture_dir(args.sink_dir, self.run_name))
+        # A leased session's record (record.py): the lease named the
+        # prefix, the slot's tee-env the bucket; every stream goes there
+        # as 30-second parts. Without one the capture is the flat files.
+        self.record = open_record(args, telemetry)
+        self.capture = Capture(capture_dir(args.sink_dir, self.run_name),
+                               record=self.record)
         self.summary: dict | None = None
         # Why run() ended early, if it did not end on its own terms: said
         # over the /produce stream as an `error` event ahead of the summary.
@@ -936,9 +969,7 @@ class Session:
         # text, gauges and segment requests come back through _on_analysis.
         # Opened last so a session that fails to reach it has nothing else
         # to tear down.
-        self.analysis = open_link(
-            getattr(args, "analysis_socket", "") or "",
-            self._on_analysis, self._on_analysis_error,
+        hello = dict(
             fps=FPS, poseFps=self.pose_fps,
             postIntervalS=self.post_interval_s,
             run=self.run_name or None,
@@ -947,17 +978,54 @@ class Session:
                         if self.audio_classifier is not None else None),
             views=(["body", "face"] if self.face_stream else ["body"]),
             facePoseFps=(self.face_pose_fps if self.face_stream else None))
+        try:
+            self.analysis = open_link(
+                getattr(args, "analysis_socket", "") or "",
+                self._on_analysis, self._on_analysis_error, **hello)
+        except Exception as error:
+            # A session that never starts still closes what it opened: the
+            # record says so and its uploader thread goes with it.
+            if self.record is not None:
+                self.record.close({"error": repr(error)}, timeout_s=5.0)
+            raise
         if self.analysis.connected:
             ready = self.analysis.ready or {}
             print(f"analysis: {ready.get('version', '?')} "
                   f"({ready.get('modelVersion', '?')}) on "
                   f"{args.analysis_socket}", flush=True)
+        if self.record is not None:
+            # hello.json: the session as the two processes agreed it, the
+            # analysis's versions and constants with it.
+            self.record.hello(
+                hello={key: value for key, value in hello.items() if key != "run"},
+                ready=(self.analysis.ready if self.analysis.connected else None),
+                sources=self._record_sources())
+            self.record.telemetry_from(telemetry)
         if self.audio_classifier is not None:
             self.audio = AudioStage(
                 AudioSource(self.audio_stream, telemetry,
                             realtime=args.pose == "gpu", stopping=self.stopping),
-                self.audio_classifier, self.analysis.send, telemetry,
+                self.audio_classifier, self._to_analysis, telemetry,
                 stream_clock=lambda: self.stream_at_s)
+
+    def _to_analysis(self, message: dict) -> None:
+        """A message to the analysis process, and to the record when it is
+        one of the kinds the record keeps (frame, audio, segment)."""
+        self.analysis.send(message)
+        capture = getattr(self, "capture", None)
+        if capture is not None:
+            capture.outbound(message)
+
+    def _record_sources(self) -> dict:
+        """hello.json's account of the sources: which camera each view is,
+        so a reader knows what `poses/` and `faces/` are pictures of."""
+        return {
+            "poses": {"view": "body", "stream": self.args.stream,
+                      "poseFps": self.pose_fps},
+            "faces": ({"view": "face", "stream": self.face_stream,
+                       "poseFps": self.face_pose_fps} if self.face_stream else None),
+            "audio": {"stream": self.audio_stream} if self.audio_classifier else None,
+        }
 
     # -- what comes back from the analysis process ---------------------------
 
@@ -1013,8 +1081,14 @@ class Session:
             if self.audio is not None:
                 self.audio.request(message)
             else:
-                self.analysis.send({"kind": "segment", "id": message.get("id"),
-                                    "error": "no-audio"})
+                self._to_analysis({"kind": "segment", "id": message.get("id"),
+                                   "error": "no-audio"})
+        elif kind == "vocal":
+            # One judgement of the analysis's vocal side (protocol.md):
+            # the record's, never the session's event stream.
+            row = message.get("row")
+            if isinstance(row, dict):
+                self.capture.vocal(row)
 
     def _on_analysis_error(self, text: str) -> None:
         self.telemetry.count("analysisErrors")
@@ -1115,7 +1189,7 @@ class Session:
         are read."""
         with self.telemetry.time_stage("descriptors"):
             fast, slow = self.descriptors.step(row, gray_row)
-        self.analysis.send({
+        self._to_analysis({
             "kind": "frame",
             "frame": row["frame"],
             "atS": row["atS"],
@@ -1173,11 +1247,23 @@ class Session:
                 wait_for_track=True)
             face_worker = PoseWorker(
                 self.pose, None, self.assembler_lock, self.telemetry,
+                on_row=self.capture.face_pose,
                 on_pose=self._on_face_pose, view="face", stage="facePose",
                 dropped_counter="facePoseDropped")
             face_thread = threading.Thread(
                 target=self._face_loop, args=(self.face_decoder, face_worker),
                 daemon=True)
+        record_taps: list[tuple] = []
+        if self.record is not None:
+            # The record hears every view's full result - all 308
+            # keypoints with their scores - beside the overlay, through the
+            # same tap (live_pose.share_full_result); the worker's gap rows
+            # reach it through on_row.
+            for view in ("body", "face") if face_worker is not None else ("body",):
+                state = self.pose.view(view)
+                listener = self.record.keypoint_listener(view, state)
+                state.add_listener(listener)
+                record_taps.append((state, listener))
         if self.overlay is not None:
             # The full result reaches the overlay before row_for narrows it;
             # the tap is per session on a process-wide GpuPose.
@@ -1295,6 +1381,8 @@ class Session:
                 # drops the samples.
                 self.audio.stop()
                 self.audio.join(timeout=5.0)
+            for state, listener in record_taps:
+                state.remove_listener(listener)
             if self.overlay is not None:
                 # Before the capture closes: the recording, if any, must be
                 # finalised on disk to ride the upload with the jsonl files.
@@ -1326,10 +1414,17 @@ class Session:
             summary["captureDir"] = str(self.capture.directory)
             if self.overlay is not None:
                 summary["overlay"] = self.overlay.snapshot()
+            # With a record this closes its parts, writes summary.json and
+            # waits (bounded) for the uploads; the summary then carries
+            # what left under `record`.
             self.capture.summary(summary)
             self.capture.close()
             self.summary = summary
         return summary
+
+    def flush_record(self, timeout_s: float = 10.0) -> None:
+        """A SIGTERM mid-session: the record's open parts leave now."""
+        self.capture.flush(timeout_s)
 
     def upload_capture(self, bucket: str) -> dict | None:
         """Copy this run's capture to gs://bucket/runs/<run>/, if named.
@@ -1640,9 +1735,32 @@ def serve(args, telemetry: Telemetry) -> int:
     if tee is not None or getattr(args, "prewarm", False):
         if server.start_warmup():
             print("prewarm: booting the GPU pose ahead of the first /warmup", flush=True)
+    install_sigterm_flush(server.current)
     print(f"serving on :{server.server_address[1]}", flush=True)
     server.serve_forever()
     return 0
+
+
+# How long a SIGTERM waits for the running session's record to leave.
+SIGTERM_FLUSH_S = 10.0
+
+
+def install_sigterm_flush(current: dict, flush_s: float = SIGTERM_FLUSH_S) -> None:
+    """A SIGTERM (the VM stopping, the launcher ending the container) with
+    a session running: the session's record flushes what it holds,
+    bounded, before the process exits 0. Without a record the exit is
+    immediate, as before."""
+    def on_sigterm(*_) -> None:
+        session = current.get("session")
+        if session is not None and getattr(session, "record", None) is not None:
+            print(f"sigterm: flushing the session's record ({flush_s:.0f}s at most)",
+                  flush=True)
+            try:
+                session.flush_record(flush_s)
+            except Exception as error:  # noqa: BLE001 - exiting anyway
+                print(f"sigterm: record flush failed: {error!r}", flush=True)
+        sys.exit(0)
+    signal.signal(signal.SIGTERM, on_sigterm)
 
 
 LEASE_BODY_CAP = 4096
@@ -2417,6 +2535,9 @@ def build_server(args, telemetry: Telemetry,
                     # A TEE run leaves no production-capture evidence by
                     # design: no annotated recording, whatever was asked.
                     session_args.overlay_record = False
+                    # What it does leave is the session's record, when the
+                    # lease named one (tee_mode.Lease.record_for).
+                    session_args.record = tee.lease.record_for()
                 if external_view_args(session_args, external):
                     session_args.face_mirror = view_prefs["mirror"]
                 self.send_response(200)

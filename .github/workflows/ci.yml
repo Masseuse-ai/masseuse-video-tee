@@ -109,7 +109,7 @@ jobs:
         working-directory: workload
         run: |
           uv run --python 3.12 \
-            --with pytest,pytest-timeout,numpy,opencv-python-headless,scipy,pyyaml,cryptography,pillow \
+            --with pytest,pytest-timeout,numpy,opencv-python-headless,scipy,pyyaml,cryptography,pillow,pyarrow \
             pytest -q --timeout 180 tests
       - name: dockerfiles copy what the tree has
         # Every COPY source in both Dockerfiles exists in the tree and is

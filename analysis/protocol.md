@@ -225,11 +225,14 @@ The producer then waits (bounded) for `summary` and closes the socket.
 
 ```json
 {"kind": "ready", "protocol": 1, "version": "2026.09.09-1",
- "modelVersion": "analysis/v1"}
+ "modelVersion": "analysis/v1", "vocal": {"...": "..."}}
 ```
 
 `version` is the bundle version from `analysis.lock`; `modelVersion` is what
-the readings carry as their `modelVersion` field.
+the readings carry as their `modelVersion` field. `vocal`, when present, is
+the constants the `vocal` rows below are judged against (thresholds, the
+labels' names, the bundle's vocal version): numbers and names, kept in the
+session record's `hello.json` so a row can be read back years later.
 
 ### `post`, at the post cadence
 
@@ -238,10 +241,14 @@ the readings carry as their `modelVersion` field.
 ```
 
 The reading. The producer treats `body` as opaque JSON: it appends it to the
-session capture (`posts.jsonl`), emits it on the session's event stream, and
-POSTs it to the trainer URL it was started with. This is the only path by
-which anything derived from the user's media leaves the enclave, and it
-carries numbers only.
+session capture (`posts.jsonl`, or the record's `posts/` parts), emits it on
+the session's event stream, and POSTs it to the trainer URL it was started
+with. It carries numbers only. Besides the readings, a leased session's
+record (`workload/producer/record.py`, described in the README under
+"Session records") is the other path out of the enclave: the keypoints,
+descriptors, audio measurements and the analysis's rows, written to the
+attested capture bucket under the prefix the trainer's lease named. Frames
+and samples are on neither path.
 
 ### `onset`, `event`, `payload`
 
@@ -255,6 +262,23 @@ Finer-grained records the analysis keeps alongside the readings; the
 producer appends each to the capture (`onsets.jsonl`, `events.jsonl`,
 `payloads.jsonl`) and emits `onset` and `payload` on the session's event
 stream. Like `post`, they are numbers about the session, never media.
+
+### `vocal`, one per judgement of the audio measurements
+
+```json
+{"kind": "vocal", "row": {"kind": "decision", "atS": 12.31, "...": "..."}}
+```
+
+The analysis's account of one step of its vocalization typing: `row.kind`
+is `activation` (a classifier activation opened or closed a span),
+`decision` (a span was judged, with the scores, level, pitch and duration
+it was judged on and the verdict), `segment_error` (a `classify` it asked
+for was not answered) or `baseline` (the reference level or pitch it
+compares against changed). Everything in `row` is a number, a label name or
+a timestamp, derived from the `audio` and `segment` messages above; no
+sample is anywhere near it. The producer appends each row to the session
+record's `vocal/` stream (`workload/producer/record.py`) and does not emit
+it on the session's event stream or send it anywhere else.
 
 ### `hud`
 

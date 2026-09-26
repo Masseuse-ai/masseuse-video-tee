@@ -54,6 +54,8 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from record import BUCKET_NAME, parse_record
+
 LAUNCHER_SOCKET = "/run/container_launcher/teeserver.sock"
 CLAIMS_TOKEN_FILE = "/run/container_launcher/attestation_verifier_claims_token"
 GOOGLE_ISSUERS = ("https://accounts.google.com", "accounts.google.com")
@@ -125,12 +127,21 @@ class TeeConfig:
     # after it has served one, and how long a boot waits for its first.
     idle_exit_s: float = IDLE_EXIT_S
     boot_idle_s: float = BOOT_IDLE_S
+    # The bucket a leased session's record is written to (producer/record.py),
+    # under the prefix the lease names. Attested like the rest of the
+    # tee-env: the trainer's policy pins it (expectedCaptureBucket) and
+    # refuses a slot whose bucket is another. Empty: the slot keeps no
+    # record, and a lease that asks for one is refused.
+    capture_bucket: str = ""
 
     @classmethod
     def from_env(cls, env=os.environ) -> "TeeConfig":
         host = (env.get("TEE_PUBLIC_HOST") or "").strip().lower()
         if not host:
             raise SystemExit("--tee needs TEE_PUBLIC_HOST")
+        capture_bucket = (env.get("TEE_CAPTURE_BUCKET") or "").strip()
+        if capture_bucket and not BUCKET_NAME.match(capture_bucket):
+            raise SystemExit("TEE_CAPTURE_BUCKET is not a bucket name")
         invokers = tuple(
             s.strip().lower()
             for s in (env.get("TRAINER_INVOKER_SERVICE_ACCOUNT") or "").split(",")
@@ -148,7 +159,8 @@ class TeeConfig:
                    launcher_socket=env.get("TEE_LAUNCHER_SOCKET", LAUNCHER_SOCKET),
                    refresh_s=float(env.get("TEE_TOKEN_REFRESH_S", TOKEN_REFRESH_S)),
                    idle_exit_s=float(env.get("TEE_IDLE_EXIT_S") or IDLE_EXIT_S),
-                   boot_idle_s=float(env.get("TEE_BOOT_IDLE_S") or BOOT_IDLE_S))
+                   boot_idle_s=float(env.get("TEE_BOOT_IDLE_S") or BOOT_IDLE_S),
+                   capture_bucket=capture_bucket)
 
     @property
     def origin(self) -> str:
@@ -420,6 +432,12 @@ class Lease:
     session_id: str = ""
     capability_hash: str = ""
     expires_at: float = 0.0
+    # The session's record (producer/record.py): `{prefix, partSeconds}`
+    # from the lease body, or None for a session that keeps none. A
+    # record needs the slot's capture bucket; without one the lease that
+    # asks for it is refused, so the trainer knows nothing will be kept.
+    record: dict | None = None
+    capture_bucket: str = ""
     # True once any lease has been granted, and it stays true through
     # clear() and expiry: the slot has served a phone, so IdleExit uses the
     # short idle clock from here on, however the ticks fall.
@@ -435,6 +453,11 @@ class Lease:
             return 400, {"error": "sessionId must match [A-Za-z0-9][A-Za-z0-9._-]{0,63}"}
         if not CAPABILITY_HASH.match(capability_hash):
             return 400, {"error": "capabilityHash must be 64 hex characters (sha256)"}
+        record, why = parse_record(body.get("record"))
+        if why:
+            return 400, {"error": why}
+        if record is not None and not self.capture_bucket:
+            return 400, {"error": "this slot keeps no record: no capture bucket"}
         now = float(self.clock())
         try:
             expires_at = float(body.get("expiresAt") or (now + LEASE_MAX_S))
@@ -449,15 +472,29 @@ class Lease:
             self.session_id = session_id
             self.capability_hash = capability_hash
             self.expires_at = expires_at
+            self.record = record
             self.ever_granted = True
-        return 200, {"status": "leased", "sessionId": session_id,
-                     "expiresAt": int(expires_at)}
+        answer = {"status": "leased", "sessionId": session_id,
+                  "expiresAt": int(expires_at)}
+        if record is not None:
+            answer["record"] = {**record, "bucket": self.capture_bucket}
+        return 200, answer
 
     def clear(self) -> None:
         with self.lock:
             self.session_id = ""
             self.capability_hash = ""
             self.expires_at = 0.0
+            self.record = None
+
+    def record_for(self) -> dict | None:
+        """What a /produce under this lease records to: the bucket, the
+        prefix, the part length and the session, or None."""
+        with self.lock:
+            if self.record is None or not self.capability_hash:
+                return None
+            return {**self.record, "bucket": self.capture_bucket,
+                    "sessionId": self.session_id}
 
     def active(self) -> bool:
         with self.lock:
@@ -485,7 +522,9 @@ class Lease:
             return {"sessionId": self.session_id or None,
                     "active": bool(self.capability_hash)
                     and float(self.clock()) < self.expires_at,
-                    "expiresAt": int(self.expires_at) if self.expires_at else None}
+                    "expiresAt": int(self.expires_at) if self.expires_at else None,
+                    "record": ({**self.record, "bucket": self.capture_bucket}
+                               if self.record is not None else None)}
 
 
 # -- the slot's lifetime -----------------------------------------------------------
@@ -695,7 +734,7 @@ class TeeMode:
         self.attestation = attestation or Attestation(
             config, self.evidence, launcher=launcher, clock=clock, log=log)
         self.control_auth = control_auth or ControlAuth(config, log=log)
-        self.lease = lease or Lease(clock=clock)
+        self.lease = lease or Lease(clock=clock, capture_bucket=config.capture_bucket)
         self.clock = clock
         self.log = log
 

@@ -29,6 +29,12 @@
 #                                      exits and the VM stops (tee_mode.IdleExit)
 #   TEE_BOOT_IDLE_S                    optional, 300: the same for a boot that
 #                                      never gets a lease at all
+#   TEE_CAPTURE_BUCKET                 the bucket a leased session's record is
+#                                      written to, under the prefix the lease
+#                                      names (producer/record.py); the trainer
+#                                      pins it in its policy and refuses a slot
+#                                      attesting another. Unset: no record, and
+#                                      a lease asking for one is refused
 #   POSE_GRAPH_BENCH                   optional, unset: batch sizes ("1,2,4,8")
 #                                      for the boot-time pose graph bench
 #                                      (pixel/pose_bench.py); a debug-slot
@@ -175,6 +181,11 @@ export POSE_MODELS_READY_FILE=/models/.complete
 rm -f "$POSE_MODELS_READY_FILE"
 ANALYSIS_SOCKET=/run/tee/analysis/analysis.sock
 
+if [ -n "${TEE_CAPTURE_BUCKET:-}" ]; then
+    log "session records to gs://${TEE_CAPTURE_BUCKET} (the lease names the prefix)"
+else
+    log "no TEE_CAPTURE_BUCKET: sessions keep no record; a lease asking for one is refused"
+fi
 log "producer --tee for $SLOT_NAME -> $TRAINER_URL (idle exit ${TEE_IDLE_EXIT_S}s, boot idle ${TEE_BOOT_IDLE_S}s)"
 python3 /app/workload/producer/producer.py \
     --tee \

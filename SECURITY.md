@@ -24,17 +24,25 @@ against production, and a check that should hold but does not is a report.
   image with debugging disabled since boot, on an Intel TDX VM with the GPU
   in confidential-computing mode. The operator cannot SSH into it, redirect
   its logs, read its memory, or change what runs without changing the digest.
-- It keeps nothing: frames and audio samples live in memory for the duration
-  of a decode and are not written anywhere. The only data that leaves are
-  the readings the analysis derives (numbers, never frames or sound) posted
-  to the trainer, and the annotated view streamed back to the same user's
-  phone.
+- It keeps no media: frames and audio samples live in memory for the
+  duration of a decode and are not written anywhere. The data that leaves
+  are the readings the analysis derives (numbers, never frames or sound)
+  posted to the trainer, the annotated view streamed back to the same
+  user's phone, and, for a signed-in session, the session record (README,
+  "Session records"): the keypoints, motion descriptors, audio
+  measurements and the analysis's rows, written to the one bucket the
+  attested environment names (`TEE_CAPTURE_BUCKET`) under the prefix the
+  trainer's lease named, by the enclave's attested identity, which can
+  create objects there and cannot read, overwrite or delete any.
+- The model weights and the ACME account credential are readable only by an
+  attested image digest through Workload Identity Federation; no service
+  account, and no person, holds that access. The same principal is the only
+  writer of the session records; a record's destination can be changed only
+  by changing the attested environment, which the trainer's policy and the
+  verifier both check.
 - Its TLS key, its Ed25519 evidence key and its certificate are generated at
   boot and die with the VM. The attestation token names both keys, which
   is how a verifier knows the endpoint it reached is the enclave.
-- The model weights and the ACME account credential are readable only by an
-  attested image digest through Workload Identity Federation; no service
-  account, and no person, holds that access.
 
 ## Supply chain
 

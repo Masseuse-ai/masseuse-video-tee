@@ -53,21 +53,28 @@ def share_full_result(on_full, telemetry, frame_index: int, at_s: float,
                       keypoints, scores, box, box_score, people: int,
                       unresolved: bool) -> None:
     """Hand the whole inference result - every keypoint the model emitted,
-    not the 21 the row keeps - to an `on_full` listener (the live overlay).
+    not the 21 the row keeps - to the `on_full` listeners: the live overlay,
+    and the session's record (producer/record.py), which keeps all 308.
 
-    The row is what the pipeline and the equivalence gate consume; this is
-    a side channel that must never alter it or stall the pose thread, so a
-    listener that raises is counted and otherwise ignored.
+    `on_full` is one callable, None, or a sequence of callables
+    (ViewState.taps). The row is what the pipeline and the equivalence gate
+    consume; this is a side channel that must never alter it or stall the
+    pose thread, so a listener that raises is counted and otherwise
+    ignored, and the next listener still hears the result.
     """
     if on_full is None:
         return
-    try:
-        on_full(frame_index, at_s, keypoints, scores, box, box_score,
-                people, unresolved)
-    except Exception as error:  # noqa: BLE001 - a listener must not stall the pose
-        if telemetry is not None:
-            telemetry.count("poseListenerErrors")
-        print(f"pose listener failed at {at_s:.1f}s: {error!r}", flush=True)
+    listeners = (on_full,) if callable(on_full) else tuple(on_full)
+    for listener in listeners:
+        if listener is None:
+            continue
+        try:
+            listener(frame_index, at_s, keypoints, scores, box, box_score,
+                     people, unresolved)
+        except Exception as error:  # noqa: BLE001 - a listener must not stall the pose
+            if telemetry is not None:
+                telemetry.count("poseListenerErrors")
+            print(f"pose listener failed at {at_s:.1f}s: {error!r}", flush=True)
 
 
 def row_keypoint_arrays(keypoints: dict) -> tuple[np.ndarray, np.ndarray]:
@@ -380,8 +387,13 @@ class ViewState:
 
     def __init__(self, on_full=None):
         # The live overlay's tap on this view's full result
-        # (share_full_result).
+        # (share_full_result), and the other listeners - the session's
+        # record - which hear the same result after it.
         self.on_full = on_full
+        self.listeners: list = []
+        # The view's frame size (width, height), from its last step: the
+        # record writes it beside the keypoints.
+        self.frame_size: tuple[int, int] | None = None
         self.warmup: list[tuple[list[list[float]], np.ndarray]] = []
         self.scenery_done = False
         self.detect_countdown = 0
@@ -398,6 +410,21 @@ class ViewState:
         self.cached_detection = None
         self.previous = None
         self.scenery = []
+
+    def taps(self) -> tuple:
+        """Every listener of this view's full result, the overlay's first;
+        empty when nobody is listening (a step then skips the hand-off)."""
+        if self.on_full is None and not self.listeners:
+            return ()
+        return ((self.on_full,) if self.on_full is not None else ()) + tuple(self.listeners)
+
+    def add_listener(self, listener) -> None:
+        if listener is not None and listener not in self.listeners:
+            self.listeners.append(listener)
+
+    def remove_listener(self, listener) -> None:
+        if listener in self.listeners:
+            self.listeners.remove(listener)
 
 
 class GpuPose:
@@ -836,6 +863,8 @@ class GpuPose:
               at_s: float) -> dict:
         tracker = self.tracker
         started = time.monotonic()
+        if hasattr(rgb, "shape") and len(rgb.shape) >= 2:
+            state.frame_size = (int(rgb.shape[1]), int(rgb.shape[0]))
         # The frame's one trip to the device; everything below reads it there.
         frame = tracker.frame_tensor(rgb, self.device)
         if self.telemetry:
@@ -869,7 +898,7 @@ class GpuPose:
             state.cached_detection = (box, score, people, unresolved)
             state.detect_countdown = self._detect_stride - 1
         if box is None:
-            share_full_result(state.on_full, self.telemetry, frame_index, at_s,
+            share_full_result(state.taps(), self.telemetry, frame_index, at_s,
                               None, None, None, None, people, unresolved)
             return pose_rows.missing_row(frame_index, at_s)
         started = time.monotonic()
@@ -879,7 +908,7 @@ class GpuPose:
         if self.telemetry:
             self.telemetry.observe("poseInfer", time.monotonic() - started)
         keypoints, scores = result[:, :2], result[:, 2]
-        share_full_result(state.on_full, self.telemetry, frame_index, at_s,
+        share_full_result(state.taps(), self.telemetry, frame_index, at_s,
                           keypoints, scores, box, score, people, unresolved)
         return pose_rows.row_for(frame_index, at_s, keypoints, scores, box,
                                  score, people, unresolved)
@@ -945,8 +974,10 @@ class SideloadPose:
     def step(self, rgb: np.ndarray, frame_index: int, at_s: float,
              view: str | None = None) -> dict:
         state = self.view(view)
+        if hasattr(rgb, "shape") and len(rgb.shape) >= 2:
+            state.frame_size = (int(rgb.shape[1]), int(rgb.shape[0]))
         if (view or BODY_VIEW) != BODY_VIEW:
-            share_full_result(state.on_full, self.telemetry, frame_index, at_s,
+            share_full_result(state.taps(), self.telemetry, frame_index, at_s,
                               None, None, None, None, 0, False)
             return {"frame": frame_index, "atS": round(at_s, 4),
                     "keypoints": None}
@@ -959,15 +990,16 @@ class SideloadPose:
             if nearest is not None and abs(nearest - key) * 2 <= self.stride:
                 row = self.rows[nearest]
         if row is None or not row.get("keypoints"):
-            share_full_result(state.on_full, self.telemetry, frame_index, at_s,
+            share_full_result(state.taps(), self.telemetry, frame_index, at_s,
                               None, None, None, None,
                               (row or {}).get("people", 0),
                               (row or {}).get("identityUnresolved", False))
             return {"frame": frame_index, "atS": round(at_s, 4),
                     "keypoints": None}
-        if state.on_full is not None:
+        taps = state.taps()
+        if taps:
             points, scores = row_keypoint_arrays(row["keypoints"])
-            share_full_result(state.on_full, self.telemetry, frame_index, at_s,
+            share_full_result(taps, self.telemetry, frame_index, at_s,
                               points, scores, row.get("box"),
                               row.get("boxScore"), row.get("people", 1),
                               row.get("identityUnresolved", False))

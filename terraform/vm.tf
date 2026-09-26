@@ -52,6 +52,10 @@ locals {
       "tee-env-ACME_DIRECTORY_URL"              = local.acme_directory_url
       "tee-env-ACME_CONTACT_EMAIL"              = var.acme_contact_email
     },
+    # Where a leased session's record goes (workload/producer/record.py).
+    # Attested with the rest of the environment: the trainer's policy pins
+    # the value, so this metadata cannot point a slot at another bucket.
+    var.capture_bucket != "" ? { "tee-env-TEE_CAPTURE_BUCKET" = var.capture_bucket } : {},
     var.debug_mode ? {
       # Debug: stdout to Cloud Logging + serial and memory metrics. No
       # tee-restart-policy (production image only). On this image the

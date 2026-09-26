@@ -86,9 +86,10 @@ func newFakeSlot(t *testing.T, mutate func(jwt.MapClaims)) *fakeSlot {
 					"image_digest":    testDigest,
 					"image_reference": "us-central1-docker.pkg.dev/prod-masseuse-video-tee/masseuse-video-tee/masseuse-video-tee@" + testDigest,
 					"env": map[string]any{
-						"TRAINER_URL":       "https://trainer.example",
-						"TEE_IMAGE_VERSION": testVersion,
-						"TEE_IMAGE_COMMIT":  testCommit,
+						"TRAINER_URL":        "https://trainer.example",
+						"TEE_CAPTURE_BUCKET": "records.example",
+						"TEE_IMAGE_VERSION":  testVersion,
+						"TEE_IMAGE_COMMIT":   testCommit,
 					},
 					"image_signatures": []map[string]any{{"key_id": "cafe", "signature_algorithm": "ECDSA_P256_SHA256"}},
 				},
@@ -127,6 +128,7 @@ func (fs *fakeSlot) config() *config {
 		projectID:      "prod-masseuse-video-tee",
 		imageRefPrefix: "us-central1-docker.pkg.dev/prod-masseuse-video-tee/masseuse-video-tee/",
 		trainerURL:     "https://trainer.example",
+		captureBucket:  "records.example",
 		signerKeyIDs:   []string{"cafe"},
 		sourceURI:      defaultSourceURI,
 		imageRepo:      defaultImageRepo,
@@ -280,9 +282,36 @@ func TestHoldsTheReleaseStampToTheFlags(t *testing.T) {
 	}
 }
 
+func TestTheCaptureBucketMustBeTheExpectedOneOrNone(t *testing.T) {
+	// A slot with no bucket keeps no record: it passes only for a verifier
+	// told to expect none, and a slot naming a bucket fails that verifier.
+	bare := newFakeSlot(t, func(c jwt.MapClaims) {
+		c["submods"].(map[string]any)["container"].(map[string]any)["env"] = map[string]any{
+			"TRAINER_URL": "https://trainer.example", "TEE_IMAGE_VERSION": testVersion, "TEE_IMAGE_COMMIT": testCommit}
+	})
+	r := runReport(t, bare.config())
+	if !contains(failed(r), "image.env.TEE_CAPTURE_BUCKET") {
+		t.Fatalf("a slot without the expected bucket must fail; failed %v", failed(r))
+	}
+	if c := checkNamed(t, r, "image.env.TEE_CAPTURE_BUCKET"); !strings.Contains(c.Detail, "keeps no session record") {
+		t.Fatalf("detail should say the slot keeps no record: %+v", c)
+	}
+	cfg := bare.config()
+	cfg.captureBucket = ""
+	if r := runReport(t, cfg); !r.Passed {
+		t.Fatalf("expecting no record, a bare slot passes; failed %v", failed(r))
+	}
+	recording := newFakeSlot(t, nil)
+	cfg = recording.config()
+	cfg.captureBucket = ""
+	if r := runReport(t, cfg); !contains(failed(r), "image.env.TEE_CAPTURE_BUCKET") {
+		t.Fatalf("a recording slot fails a verifier expecting none; failed %v", failed(r))
+	}
+}
+
 func TestAnUnstampedImagePassesOnlyWithoutAReleaseFloor(t *testing.T) {
 	fs := newFakeSlot(t, func(c jwt.MapClaims) {
-		c["submods"].(map[string]any)["container"].(map[string]any)["env"] = map[string]any{"TRAINER_URL": "https://trainer.example"}
+		c["submods"].(map[string]any)["container"].(map[string]any)["env"] = map[string]any{"TRAINER_URL": "https://trainer.example", "TEE_CAPTURE_BUCKET": "records.example"}
 	})
 	r := runReport(t, fs.config())
 	if !r.Passed || r.Release != nil {
@@ -353,7 +382,7 @@ func TestVerifiesProvenanceAgainstTheStamp(t *testing.T) {
 
 func TestProvenanceOfAnUnstampedImageSkipsTheTag(t *testing.T) {
 	fs := newFakeSlot(t, func(c jwt.MapClaims) {
-		c["submods"].(map[string]any)["container"].(map[string]any)["env"] = map[string]any{"TRAINER_URL": "https://trainer.example"}
+		c["submods"].(map[string]any)["container"].(map[string]any)["env"] = map[string]any{"TRAINER_URL": "https://trainer.example", "TEE_CAPTURE_BUCKET": "records.example"}
 	})
 	bin, argsFile := stubSLSAVerifier(t)
 	cfg := fs.config()
@@ -434,14 +463,14 @@ func TestRefusesTheWrongImageGpuTrainerAndSigner(t *testing.T) {
 	fs := newFakeSlot(t, func(c jwt.MapClaims) {
 		container := c["submods"].(map[string]any)["container"].(map[string]any)
 		container["image_digest"] = "sha256:" + strings.Repeat("cd", 32)
-		container["env"] = map[string]any{"TRAINER_URL": "https://elsewhere.example"}
+		container["env"] = map[string]any{"TRAINER_URL": "https://elsewhere.example", "TEE_CAPTURE_BUCKET": "elsewhere-bucket"}
 		container["image_signatures"] = []map[string]any{{"key_id": "beef", "signature_algorithm": "ECDSA_P256_SHA256"}}
 		c["submods"].(map[string]any)["nvidia_gpu"] = map[string]any{"cc_mode": "OFF", "gpus": []map[string]any{{"hwmodel": "GCP_NVIDIA_L4"}}}
 	})
 	cfg := fs.config()
 	cfg.allowedDigests = []string{testDigest}
 	r := runReport(t, cfg)
-	for _, want := range []string{"image.digest", "image.env.TRAINER_URL", "image.signature", "gpu.cc_mode", "gpu.hwmodel"} {
+	for _, want := range []string{"image.digest", "image.env.TRAINER_URL", "image.env.TEE_CAPTURE_BUCKET", "image.signature", "gpu.cc_mode", "gpu.hwmodel"} {
 		if !contains(failed(r), want) {
 			t.Errorf("expected %s to fail; failed set %v", want, failed(r))
 		}

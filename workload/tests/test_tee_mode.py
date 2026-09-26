@@ -379,7 +379,7 @@ def test_control_routes_take_the_trainer_token_and_nothing_else():
         snapshot = json.loads(body)
         assert snapshot["tee"]["origin"] == f"https://{HOST}"
         assert snapshot["tee"]["lease"] == {"sessionId": None, "active": False,
-                                            "expiresAt": None}
+                                            "expiresAt": None, "record": None}
         assert snapshot["counters"].get("teeControlRejects") == 11
         code, _, body = slot.as_trainer("GET", "/ingest/status")
         assert code == 200 and json.loads(body)["ready"] is False
@@ -579,6 +579,47 @@ def test_lease_validation_and_stop_clearing():
         assert code == 200
         assert slot.tee.lease.active() is False
         assert slot.tee.lease.check(cap) == (False, "no lease")
+
+
+def test_the_lease_names_the_sessions_record_when_the_slot_has_a_bucket():
+    """The trainer's lease may carry `record` (the prefix its half of the
+    session record lives beside, producer/record.py): a slot with a
+    capture bucket takes it and says where the parts will land; a slot
+    without refuses the lease, so nothing is silently not kept; /stop
+    clears it with the lease."""
+    prefix = ("019966a0-0000-7000-8000-000000000001/estim_sessions/"
+              "019966a0-0000-7000-8000-000000000002/enclave")
+    json_type = {"Content-Type": "application/json"}
+    with Slot() as slot:
+        _, cap_hash = capability()
+        body = {"sessionId": "sess-1", "capabilityHash": cap_hash,
+                "record": {"prefix": prefix, "partSeconds": 30}}
+        code, _, answer = slot.as_trainer("POST", "/lease", json.dumps(body).encode(), json_type)
+        assert code == 400 and "capture bucket" in json.loads(answer)["error"]
+        assert not slot.tee.lease.active()
+        # The same slot with the attested bucket.
+        slot.tee.lease.capture_bucket = "masseuse-ai-prod"
+        code, _, answer = slot.as_trainer(
+            "POST", "/lease", json.dumps({**body, "record": {"prefix": "runs/x"}}).encode(), json_type)
+        assert code == 400 and "record.prefix" in json.loads(answer)["error"]
+        code, _, answer = slot.as_trainer("POST", "/lease", json.dumps(body).encode(), json_type)
+        assert code == 200
+        assert json.loads(answer)["record"] == {"prefix": prefix, "partSeconds": 30,
+                                                "bucket": "masseuse-ai-prod"}
+        assert slot.tee.lease.record_for() == {"prefix": prefix, "partSeconds": 30,
+                                               "bucket": "masseuse-ai-prod", "sessionId": "sess-1"}
+        code, _, statz = slot.as_trainer("GET", "/statz")
+        assert json.loads(statz)["tee"]["lease"]["record"]["prefix"] == prefix
+        slot.server.current["session"] = argparse.Namespace(
+            stopping=threading.Event(), run_name="sess-1", overlay=None)
+        assert slot.as_trainer("POST", "/stop")[0] == 200
+        assert slot.tee.lease.record_for() is None
+        # A lease without a record is a session without one, as before.
+        code, _, answer = slot.as_trainer(
+            "POST", "/lease", json.dumps({k: v for k, v in body.items() if k != "record"}).encode(),
+            json_type)
+        assert code == 200 and "record" not in json.loads(answer)
+        assert slot.tee.lease.record_for() is None
 
 
 def test_an_answer_without_a_fingerprint_is_refused_and_hung_up(monkeypatch):

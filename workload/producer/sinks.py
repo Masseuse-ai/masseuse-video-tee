@@ -4,11 +4,19 @@ The capture files are the session's record - the analysis process's onsets,
 paired events and payloads, the posted readings and the raw pose rows, one
 JSON object per line, written as they are emitted so a crash loses nothing
 already decided. Nothing in them is a frame. `upload` copies them to GCS
-when a named test session ends (never in --tee mode, where no capture
+when a named test session ends (never in --tee mode, where no test capture
 leaves the enclave); a named session's capture is what `SideloadPose`
-replays. The POST client sends the readings to the trainer; it stays
-optional and failures are counted, never fatal - a sink must not be able to
-stall the pipeline.
+replays.
+
+A leased session with a record (record.py) is the other shape of the same
+thing: no flat files, every stream written as 30-second parts under the
+lease's prefix in the attested capture bucket, the full 308-keypoint result
+of both views among them, uploaded as each part closes. `Capture` takes
+the record and routes to it; the session never knows which shape it has.
+
+The POST client sends the readings to the trainer; it stays optional and
+failures are counted, never fatal - a sink must not be able to stall the
+pipeline.
 """
 
 from __future__ import annotations
@@ -20,15 +28,25 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
+from record import Record  # noqa: F401 - the record's type, for callers
+
 
 class Capture:
-    def __init__(self, directory: Path):
+    def __init__(self, directory: Path, record: "Record | None" = None):
         directory.mkdir(parents=True, exist_ok=True)
         self.directory = directory
-        self._files = {
+        self.record = record
+        self._files = {} if record is not None else {
             name: open(directory / f"{name}.jsonl", "a", buffering=1)
             for name in ("onsets", "events", "payloads", "posts", "poses")
         }
+
+    def _write(self, name: str, row: dict) -> None:
+        handle = self._files.get(name)
+        if handle is not None:
+            handle.write(json.dumps(row) + "\n")
+        elif self.record is not None:
+            self.record.append(name, row)
 
     def pose(self, row: dict) -> None:
         """Every pose row the worker produced, in production numerics.
@@ -39,19 +57,30 @@ class Capture:
         else keeps the keypoints - the assembler interpolates them away and
         the readings carry only derived numbers - so without this file a
         session can never be replayed or explained.
+
+        With a record the posed rows arrive whole through the view's full
+        listener (record.Record.keypoint_listener); only the gaps come
+        this way.
         """
+        if self.record is not None:
+            self.record.gap("body", row)
+            return
         self._files["poses"].write(json.dumps(row) + "\n")
 
+    def face_pose(self, row: dict) -> None:
+        """The face view's pose rows: kept only by a record, as gaps."""
+        if self.record is not None:
+            self.record.gap("face", row)
+
     def onset(self, at_s: float) -> None:
-        self._files["onsets"].write(json.dumps({"atS": round(at_s, 3)}) + "\n")
+        self._write("onsets", {"atS": round(at_s, 3)})
 
     def event(self, start_s: float, release_s: float) -> None:
-        self._files["events"].write(json.dumps(
-            {"startS": round(start_s, 3),
-             "releaseS": round(release_s, 3)}) + "\n")
+        self._write("events", {"startS": round(start_s, 3),
+                               "releaseS": round(release_s, 3)})
 
     def payload(self, payload: dict) -> None:
-        self._files["payloads"].write(json.dumps(payload) + "\n")
+        self._write("payloads", payload)
 
     def post(self, body: dict) -> None:
         """A reading from the analysis process, at its true availability.
@@ -60,15 +89,37 @@ class Capture:
         what a replay of the session's consumers runs against, with real
         availability rather than modeled lags.
         """
-        self._files["posts"].write(json.dumps(body) + "\n")
+        self._write("posts", body)
+
+    def vocal(self, row: dict) -> None:
+        """One judgement of the analysis's vocal side (protocol.md `vocal`):
+        a record keeps every one; the flat capture has no file for them."""
+        if self.record is not None:
+            self.record.append("vocal", row)
+
+    def outbound(self, message: dict) -> None:
+        """A message on its way to the analysis process: the record keeps
+        the `frame`, `audio` and `segment` kinds."""
+        if self.record is not None:
+            self.record.outbound(message)
 
     def summary(self, summary: dict) -> None:
+        if self.record is not None:
+            summary["record"] = self.record.close(summary)
+            return
         (self.directory / "summary.json").write_text(
             json.dumps(summary, indent=2) + "\n")
 
     def close(self) -> None:
         for handle in self._files.values():
             handle.close()
+        if self.record is not None:
+            self.record.close()
+
+    def flush(self, timeout_s: float = 10.0) -> None:
+        """A SIGTERM: what the record holds leaves now, bounded."""
+        if self.record is not None:
+            self.record.flush(timeout_s)
 
     def upload(self, bucket: str, prefix: str, telemetry=None,
                client_factory=None) -> dict:

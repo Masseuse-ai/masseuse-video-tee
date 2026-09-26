@@ -131,9 +131,11 @@ RUN /venv/bin/pip check > /tmp/pip-check.txt || true; \
 # post-processing from the Sapiens2 image processor's own functions, and
 # the processor's on-device crop is the pose preprocessing, so the version
 # the tests ran against is the version the enclave runs.
+# pyarrow writes the session record's keypoint parts (producer/record.py):
+# Parquet, all 308 keypoints of a view per row.
 RUN /venv/bin/pip install --no-cache-dir \
         transformers==5.17.0 pillow opencv-python-headless numpy \
-        pyyaml scipy google-cloud-storage
+        pyyaml scipy google-cloud-storage pyarrow
 
 WORKDIR /app
 # The workload: pixel/ (decode geometry, person detection, keypoints,

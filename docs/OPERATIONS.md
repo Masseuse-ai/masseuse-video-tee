@@ -490,6 +490,50 @@ the key before the image can read the weights, and the trainer's and the
 clients' policy (`imageSignatures`) refuse to lease or send media to a slot
 whose token carries none.
 
+## Session records (`workload/producer/record.py`)
+
+A leased session writes its record to `gs://$TEE_CAPTURE_BUCKET/{account
+uuid}/estim_sessions/{session uuid}/enclave/` (README, "Session
+records"): the trainer's lease carries `record.prefix` and
+`record.partSeconds`, the slot validates the prefix's shape, and every
+stream goes out as thirty-second parts (`part-20260915T051230Z.parquet`
+or `.jsonl.gz`, named by the UTC second the window starts, the same grid
+and names as the trainer's half) as each window closes, on a background
+thread, each object created once (`ifGenerationMatch=0`). Parts wait on a
+tmpfs (`/run/tee/capture/record/<session>/`) only until they are
+uploaded; a slot that dies loses at most the window it was writing, and a
+SIGTERM mid-session flushes what is open for up to ten seconds before the
+process exits.
+
+- `TEE_CAPTURE_BUCKET` is `var.capture_bucket` (default
+  `masseuse-ai-prod`, the trainer's records bucket in its project),
+  attested like the rest of the tee-env. The trainer's policy pins it
+  (`expectedCaptureBucket`) and the verifier checks it
+  (`image.env.TEE_CAPTURE_BUCKET`). Unset (`capture_bucket = ""`), the slot
+  keeps no record and answers a lease that asks for one with 400: a
+  misconfiguration surfaces as a failed lease, never as a session
+  silently unrecorded.
+- The writer is the image digest's WIF principal (`terraform output
+  capture_writer_principals`), granted `roles/storage.objectCreator` on
+  the bucket by the trainer's Terraform from this state; nothing holds
+  `objects.delete` there and the bucket has no lifecycle rule. The bucket's
+  data-access audit log therefore shows every part with that principal as
+  the writer.
+- What to look at: `/statz` `tee.lease.record` (the prefix and part
+  length of the current lease); the session summary's `record` (per-stream
+  rows and parts, `upload.uploaded/existed/failed`, `drained`); the
+  counters `recordPartsUploaded`, `recordPartsExisted` (a part that was
+  already there, left as it was), `recordPartsFailed` (gave up after six
+  tries), `recordErrors`; the logs `record: upload of ... failed for good`.
+  `gcloud storage ls gs://masseuse-ai-prod/<uuid>/estim_sessions/<sid>/enclave/`
+  from an operator identity with `objectViewer` lists a session's parts;
+  `hello.json` says which image, analysis bundle and cameras it was,
+  `summary.json` how it ended.
+- The flat capture (`--sink-dir` files, a named run's `runs/<name>/`
+  upload) is unchanged for the local loop and the equivalence gate, and
+  `--tee` still forbids `--capture-bucket` and `--overlay-record`: the
+  record is the only thing a TEE session writes out.
+
 ## The sweeper (`terraform/sweeper.tf`)
 
 The backstop for a slot that did not end itself. `sweeper_enabled = true`
@@ -598,7 +642,14 @@ deployment's own pin is the digest, in this repository's `terraform.tfvars`:
 2. Here, with no slot running: the new digest into `container_image` /
    `container_image_digest` (the VM's `tee-image-reference`) and the
    previous one into `candidate_image_digests` (so it keeps its WIF
-   bindings and can be pinned back), `terraform apply`.
+   bindings and can be pinned back), `terraform apply`. The digest set
+   changes `capture_writer_principals`, which the trainer's Terraform
+   reads from this state to grant the records bucket: `terraform apply`
+   there next (`masseuse-trainer/terraform`, `records.tf`), or list the
+   new digest in `candidate_image_digests` and apply both sides before the
+   roll, so the first session on the new image can write its record. A
+   slot whose principal is not yet granted counts `recordPartsFailed` and
+   the record's summary names the parts that never left.
 3. Hand-boot a slot with no lease (`gcloud compute instances start
    masseuse-video-tee-slot-0 --zone us-central1-a`; the VM's power state is
    not Terraform's after creation, see `vm.tf`) and run `tee-verify
