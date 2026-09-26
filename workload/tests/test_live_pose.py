@@ -195,6 +195,23 @@ def test_a_second_view_keeps_its_own_anchor_scenery_cache_and_tap(monkeypatch):
     assert pose._scenery_done is False
 
 
+def test_a_face_views_row_names_the_face_block_and_the_bodys_does_not(monkeypatch):
+    pose = _pose(monkeypatch, StubTracker(), stride="1")
+    rgb = np.zeros((HEIGHT, WIDTH, 3), np.uint8)
+    body_row = pose.step(rgb, 0, 0.0)
+    face_row = pose.step(rgb, 0, 0.0, view="face")
+    # The body view's row is the 21 body points its consumers know.
+    assert set(body_row["keypoints"]) == {KEYPOINT_NAMES[i] for i in BODY}
+    # The face view's row names the body points and the whole face block,
+    # by the definition's names, with the model's coordinates and scores.
+    assert len(face_row["keypoints"]) == len(pose_rows.FACE_VIEW_POINTS) == 21 + 238
+    assert set(body_row["keypoints"]) <= set(face_row["keypoints"])
+    assert face_row["keypoints"]["tip_of_nose"] == [178.0, 356.0, 0.8]
+    assert face_row["keypoints"]["l_center_of_iris"] == [272.0, 544.0, 0.8]
+    assert face_row["keypoints"]["r_border_of_pupil_midpoint_2"] == [307.0, 614.0, 0.8]
+    assert "right_wrist" not in face_row["keypoints"]  # the hands stay out of both
+
+
 def test_the_body_views_state_keeps_its_old_names(monkeypatch):
     pose = _pose(monkeypatch, StubTracker())
     assert pose._scenery_done is True and pose.views["body"].scenery_done is True

@@ -125,7 +125,12 @@ Only in a session whose `hello` listed a `face` view.
   two views are lined up.
 - `keypoints`, `dropped`, `error`, `frameSize`: as in `pose`, for the face
   view's frame. The model is the same and so are the keypoint names; the
-  body points of a face view are whatever of the body the phone sees.
+  body points of a face view are whatever of the body the phone sees. A
+  face row names the face block as well: the 238 face landmarks
+  (`workload/pixel/keypoints.py`, `FACE`, indices 70-307: midline,
+  eyebrows, eyelids, nose, lips, ears, iris, pupil) beside the 21 body
+  points, so the analysis can measure the expression; a body row names the
+  body points only.
 
 Face rows carry no descriptors: the regional motion descriptors are the
 body view's alone.
@@ -248,6 +253,10 @@ session (`hello.resume`) rather than starting one. `vocal`, when present, is
 the constants the `vocal` rows below are judged against (thresholds, the
 labels' names, the bundle's vocal version): numbers and names, kept in the
 session record's `hello.json` so a row can be read back years later.
+`face`, when present (a bundle from 2026.09.18-1 on), is the same for what
+the readings carry about a `face` view: the keypoint indices and thresholds
+it is computed from, the names of its channels, and that part of the
+bundle's version. Numbers and names, kept in `hello.json` the same way.
 
 ### `post`, at the post cadence
 

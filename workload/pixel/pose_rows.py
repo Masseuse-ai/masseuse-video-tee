@@ -11,7 +11,14 @@ from __future__ import annotations
 
 from collections.abc import Callable
 
-from keypoints import BODY, KEYPOINT_NAMES, LOWER_BODY, MIN_KEYPOINT_SCORE
+from keypoints import ALL_NAMES, BODY, FACE, LOWER_BODY, MIN_KEYPOINT_SCORE
+
+# What a row names: the body view its 21 body points; a face view (the
+# phone pointed at the face) those plus the face block, 238 landmarks the
+# analysis reads for the expression's measures. The record carries every
+# view's full result regardless (record.py); this is what travels live.
+BODY_POINTS = tuple(BODY)
+FACE_VIEW_POINTS = tuple(BODY) + tuple(FACE)
 
 # On prone frames RT-DETRv4-X sometimes emits the torso as the high-confidence
 # person and the legs as an overlapping low-confidence person query. The latter
@@ -241,10 +248,11 @@ def choose_person(
 
 def row_for(frame_index: int, at_s: float, keypoints, scores,
             box: Box, box_score: float, people: int,
-            unresolved: bool) -> dict:
-    """A posed row: the 21 body points with scores, plus the box that framed
-    them. `frame` is whatever cadence the caller counts in - the producer
-    writes decode-cadence indices."""
+            unresolved: bool, points=BODY_POINTS) -> dict:
+    """A posed row: the named points (`points`, the 21 body points unless a
+    view asks for more) with scores, plus the box that framed them. `frame`
+    is whatever cadence the caller counts in - the producer writes
+    decode-cadence indices."""
     scores = [float(s) for s in scores]
     return {
         "frame": frame_index,
@@ -260,12 +268,12 @@ def row_for(frame_index: int, at_s: float, keypoints, scores,
             1 for i in LOWER_BODY if scores[i] >= MIN_KEYPOINT_SCORE
         ),
         "keypoints": {
-            KEYPOINT_NAMES[i]: [
+            ALL_NAMES[i]: [
                 round(float(keypoints[i][0]), 2),
                 round(float(keypoints[i][1]), 2),
                 round(scores[i], 4),
             ]
-            for i in BODY
+            for i in points
         },
     }
 

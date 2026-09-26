@@ -373,6 +373,7 @@ def _fetch_fuse(jobs) -> None:
 # The session's primary stream's view; a second stream's is named by the
 # session (the producer calls the phone's, beside a fixed camera, "face").
 BODY_VIEW = "body"
+FACE_VIEW = "face"
 
 
 class ViewState:
@@ -385,7 +386,10 @@ class ViewState:
     has its own of these and the model sees them one at a time.
     """
 
-    def __init__(self, on_full=None):
+    def __init__(self, on_full=None, name: str = BODY_VIEW):
+        # Which view this is: the row builder names the face block for the
+        # face view.
+        self.name = name
         # The live overlay's tap on this view's full result
         # (share_full_result), and the other listeners - the session's
         # record - which hear the same result after it.
@@ -566,7 +570,7 @@ class GpuPose:
         name = name or BODY_VIEW
         state = self.views.get(name)
         if state is None:
-            state = self.views[name] = ViewState()
+            state = self.views[name] = ViewState(name=name)
         return state
 
     def reset_session_state(self) -> None:
@@ -910,8 +914,13 @@ class GpuPose:
         keypoints, scores = result[:, :2], result[:, 2]
         share_full_result(state.taps(), self.telemetry, frame_index, at_s,
                           keypoints, scores, box, score, people, unresolved)
+        # A face view's row names the face block too (pose_rows): what the
+        # analysis measures the expression from. The body view stays the
+        # 21 body points its consumers know.
+        points = (pose_rows.FACE_VIEW_POINTS if state.name == FACE_VIEW
+                  else pose_rows.BODY_POINTS)
         return pose_rows.row_for(frame_index, at_s, keypoints, scores, box,
-                                 score, people, unresolved)
+                                 score, people, unresolved, points=points)
 
 
 class SideloadPose:
@@ -965,7 +974,7 @@ class SideloadPose:
         name = name or BODY_VIEW
         state = self.views.get(name)
         if state is None:
-            state = self.views[name] = ViewState()
+            state = self.views[name] = ViewState(name=name)
         return state
 
     def boot(self) -> None:
