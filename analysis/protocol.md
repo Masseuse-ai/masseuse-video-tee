@@ -317,6 +317,20 @@ lying stretch corrects it; the `stance` constants name the thresholds
 (`rest.hipsAboveShouldersMaxBu`, `unresolved`, `kneeChest.rearKneeFlexDeg`).
 The fields are the same; only the word's timing at the start of a run and
 its reading of a fold seen from below the hips change.
+From 2026.09.25-5 (`stance/v4`) the rest lines learn only from rows with a
+hip and a knee in frame (a body passing close to the lens with the legs
+out of frame taught them where it was, not where it lies), and when the
+body has been still for 30 s with the hips and shoulders both more than a
+body unit off their lines, the lines are re-seeded from the still rows;
+the `stance` constants name both (`rest.contactInFrame`, `rest.reanchor`).
+The same bundle's reading carries `rhythmSnr` and `rateConfidence` beside
+the contraction rate: the best channel's in-band to out-of-band power
+ratio, and a confidence in the rate from it (0 while the channel shows no
+rhythm at the contraction period, when no onsets are emitted either; 1 at
+twice the gate), so a reader weighs the rate by it; both `null` before the
+detector is ready. Its `posture` object carries `buckPeakedness`, the
+share of the movement band's power in its strongest bin, a diagnostic
+beside `buckPowerRatio`; the fields from before are computed as before.
 From 2026.09.24-2 (`face/v5`) the reading's `face` object also carries
 `hazard`: the analysis's probability that the response peaks within 30 and
 within 60 seconds (`p30`, `p60`, their logits, and `featuresPresent`, the
