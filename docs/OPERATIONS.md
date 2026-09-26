@@ -217,8 +217,19 @@ running between sessions.
   is answered once the run has let go of the slot, up to `STOP_WAIT_S`
   (5 s): `{"status":"stopped"}`, or `"stopping"` when the wind-down
   outlasted the wait; the `/produce` that follows then lands first time
-  instead of a 409 against the run still winding down. The lease is
-  cleared either way.
+  instead of a 409 against the run still winding down. The lease stands
+  through a `/stop` (the phone's legs, the connector and the session's
+  record are the session's still), but nothing works under it until the
+  next `/produce`, and the idle clock runs from the stop: a trainer that
+  stops and comes back with neither a `/produce` nor a `/teardown` does
+  not keep the slot up for the lease's hours. `/stop` and `/teardown`
+  may name their session (`?session=`); one that names another session
+  than the lease's is refused (`409 lease mismatch`, counted as
+  `leaseMismatch`) and the slot is untouched, since a session's release
+  can land after the next session's lease (2026-09-17: the next session
+  lost its lease, and its camera link, to the previous one's teardown).
+  Until then, `/stop` cleared the lease outright, which also closed the
+  session's record at every camera change.
 - **Stop, part two: the VM.** What happens next is the launcher's
   (go-tpm-tools `launcher/launcher/main.go` `getExitCode` and the image's
   `exit_script.sh`). The **debug image always holds** the VM after any
@@ -530,9 +541,10 @@ process exits.
   `hello.json` says which image it was, `runs/<start>/hello.json` which
   analysis bundle and cameras each production run had, `summary.json`
   how the lease ended and which runs it saw (docs/SESSION_RECORD.md). A
-  record is the lease's: it stays open between a session's runs (the
-  `records` list in `/statz`) and closes on `/stop`, `/teardown`, the
-  idle exit, a SIGTERM or another session's lease, logged as
+  record is the lease's: it stays open between a session's runs and
+  through the trainer's `/stop` between them (the `records` list in
+  `/statz`) and closes on `/teardown`, the idle exit, a lease expiry, a
+  SIGTERM or another session's lease, logged as
   `record: closed <prefix> (<why>): N rows in M parts, R run(s),
   drained=…`.
 - The flat capture (`--sink-dir` files, a named run's `runs/<name>/`

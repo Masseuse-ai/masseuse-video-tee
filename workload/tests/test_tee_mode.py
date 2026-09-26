@@ -378,7 +378,7 @@ def test_control_routes_take_the_trainer_token_and_nothing_else():
         assert code == 200
         snapshot = json.loads(body)
         assert snapshot["tee"]["origin"] == f"https://{HOST}"
-        assert snapshot["tee"]["lease"] == {"sessionId": None, "active": False,
+        assert snapshot["tee"]["lease"] == {"sessionId": None, "active": False, "stopped": False,
                                             "expiresAt": None, "record": None}
         assert snapshot["counters"].get("teeControlRejects") == 11
         code, _, body = slot.as_trainer("GET", "/ingest/status")
@@ -562,7 +562,7 @@ def test_lease_then_whip_with_the_capability_yields_signed_evidence():
         assert counters["teeCapabilityRejects"] >= 5
 
 
-def test_lease_validation_and_stop_clearing():
+def test_lease_validation_and_a_stop_that_leaves_the_lease_standing():
     with Slot() as slot:
         code, _, body = slot.as_trainer("POST", "/lease", b"not json",
                                         {"Content-Type": "application/json"})
@@ -572,13 +572,44 @@ def test_lease_validation_and_stop_clearing():
         assert code == 400 and "capabilityHash" in json.loads(body)["error"]
         assert slot.as_trainer("POST", "/lease", b"x" * 5000)[0] == 413
         cap = slot.lease()
+        assert slot.tee.lease.active() and slot.tee.lease.busy()
+        running = argparse.Namespace(stopping=threading.Event(), run_name="sess-1", overlay=None)
+        slot.server.current["session"] = running
+        # Another session's /stop is refused, and the run is left alone
+        # (2026-09-17: a release's stop and teardown landed on the slot the
+        # next session had just been leased).
+        code, _, body = slot.as_trainer("POST", "/stop?session=sess-9")
+        assert code == 409 and json.loads(body) == {"error": "lease mismatch"}
+        assert running.stopping.is_set() is False
+        assert slot.tee.lease.active() and slot.tee.lease.busy()
+        code, _, body = slot.as_trainer("POST", "/teardown?session=sess-9")
+        assert code == 409 and json.loads(body) == {"error": "lease mismatch"}
         assert slot.tee.lease.active()
+        # The lease's own /stop ends the run and leaves the lease standing:
+        # the phone's capability still opens it (its legs, the connector),
+        # the record stays the session's, and nothing works under it until
+        # the next /produce, so the idle clock runs.
+        code, _, _ = slot.as_trainer("POST", "/stop?session=sess-1")
+        assert code == 200
+        assert running.stopping.is_set()
+        assert slot.tee.lease.active() is True
+        assert slot.tee.lease.busy() is False
+        assert slot.tee.lease.check(cap) == (True, "sess-1")
+        assert slot.tee.lease.snapshot()["stopped"] is True
+        code, _, statz = slot.as_trainer("GET", "/statz")
+        assert json.loads(statz)["tee"]["lease"]["stopped"] is True
+        assert json.loads(statz)["counters"].get("leaseMismatch") == 2
+        # A caller that names no session is taken at its word, as before.
         slot.server.current["session"] = argparse.Namespace(
             stopping=threading.Event(), run_name="sess-1", overlay=None)
-        code, _, _ = slot.as_trainer("POST", "/stop")
-        assert code == 200
+        assert slot.as_trainer("POST", "/stop")[0] == 200
+        # The lease's own /teardown clears it.
+        slot.server.current["session"] = None
+        assert slot.as_trainer("POST", "/teardown?session=sess-1&mode=drain")[0] == 200
         assert slot.tee.lease.active() is False
         assert slot.tee.lease.check(cap) == (False, "no lease")
+        # With no lease held, anyone's teardown is nobody's to refuse.
+        assert slot.as_trainer("POST", "/teardown?session=sess-9&mode=drain")[0] == 200
 
 
 def test_the_lease_names_the_sessions_record_when_the_slot_has_a_bucket():
@@ -613,6 +644,12 @@ def test_the_lease_names_the_sessions_record_when_the_slot_has_a_bucket():
         slot.server.current["session"] = argparse.Namespace(
             stopping=threading.Event(), run_name="sess-1", overlay=None)
         assert slot.as_trainer("POST", "/stop")[0] == 200
+        # The lease stands through a /stop, its record with it: the next
+        # /produce of the same session (a camera change) records there.
+        assert slot.tee.lease.record_for() == {"prefix": prefix, "partSeconds": 30,
+                                               "bucket": "masseuse-ai-prod", "sessionId": "sess-1"}
+        slot.server.current["session"] = None
+        assert slot.as_trainer("POST", "/teardown?mode=drain")[0] == 200
         assert slot.tee.lease.record_for() is None
         # A lease without a record is a session without one, as before.
         code, _, answer = slot.as_trainer(
@@ -667,13 +704,23 @@ def test_the_leases_record_outlives_its_runs_and_closes_with_the_lease(tmp_path)
         slot.server.current["session"] = None
         assert slot.as_trainer("POST", "/stop")[0] == 404
         assert record.closed is False
-        # A /stop that ends the run closes it, off the request.
+        # A /stop that ends a run leaves it too: the record is the lease's,
+        # and the trainer stops a run to start the next one under the same
+        # session (a camera change). Until 2026-09-17 this closed it, with
+        # summary.json written at the first camera change and the later
+        # runs' summaries never landing.
         slot.server.current["session"] = argparse.Namespace(
             stopping=threading.Event(), run_name="sess-1", overlay=None)
         assert slot.as_trainer("POST", "/stop")[0] == 200
+        time.sleep(0.1)
+        assert record.closed is False and slot.server.records.open_records() == [record]
+        assert f"{PREFIX}/summary.json" not in gcs.objects
+        # The lease's /teardown closes it, off the request.
+        slot.server.current["session"] = None
+        assert slot.as_trainer("POST", "/teardown?mode=drain")[0] == 200
         settled(lambda: record.closed)
         settled(lambda: f"{PREFIX}/summary.json" in gcs.objects)
-        assert json.loads(gcs.objects[f"{PREFIX}/summary.json"][0])["ended"] == "stop"
+        assert json.loads(gcs.objects[f"{PREFIX}/summary.json"][0])["ended"] == "teardown"
         assert f"{PREFIX}/posts/part-" in "".join(gcs.objects)
         settled(lambda: slot.server.records.open_records() == [])
 
@@ -682,7 +729,7 @@ def test_the_leases_record_outlives_its_runs_and_closes_with_the_lease(tmp_path)
         second = opened(PREFIX, "r2")
         lease("sess-2", other)
         settled(lambda: second.closed)
-        assert json.loads(gcs.objects[f"{PREFIX}/summary.json"][0])["ended"] == "stop", \
+        assert json.loads(gcs.objects[f"{PREFIX}/summary.json"][0])["ended"] == "teardown", \
             "the first record's summary is untouched: objects are written once"
         # (the second record's summary was refused as already there, and
         # counted: the prefix was reused within one test only.)

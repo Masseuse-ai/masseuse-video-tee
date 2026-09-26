@@ -42,8 +42,11 @@ so a window has one part whichever runs fell in it, `hello.json` and
 `summary.json` are written once, and each run has its own pair under
 `runs/<start>/`, named by the UTC second it began (`-2`, `-3` should two
 begin in the same second). The record closes when the lease ends: the
-trainer's `/stop` or `/teardown`, the slot's idle exit or a lease expiry,
-a SIGTERM, or a lease for another session.
+trainer's `/teardown`, the slot's idle exit or a lease expiry, a SIGTERM,
+or a lease for another session; the trainer's `/stop` between two runs of
+one session leaves it open (before v0.8.4 it closed it, and `summary.json`
+said `ended: stop` from the first camera change while the later runs'
+`runs/<start>/summary.json` never landed).
 
 ## The grid
 

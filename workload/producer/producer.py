@@ -2097,6 +2097,12 @@ def build_server(args, telemetry: Telemetry,
             self.send_response(404)
             self.end_headers()
 
+        def _named_session(self, parsed) -> str | None:
+            """The `session` a /stop or /teardown names (`?session=`), or
+            None from a caller that names none."""
+            values = parse_qs(parsed.query).get("session")
+            return str(values[0]) if values and values[0] else None
+
         def _control_gate(self) -> bool:
             """The trainer's OIDC token on a control route in TEE mode.
             True when the request may proceed; otherwise the 401 has been
@@ -2213,8 +2219,9 @@ def build_server(args, telemetry: Telemetry,
                 self._json(400, {"error": str(error)})
                 return
             # The lease says whose slot this is; a connector may be expected
-            # for that session only (after /stop there is no lease until the
-            # trainer leases again, and the trainer retries then).
+            # for that session only (after a /teardown there is no lease
+            # until the trainer leases again, and the trainer retries then;
+            # a /stop between two runs leaves the lease standing).
             if session_id != (tee.lease.snapshot()["sessionId"] or ""):
                 self._json(409, {"error": "lease mismatch"})
                 return
@@ -2562,20 +2569,28 @@ def build_server(args, telemetry: Telemetry,
             if parsed.path == "/stop":
                 if not self._control_gate():
                     return
+                # Whose slot this is: a /stop that names another session
+                # than the lease's is refused (the trainer's release of a
+                # session whose slot has since been leased again; 2026-09-17
+                # one such teardown cleared the next session's lease).
+                if tee is not None and not tee.lease.owns(self._named_session(parsed)):
+                    telemetry.count("leaseMismatch")
+                    self._json(409, {"error": "lease mismatch"})
+                    return
                 # Answered once the slot is free again (up to STOP_WAIT_S):
                 # the trainer's next /produce then lands first time.
                 code, body = stop_session(current, busy)
                 if code == 200:
                     print(f"stop: {body}", flush=True)
                     if tee is not None:
-                        tee.lease.clear()
-                        # The lease is over: its record closes (the last
-                        # parts, summary.json) off this request, which the
-                        # trainer is waiting on before its /teardown. A
-                        # session still winding down (`stopping`) closes
-                        # it itself when it ends (the /produce handler).
-                        if body.get("status") == "stopped" and records.open_records():
-                            records.close_in_background("stop")
+                        # The lease stands: the trainer stops a run to start
+                        # another under the same session (a camera change),
+                        # and the session's record is the lease's, not the
+                        # run's. Nothing works under the lease until that
+                        # /produce, and the idle clock runs from here; a
+                        # /teardown, the lease's expiry, another session's
+                        # lease or the idle exit is what closes the record.
+                        tee.lease.note_stop()
                 payload = json.dumps(body).encode()
                 self.send_response(code)
                 self.send_header("Content-Type", "application/json")
@@ -2588,6 +2603,13 @@ def build_server(args, telemetry: Telemetry,
                 self.end_headers()
                 return
             if not self._control_gate():
+                return
+            if tee is not None and not tee.lease.owns(self._named_session(parsed)):
+                # Another session's slot now (its lease came after the
+                # caller's release began): its teardown is not this one's
+                # to make.
+                telemetry.count("leaseMismatch")
+                self._json(409, {"error": "lease mismatch"})
                 return
             mode = parse_qs(parsed.query).get("mode", ["drain"])[0]
             if mode not in ("drain", "now"):
@@ -2744,6 +2766,7 @@ def build_server(args, telemetry: Telemetry,
                     # What it does leave is the session's record, when the
                     # lease named one (tee_mode.Lease.record_for).
                     session_args.record = tee.lease.record_for()
+                    tee.lease.note_run()
                 if external_view_args(session_args, external):
                     session_args.face_mirror = view_prefs["mirror"]
                 self.send_response(200)

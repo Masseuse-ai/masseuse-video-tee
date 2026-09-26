@@ -118,6 +118,49 @@ def test_a_lease_holds_the_slot_and_the_short_clock_runs_after_it():
     assert idle.due() == "no lease and no session for 60s"
 
 
+def test_a_stopped_lease_does_not_hold_the_slot_but_a_produce_under_it_does():
+    # The trainer's /stop leaves the lease standing (a camera change stops
+    # one run to start the next under the same session); a trainer that
+    # stops and never comes back with a /produce or a /teardown must not
+    # keep the slot up for the lease's hours.
+    clock = Clock()
+    idle, _, lease, _, _ = make(clock)
+    grant(lease, clock, ttl_s=tee_mode.LEASE_MAX_S)
+    clock.advance(30)
+    assert idle.due() is None
+    lease.note_stop()
+    assert lease.active() and not lease.busy()
+    assert idle.due() is None
+    clock.advance(59)
+    assert idle.due() is None
+    # The next run under the lease, in time: working again.
+    lease.note_run()
+    assert lease.busy()
+    assert idle.due() is None
+    clock.advance(3600)
+    assert idle.due() is None
+    # Stopped and left: the short clock runs out.
+    lease.note_stop()
+    idle.due()
+    clock.advance(60)
+    assert idle.due() == "a stopped lease and no session for 60s"
+    # A fresh grant is working again, until its own stop.
+    grant(lease, clock, ttl_s=tee_mode.LEASE_MAX_S)
+    assert lease.busy() and idle.due() is None
+
+
+def test_the_lease_knows_its_session():
+    clock = Clock()
+    lease = tee_mode.Lease(clock=clock)
+    assert lease.owns("anyone") is True, "no lease: nobody's to refuse"
+    grant(lease, clock)
+    assert lease.owns("sess-1") is True
+    assert lease.owns("sess-2") is False
+    assert lease.owns(None) is True, "an older caller names none"
+    clock.advance(tee_mode.LEASE_MAX_S + 1)
+    assert lease.owns("sess-2") is True, "expired: nobody's"
+
+
 def test_an_expired_lease_is_idle():
     clock = Clock()
     idle, _, lease, _, _ = make(clock)

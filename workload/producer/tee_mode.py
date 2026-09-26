@@ -442,6 +442,14 @@ class Lease:
     # clear() and expiry: the slot has served a phone, so IdleExit uses the
     # short idle clock from here on, however the ticks fall.
     ever_granted: bool = False
+    # Set by a /stop under this lease and cleared by the next /produce or
+    # grant: the lease stands (the phone's legs, the connector, the record
+    # are the session's still) but nothing is working under it, and the
+    # idle clock runs. Before 2026-09-17 /stop cleared the lease outright,
+    # which closed the session's record at every camera change (the trainer
+    # stops the run and starts another under a fresh lease of the same
+    # session) and left a torn-down slot's lease to whoever leased next.
+    stopped_at: float | None = None
     lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
     clock: object = field(default=time.time, repr=False)
 
@@ -474,6 +482,7 @@ class Lease:
             self.expires_at = expires_at
             self.record = record
             self.ever_granted = True
+            self.stopped_at = None
         answer = {"status": "leased", "sessionId": session_id,
                   "expiresAt": int(expires_at)}
         if record is not None:
@@ -486,6 +495,36 @@ class Lease:
             self.capability_hash = ""
             self.expires_at = 0.0
             self.record = None
+            self.stopped_at = None
+
+    def note_stop(self) -> None:
+        """A /stop under this lease: the lease stands, nothing works under it."""
+        with self.lock:
+            if self.capability_hash:
+                self.stopped_at = float(self.clock())
+
+    def note_run(self) -> None:
+        """A /produce under this lease: working again."""
+        with self.lock:
+            self.stopped_at = None
+
+    def owns(self, session_id: str | None) -> bool:
+        """Whether `session_id` is this lease's session. None (an older
+        caller that names none) is taken as the holder's word; a lease that
+        is not active belongs to nobody, and anyone may end it."""
+        if session_id is None:
+            return True
+        if not self.active():
+            return True
+        with self.lock:
+            return session_id == self.session_id
+
+    def busy(self) -> bool:
+        """Active with a run under it, or one still to come: what keeps the
+        slot's idle clock from running. A stopped lease is not busy."""
+        with self.lock:
+            active = bool(self.capability_hash) and float(self.clock()) < self.expires_at
+            return active and self.stopped_at is None
 
     def record_for(self) -> dict | None:
         """What a /produce under this lease records to: the bucket, the
@@ -522,6 +561,7 @@ class Lease:
             return {"sessionId": self.session_id or None,
                     "active": bool(self.capability_hash)
                     and float(self.clock()) < self.expires_at,
+                    "stopped": self.stopped_at is not None,
                     "expiresAt": int(self.expires_at) if self.expires_at else None,
                     "record": ({**self.record, "bucket": self.capture_bucket}
                                if self.record is not None else None)}
@@ -580,13 +620,17 @@ class IdleExit:
             self._last_touch = self.clock()
 
     def _busy(self) -> bool:
-        return self.lease.active() or self.teardown.is_working()
+        return self.lease.busy() or self.teardown.is_working()
 
     def due(self) -> str | None:
         """One tick: the reason to exit now, or None. Also advances the
-        idle bookkeeping, so call it on a cadence."""
+        idle bookkeeping, so call it on a cadence. A lease under which a
+        /stop has landed and no /produce followed does not hold the slot:
+        the trainer's next step is a /produce (a camera change) within
+        seconds or a /teardown; a trainer that does neither has gone, and
+        the slot should not run out the lease's hours for it."""
         now = self.clock()
-        leased = self.lease.active()
+        leased = self.lease.busy()
         ever = self.lease.ever_granted
         with self._lock:
             if leased or self.teardown.is_working():
@@ -600,7 +644,8 @@ class IdleExit:
             if idle_for < limit:
                 return None
             if ever:
-                return f"no lease and no session for {idle_for:.0f}s"
+                return (f"a stopped lease and no session for {idle_for:.0f}s"
+                        if self.lease.active() else f"no lease and no session for {idle_for:.0f}s")
             return f"no lease {idle_for:.0f}s after boot"
 
     def snapshot(self) -> dict:
