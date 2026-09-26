@@ -14,6 +14,9 @@ numbers are the pipeline's, arranged so it can sit inside a CUDA graph:
   one device-to-host copy per frame brings everything back. The producer
   used to hand CUDA tensors to the row builder, which read them one
   element at a time: some 350 tiny synchronous copies per pose frame.
+
+`keypoints_in_image_batch` is the same over B crops at once (`(B, K, 3)`),
+for a graph captured over a batch; the production path is its batch of one.
 """
 
 from __future__ import annotations
@@ -31,14 +34,17 @@ def heatmap_extent(heatmap_shape, device) -> torch.Tensor:
                         device=device)
 
 
-def keypoints_in_image(heatmaps: torch.Tensor, box_xywh: torch.Tensor,
-                       extent: torch.Tensor, crop_size: tuple[int, int],
-                       kernel_size: int = DARK_KERNEL) -> torch.Tensor:
-    """`(1, K, H, W)` heatmaps for one person framed by `box_xywh` (COCO
-    x, y, width, height in image pixels), as `(K, 3)` image-space x, y, score.
+def keypoints_in_image_batch(heatmaps: torch.Tensor, boxes_xywh: torch.Tensor,
+                             extent: torch.Tensor, crop_size: tuple[int, int],
+                             kernel_size: int = DARK_KERNEL) -> torch.Tensor:
+    """`(B, K, H, W)` heatmaps for B people, each framed by its row of
+    `boxes_xywh` (`(B, 4)`, COCO x, y, width, height in image pixels), as
+    `(B, K, 3)` image-space x, y, score.
 
-    `crop_size` is the processor's `(height, width)`; `extent` comes from
-    `heatmap_extent` for these heatmaps.
+    The processor's functions are batched over their first dimension, so
+    this is their computation with B crops in flight at once: what a graph
+    captured over a batch of crops replays. `crop_size` is the processor's
+    `(height, width)`; `extent` comes from `heatmap_extent`.
     """
     from transformers.models.sapiens2.image_processing_sapiens2 import (
         box_xywh_to_cxcywh, boxes_to_crop_params, get_keypoint_predictions,
@@ -52,7 +58,17 @@ def keypoints_in_image(heatmaps: torch.Tensor, box_xywh: torch.Tensor,
     keypoints = post_dark_unbiased_data_processing(
         keypoints=keypoints, heatmaps=heatmaps, blur_kernel_size=kernel_size)
     centers, scales = boxes_to_crop_params(
-        box_xywh_to_cxcywh(box_xywh.float()[None]), output_size=crop_size)
+        box_xywh_to_cxcywh(boxes_xywh.float()), output_size=crop_size)
     keypoints = (keypoints / extent * scales[:, None, :]
                  + centers[:, None, :] - 0.5 * scales[:, None, :])
-    return torch.cat([keypoints[0], scores[0][:, None]], dim=-1)
+    return torch.cat([keypoints, scores[..., None]], dim=-1)
+
+
+def keypoints_in_image(heatmaps: torch.Tensor, box_xywh: torch.Tensor,
+                       extent: torch.Tensor, crop_size: tuple[int, int],
+                       kernel_size: int = DARK_KERNEL) -> torch.Tensor:
+    """`(1, K, H, W)` heatmaps for one person framed by `box_xywh` (COCO
+    x, y, width, height in image pixels), as `(K, 3)` image-space x, y, score:
+    the batch of one."""
+    return keypoints_in_image_batch(
+        heatmaps, box_xywh[None], extent, crop_size, kernel_size)[0]

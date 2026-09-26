@@ -29,6 +29,10 @@
 #                                      exits and the VM stops (tee_mode.IdleExit)
 #   TEE_BOOT_IDLE_S                    optional, 300: the same for a boot that
 #                                      never gets a lease at all
+#   POSE_GRAPH_BENCH                   optional, unset: batch sizes ("1,2,4,8")
+#                                      for the boot-time pose graph bench
+#                                      (pixel/pose_bench.py); a debug-slot
+#                                      knob set by hand, never by Terraform
 set -euo pipefail
 
 log() { printf 'entrypoint: %s\n' "$*"; }

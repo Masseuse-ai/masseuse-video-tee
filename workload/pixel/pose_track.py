@@ -258,20 +258,27 @@ class Tracker:
         import pose_post
 
         self.detector_backend.capture(telemetry)
-        height, width = self.crop_size
-        static_crop = torch.zeros(
-            (1, 3, height, width), device=self.device, dtype=self.dtype)
-        static_box = torch.tensor(
-            [0.0, 0.0, float(width), float(height)], device=self.device)
+        static_crops, static_boxes = self.pose_static_inputs(1)
         # One eager forward tells the heatmap shape; the extent tensor must
         # exist before capture (a tensor built inside is a host copy).
         with torch.inference_mode(), self.autocast():
-            heatmaps = self.pose(static_crop).heatmaps
+            heatmaps = self.pose(static_crops).heatmaps
         self.heatmap_extent = pose_post.heatmap_extent(
             heatmaps.shape, self.device)
         self.pose_graph = gpu_graph.build(
-            self.pose_forward, (static_crop, static_box), name="pose",
+            self.pose_forward, (static_crops, static_boxes[0]), name="pose",
             device=self.device, telemetry=telemetry)
+
+    def pose_static_inputs(self, batch: int) -> tuple[torch.Tensor, torch.Tensor]:
+        """Static graph inputs for `batch` crops: `(B, 3, H, W)` zeros in the
+        model dtype and `(B, 4)` boxes framing a whole crop, on the device."""
+        height, width = self.crop_size
+        crops = torch.zeros(
+            (batch, 3, height, width), device=self.device, dtype=self.dtype)
+        boxes = torch.tensor(
+            [0.0, 0.0, float(width), float(height)], device=self.device
+        ).repeat(batch, 1)
+        return crops, boxes
 
     def pose_forward(self, crop: torch.Tensor,
                      box: torch.Tensor) -> torch.Tensor:
@@ -283,6 +290,20 @@ class Tracker:
             heatmaps = self.pose(crop).heatmaps
         return pose_post.keypoints_in_image(
             heatmaps, box, self.heatmap_extent, self.crop_size)
+
+    def pose_forward_batch(self, crops: torch.Tensor,
+                           boxes: torch.Tensor) -> torch.Tensor:
+        """`pose_forward` over B crops at once: one forward over the
+        `(B, 3, H, W)` batch and the batched post-processing, `(B, K, 3)`
+        image-space x, y, score per crop for the `(B, 4)` boxes framing them.
+        Not on the production path: what `pose_bench` captures to measure
+        a batch against the batch-of-one graph."""
+        import pose_post
+
+        with torch.inference_mode(), self.autocast():
+            heatmaps = self.pose(crops).heatmaps
+        return pose_post.keypoints_in_image_batch(
+            heatmaps, boxes, self.heatmap_extent, self.crop_size)
 
     def pose_forward_tta(self, crop: torch.Tensor,
                          box: torch.Tensor) -> torch.Tensor:
@@ -311,6 +332,16 @@ class Tracker:
         inputs = self.pose_processor(
             [frame], boxes=[[box]], return_tensors="pt", device=self.device)
         return inputs["pixel_values"].to(dtype=self.dtype)
+
+    def pose_inputs(self, frame: torch.Tensor,
+                    boxes: list[list[float]]) -> tuple[torch.Tensor, torch.Tensor]:
+        """`pose_forward_batch`'s inputs for the people in `boxes` (COCO
+        xywh) on one CHW uint8 device frame: their crops as one
+        `(B, 3, H, W)` batch in the model dtype, made exactly as `pose_crop`
+        makes the production crop, and the boxes as a `(B, 4)` tensor."""
+        crops = torch.cat([self.pose_crop(frame, box) for box in boxes])
+        return crops, torch.tensor(
+            boxes, dtype=torch.float32, device=self.device)
 
     def pose_keypoints(self, frame: torch.Tensor, box: list[float]):
         """`(K, 3)` x, y, score in image pixels for the person in `box`, as

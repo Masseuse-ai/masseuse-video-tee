@@ -292,6 +292,29 @@ posture.
 - The certificate is publicly trusted in debug mode too (Google Trust
   Services), so a phone can test the debug slot as is.
 - The `attestation-debug` WIF provider admits `dbgstat == 'enabled'`.
+- The pose graph batch bench (`workload/pixel/pose_bench.py`): with the
+  slot `TERMINATED`, `gcloud compute instances add-metadata
+  masseuse-video-tee-slot-0 --zone us-central1-a
+  --metadata tee-env-POSE_GRAPH_BENCH=1,2,4,8`, then start it by hand. The
+  boot runs its usual capture and parity check, then for each batch size
+  captures a graph over that many pose crops, times it, checks every slot
+  of the batch against the production batch-of-one graph and frees it,
+  and prints one line per batch to Cloud Logging:
+  `poseBench batch=8 graph=on captureMs=... replayMs=p50/p95 gpuMs=...
+  perCropMs=... cropsPerS=... parityPx=... parityScore=... memMiB=...
+  detectBehindMs=... pose1BehindMs=...` (`replayMs` is wall time to
+  completion, `gpuMs` the device time between CUDA events, `memMiB` what
+  the graph reserved, the two `Behind` figures how long a detector replay
+  and a batch-of-one replay take when queued right behind a batch replay
+  on the same stream). `poseBench before/after batch=1` lines bracket the
+  run with the production graph's own timing; `after` also carries
+  `driftPx`, the production graph's result before against after, which
+  must be 0. A batch whose capture fails is a `graph=off` row with eager
+  timing. The bench lengthens the boot by about a minute and nothing of it
+  survives it: the graphs are released before the slot serves. The knob
+  has no default in the image and no Terraform sets it; the metadata
+  entry is dropped by the next `terraform apply` (and the flip replaces
+  the instance), so it never follows the slot into production.
 
 ## Image signing (`terraform/signing.tf`)
 
@@ -472,6 +495,30 @@ trainer's control token and the attestation are the only telemetry; a slot
 that fails to come up is diagnosed by rebuilding it with `debug_mode =
 true`. What it gains: the launcher itself powers the VM off two minutes
 after the workload exits, a second path beside the trainer's reaper.
+
+Flipping back to `debug_mode = true` within 30 days of a flip fails on the
+`attestation-debug` WIF provider with a 409 (`Requested entity already
+exists`): a deleted provider is only soft-deleted, and keeps its name, for
+30 days. Undelete it and put it back under Terraform's management before
+the apply:
+
+```bash
+gcloud iam workload-identity-pools providers undelete attestation-debug \
+  --workload-identity-pool=masseuse-video-tee --location=global \
+  --project=prod-masseuse-video-tee
+```
+
+then an `import` block in a temporary `.tf` file (`to =
+google_iam_workload_identity_pool_provider.attestation_debug[0]`, `id =
+"projects/prod-masseuse-video-tee/locations/global/workloadIdentityPools/masseuse-video-tee/providers/attestation-debug"`),
+applied with `-target='google_iam_workload_identity_pool_provider.attestation_debug[0]'`
+(the plain `terraform import` command evaluates the whole configuration
+and refuses while the slot instance is absent, because the IAM bindings
+keyed on it cannot be known until apply); remove the file afterwards.
+The rest of the flip is as above with the values
+reversed, `-replace='google_compute_instance.slot["slot-0"]'` while the VM
+reads `TERMINATED`, and a second plain apply for the IAM bindings the
+replacement re-keys.
 
 ## VPC Service Controls
 

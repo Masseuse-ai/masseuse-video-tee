@@ -50,10 +50,11 @@ buildx_last_digest() {
 
 # The tests that need torch and transformers (the CPU-only CI skips them):
 # the graph wrapper's contract, the packed post-processing against the
-# processor's own, the detector's host-side selection, and the pose step
-# and parity check around stub models. Run in the smoke stage, where the
-# libraries are the versions the enclave ships.
-SMOKE_TESTS="tests/test_gpu_graph.py tests/test_pose_post.py tests/test_detector_post.py tests/test_live_pose.py"
+# processor's own (batch of one and batched), the batch bench's contract,
+# the detector's host-side selection, and the pose step and parity check
+# around stub models. Run in the smoke stage, where the libraries are the
+# versions the enclave ships.
+SMOKE_TESTS="tests/test_gpu_graph.py tests/test_pose_post.py tests/test_pose_bench.py tests/test_detector_post.py tests/test_live_pose.py"
 
 # buildx_smoke <TEE image ref>: every import the enclave makes, on the
 # built image, CPU only, run by BuildKit (the daemon's own image store may

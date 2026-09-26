@@ -275,3 +275,43 @@ def test_eager_graphs_are_warmed_not_compared():
     assert tracker.detector_backend.calls == 1 and tracker.forwards == 1
     gauges = pose.telemetry.snapshot()["gauges"]
     assert gauges["detectGraph"] == 0.0 and gauges["poseGraph"] == 0.0
+
+
+# -- the batch bench knob ---------------------------------------------------------
+
+
+def _bench_pose(monkeypatch, run):
+    import pose_bench
+
+    monkeypatch.setattr(pose_bench, "run", run)
+    monkeypatch.setattr(live_pose.GpuPose, "parity_frame",
+                        staticmethod(lambda device, size=(360, 640): ("frame", device)))
+    pose = live_pose.GpuPose(device="cpu", telemetry=Telemetry())
+    pose.tracker = StubTracker()
+    return pose
+
+
+def test_the_bench_runs_only_when_the_knob_names_batches(monkeypatch):
+    calls = []
+
+    def run(tracker, frame, batches, **kwargs):
+        calls.append((tracker, frame, batches, kwargs["telemetry"]))
+        return {"before": None, "after": None, "batches": []}
+
+    pose = _bench_pose(monkeypatch, run)
+    assert pose.bench_batches(None) is None
+    assert pose.bench_batches("") is None
+    assert pose.bench_batches("0") is None
+    assert calls == []
+    assert pose.bench_batches("1,2,4,8") == {"before": None, "after": None, "batches": []}
+    assert calls == [(pose.tracker, ("frame", "cpu"), [1, 2, 4, 8], pose.telemetry)]
+
+
+def test_a_bench_that_fails_is_printed_and_counted_not_fatal(monkeypatch, capsys):
+    def run(tracker, frame, batches, **kwargs):
+        raise RuntimeError("CUDA out of memory")
+
+    pose = _bench_pose(monkeypatch, run)
+    assert pose.bench_batches("8") is None
+    assert "poseBench: failed: RuntimeError('CUDA out of memory')" in capsys.readouterr().out
+    assert pose.telemetry.snapshot()["counters"]["poseBenchFailed"] == 1

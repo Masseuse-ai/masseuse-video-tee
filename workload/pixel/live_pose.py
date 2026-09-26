@@ -399,6 +399,13 @@ class GpuPose:
       POSE_CUDA_GRAPHS=0  run the forwards eagerly instead of as captured
                         CUDA graphs (gpu_graph). Debugging only: eager is
                         launch-bound on a Confidential Computing GPU.
+      POSE_GRAPH_BENCH=1,2,4,8  after the parity check, capture the pose
+                        forward over batches of that many crops and print
+                        `poseBench` lines comparing each with the batch of
+                        one (pose_bench). Debug slots only: the launch
+                        policy admits it, nothing in production sets it,
+                        and the graphs it captures are gone before the
+                        slot serves.
 
     Each frame is uploaded once as a CHW uint8 tensor; the detector's
     resize, the pose crop, both forwards and their post-processing run on
@@ -475,9 +482,30 @@ class GpuPose:
         # eager twin on a synthetic frame.
         self.tracker.capture(self.telemetry)
         self.check_parity()
+        self.bench_batches(os.environ.get("POSE_GRAPH_BENCH"))
         if self.telemetry:
             self.telemetry.boot_phase("firstInference", started)
         self._log_gpu()
+
+    def bench_batches(self, spec: str | None) -> dict | None:
+        """The boot-time batch bench when `POSE_GRAPH_BENCH` names batch
+        sizes (see `pose_bench`); nothing otherwise. A measurement must not
+        cost a boot, so a failure inside it is printed and counted
+        (`poseBenchFailed`) and the slot goes on to serve."""
+        import pose_bench
+
+        batches = pose_bench.parse_batches(spec)
+        if not batches:
+            return None
+        try:
+            return pose_bench.run(
+                self.tracker, self.parity_frame(self.device), batches,
+                telemetry=self.telemetry)
+        except Exception as error:  # noqa: BLE001 - a bench, not the service
+            print(f"poseBench: failed: {error!r}", flush=True)
+            if self.telemetry:
+                self.telemetry.count("poseBenchFailed")
+            return None
 
     @staticmethod
     def parity_frame(device: str, size: tuple[int, int] = (360, 640)):

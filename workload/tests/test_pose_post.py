@@ -52,6 +52,39 @@ def test_keypoints_in_image_matches_the_processor(box):
     assert torch.equal(packed[:, 2], reference["scores"])
 
 
+def test_a_batch_of_crops_matches_the_processor_person_by_person():
+    """`keypoints_in_image_batch` over three people is the processor's
+    post-processing of the three, and each row is what the batch of one
+    gives for that person alone (the production path is unchanged).
+
+    The one exception is a keypoint whose heatmap is all zero: its argmax
+    is (-1, -1) and the processor's refinement then reads the neighbouring
+    heatmap in memory, which in a batch is the previous person's. Such a
+    keypoint has score 0 and no consumer reads its position, so the rows
+    are compared where the score is positive.
+    """
+    processor = sapiens2.Sapiens2ImageProcessor()
+    boxes = [[200.0, 90.0, 240.0, 180.0], [300.0, 20.0, 60.0, 300.0],
+             [0.0, 0.0, 640.0, 360.0]]
+    heat = torch.cat([_heatmaps(seed=11 + i) for i in range(len(boxes))])
+    assert heat.shape[0] == 3
+    reference = processor.post_process_pose_estimation(
+        SimpleNamespace(heatmaps=heat), boxes=[boxes])[0]
+    extent = pose_post.heatmap_extent(heat.shape, "cpu")
+    packed = pose_post.keypoints_in_image_batch(
+        heat, torch.tensor(boxes), extent, CROP)
+    assert packed.shape == (3, KEYPOINTS, 3) and packed.dtype == torch.float32
+    for i, box in enumerate(boxes):
+        assert torch.equal(packed[i, :, :2], reference[i]["keypoints"])
+        assert torch.equal(packed[i, :, 2], reference[i]["scores"])
+        alone = pose_post.keypoints_in_image(
+            heat[i:i + 1], torch.tensor(box), extent, CROP)
+        assert torch.equal(alone[:, 2], packed[i, :, 2])
+        live = packed[i, :, 2] > 0
+        assert int(live.sum()) == KEYPOINTS - 5
+        assert torch.equal(alone[live], packed[i][live])
+
+
 def test_bf16_heatmaps_are_refined_in_float32_like_the_processor():
     processor = sapiens2.Sapiens2ImageProcessor()
     box = [100.0, 50.0, 200.0, 250.0]
