@@ -58,7 +58,7 @@ variable "vm_running" {
 # ---------------------------------------------------------------------------
 
 variable "container_image" {
-  description = "The TEE workload image by digest: <region>-docker.pkg.dev/<project>/masseuse-video-tee/masseuse-video-tee@sha256:... (cloudbuild.tee.yaml)."
+  description = "The TEE workload image by digest: <region>-docker.pkg.dev/<project>/masseuse-video-tee/masseuse-video-tee@sha256:..., the digest a release.yml run promoted (its GitHub Release names it)."
   type        = string
 }
 
@@ -182,7 +182,7 @@ variable "run_tmpfs_gib" {
 # ---------------------------------------------------------------------------
 
 variable "operator_members" {
-  description = "Who may run Terraform, Cloud Build and (debug only) SSH: the VPC-SC ingress access level is built from these. Set in terraform.tfvars (IAM members, e.g. user:... or group:...); never committed."
+  description = "Who may run Terraform and (debug only) SSH: the VPC-SC ingress access level is built from these. Set in terraform.tfvars (IAM members, e.g. user:... or group:...); never committed."
   type        = list(string)
   default     = []
 }

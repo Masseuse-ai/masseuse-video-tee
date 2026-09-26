@@ -1,15 +1,19 @@
 # ---------------------------------------------------------------------------
-# Image signing (Phase 5): a Cloud KMS signing key that Cloud Build uses
-# with cosign after every push (cloudbuild.tee*.yaml, step "sign"). The
-# launcher verifies the signature at boot (tee-signed-image-repos) and
-# lists it in the attestation token as
+# Image signing: a Cloud KMS signing key that the release workflow's
+# promote job (.github/workflows/release.yml) uses with cosign once the
+# image it built on GitHub has been copied by digest into Artifact
+# Registry. The launcher verifies the signature at boot
+# (tee-signed-image-repos) and lists it in the attestation token as
 # submods.container.image_signatures[] = {key_id, signature_algorithm}
 # where key_id is the hex SHA-256 of the DER-encoded public key. The WIF
-# production provider and the trainer/phone policy pin that key_id, so a
-# rebuilt image nobody signed cannot read the weights or take a session,
-# whatever its digest. Same shape as auth-broker-tee/terraform/kms.tf.
+# production provider, the trainer/phone policy and the camera connector
+# pin that key_id: it is the image's identity. Only the github-release
+# service account may sign (github-release.tf), and only a release.yml run
+# on a tag may become that account, so "signed by the key" means "built by
+# release.yml from a tag of the public repository", for whatever digest the
+# token then reports. Same shape as auth-broker-tee/terraform/kms.tf.
 #
-# Signing runs on every build; *requiring* the signature is the
+# Signing runs on every release; *requiring* the signature is the
 # require_signed_image switch (production flip), because the debug images
 # built before the key existed carry none.
 # ---------------------------------------------------------------------------
@@ -41,21 +45,11 @@ resource "google_kms_crypto_key" "image_signer" {
   }
 }
 
-# Cloud Build signs (asymmetricSign) and reads the public key for the
-# dev.cosignproject.cosign/pub annotation the launcher insists on.
-resource "google_kms_crypto_key_iam_member" "cloud_build_signs" {
-  crypto_key_id = google_kms_crypto_key.image_signer.id
-  role          = "roles/cloudkms.signerVerifier"
-  member        = local.cloud_build_sa
-}
+# Who may sign: the release workflow's account alone (github-release.tf,
+# github_release_signs and github_release_reads_key). No build system in
+# this project holds the key any more.
 
-resource "google_kms_crypto_key_iam_member" "cloud_build_reads_key" {
-  crypto_key_id = google_kms_crypto_key.image_signer.id
-  role          = "roles/cloudkms.viewer"
-  member        = local.cloud_build_sa
-}
-
-# The primary version's public key: PEM for VERIFICATION.md readers, and
+# The primary version's public key: PEM for VERIFY.md readers, and
 # its fingerprint (what the token reports as key_id) computed the way the
 # launcher does, sha256 over the DER SubjectPublicKeyInfo.
 data "google_kms_crypto_key_version" "image_signer" {
@@ -111,6 +105,6 @@ output "image_signer_fingerprint" {
 }
 
 output "image_signer_public_key_pem" {
-  description = "The signing public key, for VERIFICATION.md and external verifiers."
+  description = "The signing public key, for VERIFY.md and external verifiers."
   value       = data.google_kms_crypto_key_version.image_signer.public_key[0].pem
 }

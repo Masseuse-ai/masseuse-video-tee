@@ -9,8 +9,14 @@
 # KMS key in signing.tf so the launcher's signature check
 # (tee-signed-image-repos) and the production provider's key_id pin are
 # unchanged. The promote job needs write on the repository and sign on the
-# key, nothing else; it gets them through this pool, and only from workflow
-# runs of the named repository on a tag.
+# key, nothing else; it gets them through this pool, and only from runs of
+# release.yml in the named repository on a release tag. Nothing else can
+# sign with the key (signing.tf grants it to no other principal), so a
+# signature by it, which the launcher verifies at boot and the attestation
+# token reports as image_signatures[].key_id, means: built by release.yml
+# from a tag of this repository. That is what the trainer, the phone and
+# the camera connector pin, instead of a list of digests that would always
+# be one release behind the image (VERIFY.md, "What identifies the image").
 #
 # A second pool rather than a second provider in `tee`: the enclave pool's
 # principals are image digests and its bucket grant is per digest; mixing
@@ -42,19 +48,24 @@ resource "google_iam_workload_identity_pool_provider" "github" {
   }
 
   attribute_mapping = {
-    "google.subject"       = "assertion.sub"
-    "attribute.repository" = "assertion.repository"
-    "attribute.ref"        = "assertion.ref"
-    "attribute.ref_type"   = "assertion.ref_type"
-    "attribute.workflow"   = "assertion.workflow_ref"
+    "google.subject"         = "assertion.sub"
+    "attribute.repository"   = "assertion.repository"
+    "attribute.ref"          = "assertion.ref"
+    "attribute.ref_type"     = "assertion.ref_type"
+    "attribute.workflow"     = "assertion.workflow_ref"
+    "attribute.job_workflow" = "assertion.job_workflow_ref"
   }
 
-  # Only this repository, only a tag ref: a pull request or a branch build
-  # of the same workflow gets no token exchange.
+  # Only this repository, only a release tag, only release.yml: a pull
+  # request, a branch build, or another workflow file added to the
+  # repository (even on a tag) gets no token exchange. job_workflow_ref is
+  # the workflow file the running job belongs to, at the ref that ran it,
+  # so the signing job is the release.yml of the tag's own commit.
   attribute_condition = join(" && ", [
     "assertion.repository == '${var.github_repository}'",
     "assertion.ref_type == 'tag'",
     "assertion.ref.startsWith('refs/tags/v')",
+    "assertion.job_workflow_ref.startsWith('${var.github_repository}/.github/workflows/release.yml@refs/tags/v')",
   ])
 }
 

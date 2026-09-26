@@ -14,10 +14,12 @@ not prove. If you are not technical, hand it to someone who is.
    the enclave. Cloudflare, the trainer service (Cloud Run), the TURN relay,
    the home-network connector and FemLed's operators see ciphertext or
    nothing.
-2. The enclave runs a published container image, by digest, on a
-   production Confidential Space image with debugging disabled since boot
-   (no SSH, no log redirection, no memory monitoring), on hardware Google
-   attests to, with the GPU attestation-bound.
+2. The enclave runs an image that the release workflow of this public
+   repository built from a tagged commit and signed, on a production
+   Confidential Space image with debugging disabled since boot (no SSH, no
+   log redirection, no memory monitoring), on hardware Google attests to,
+   with the GPU attestation-bound. The attestation names the image's
+   digest, the release it was built from and the signature.
 3. TLS for the signalling origin (`slot-N.tee.masseuse.ai`) terminates
    inside the enclave: the certificate's key was generated there and is
    named in the attestation.
@@ -25,18 +27,55 @@ not prove. If you are not technical, hand it to someone who is.
    SDP answer's DTLS fingerprint is signed by an Ed25519 key generated in
    the enclave and named in the attestation, and your browser's own DTLS
    handshake then verifies that fingerprint.
-5. FemLed operators cannot change what runs without changing the digest
-   your device checks, and cannot read the model weights themselves: the
-   only credential that can is minted from the attestation of an approved
-   image.
+5. FemLed operators cannot change what runs without publishing a release:
+   the signing key the clients pin can be used only by the release workflow
+   of this repository running on a tag, every release carries SLSA
+   provenance naming the commit it was built from, and the only credential
+   that can read the model weights is minted from the attestation of the
+   deployed image, which the production posture also requires to be
+   signed. An image nobody released cannot read the weights or take a
+   session, whatever its digest.
 6. What the enclave sends onward is derived readings (numbers), never
    frames: `README.md`, "What happens to your video".
 
+## What identifies the image
+
+Not a list of digests. A digest is known only after a build, so any list
+kept in a repository is written after the tag that produced the image and
+is always a release behind what runs: `main` could never both describe the
+running image and be the tree it was built from. The identity that holds
+at every moment is in the attestation token itself:
+
+- `submods.container.image_signatures[].key_id`: the fingerprint of the KMS
+  signing key (below). Only the release workflow may sign with it
+  (`terraform/github-release.tf`, `signing.tf`), and only from a run of
+  `.github/workflows/release.yml` on a `v*` tag of this repository, so a
+  signature by that key means "built by the release workflow from a tag of
+  the public source". The launcher verified the signature before it started
+  the image.
+- `submods.container.env.TEE_IMAGE_VERSION` and `TEE_IMAGE_COMMIT`: the
+  release tag and the commit the workflow baked into the image
+  (`workload/tee/Dockerfile.tee`), attested with the rest of the workload
+  environment. Images released before `v0.4.0` carry no stamp.
+- `submods.container.image_digest`: the digest that is running. The same
+  digest sits on `ghcr.io/femled/masseuse-video-tee` with its SLSA
+  provenance, which names the source commit; that commit must be the one
+  the stamp names, and `slsa-verifier` checks the tag.
+
+The clients (the web app, the connector) pin the signing key and, once
+every running image is stamped, a minimum release; they do not pin digests.
+Every release's digest and validation record is on its GitHub Release
+([releases](https://github.com/FemLed/masseuse-video-tee/releases)), written
+by the workflow that built it and appended to by the operators when the
+image has been verified on a slot and carried a session.
+
 ## What you need
 
-- The published digest list (below) and signing key fingerprint.
+- The signing key fingerprint (below).
 - `go` 1.22+ to build the verifier in `verifier/`.
-- Optionally `cosign` to check the image signature independently.
+- [`slsa-verifier`](https://github.com/slsa-framework/slsa-verifier) to tie
+  the running digest to this source; optionally `cosign` to check the image
+  signature independently.
 
 ## Run the verifier
 
@@ -44,14 +83,20 @@ not prove. If you are not technical, hand it to someone who is.
 cd verifier
 go build -o tee-verify .
 ./tee-verify -origin https://slot-0.tee.masseuse.ai \
-    -allowed-digests sha256:<digest from the list below> \
-    -signer-key-ids <signing key fingerprint below>
+    -signer-key-ids <signing key fingerprint below> \
+    -slsa-verifier "$(command -v slsa-verifier)"
 ```
 
 Exit code 0 and `"passed": true` means every check below held for a token
-minted seconds ago for your nonce. Add `-v` to print the decoded
-attestation claims; add `-cosign <path> -cosign-public-key signer.pub` to
-have cosign re-verify the image signature from the registry.
+minted seconds ago for your nonce. The report names the digest and the
+release (`release.version`, `release.commit`) that are running. Add
+`-expect-release vX.Y.Z` to insist on a particular release (the newest one
+on the releases page, say) or `-min-release vX.Y.Z` for a floor; without
+either, an unstamped image (released before `v0.4.0`) passes with
+`image.release` saying so. Add `-v` to print the decoded attestation
+claims; add `-cosign <path> -cosign-public-key signer.pub` to have cosign
+re-verify the image signature from the registry. `-allowed-digests` pins
+the slot to a list if you have a reason to; nothing here requires it.
 
 Each check, and why it matters:
 
@@ -62,9 +107,11 @@ Each check, and why it matters:
 | `cs.swname`, `cs.hwmodel`, `cs.secboot` | Confidential Space on Intel TDX with Secure Boot. |
 | `cs.dbgstat`, `cs.support_attributes.STABLE` | the production image family, debugging disabled since boot: the operator cannot SSH in, redirect the container's output, or read memory metrics. (`-allow-debug` accepts the debug posture; production verification must not pass it.) |
 | `gpu.cc_mode`, `gpu.hwmodel` | the H100 is in confidential-computing mode and its device attestation is part of the token: the models run on protected GPU memory, not a plain GPU next to a TDX CPU. |
-| `image.digest`, `image.reference` | the running container is one of the published digests, pulled from FemLed's registry for this project. |
+| `image.signature` | the image carries a cosign signature by the KMS key whose fingerprint is published below; the launcher verified it at boot. Only the release workflow on a tag can make that signature, and rebuilding the image with different code changes the digest and voids it. This is the check that identifies the image. |
+| `image.release` | the release stamp (`TEE_IMAGE_VERSION`, `TEE_IMAGE_COMMIT`) the workflow baked in: which release is running, held to `-expect-release` / `-min-release` when given. |
+| `image.digest`, `image.reference` | the digest of the running container, reported (and pinned to `-allowed-digests` if you passed a list), pulled from FemLed's registry for this project. |
 | `image.env.TRAINER_URL` | the enclave posts its readings (numbers, never frames) to the trainer service you expect and nowhere else (the whole workload environment is in the token; `-v` shows it). |
-| `image.signature` | the image carries a cosign signature by the KMS key whose fingerprint is published below; the launcher verified it at boot. Rebuilding the image with different code changes the digest and voids the signature. |
+| `provenance.source` | (with `-slsa-verifier`) the running digest, on `ghcr.io/femled/masseuse-video-tee`, carries SLSA provenance from this repository at the release the stamp names, and the provenance's commit is the stamp's commit: the image is the public source at that tag, built by GitHub's runners. |
 | `nonce.fresh` | `eat_nonce` contains the random nonce this run sent: the token was minted now, not replayed. |
 | `nonce.evidence-key` | `eat_nonce` contains `sha256(evidence key)`: the Ed25519 key that signs DTLS fingerprints lives in this enclave. |
 | `nonce.tls-spki` | `eat_nonce` contains `sha256(SubjectPublicKeyInfo)` of the certificate this very TLS connection negotiated: the TLS endpoint is the enclave, not a proxy in front of it. |
@@ -83,7 +130,10 @@ openssl s_client -connect $HOST:443 -servername $HOST </dev/null 2>/dev/null \
 
 The two hashes must both appear in the token's `eat_nonce`, alongside your
 `$NONCE`. Verify the token's RS256 signature against the JWKS URL above
-with any JWT library.
+with any JWT library. In `submods.container`, `image_signatures[].key_id`
+must be the fingerprint below, and `env.TEE_IMAGE_VERSION` says which
+release is running; take that and `image_digest` to "How the image is
+built" below to tie them to this source.
 
 A slot exists only while a session needs it (it boots when a visitor taps
 Enable camera and stops a minute or two after the session), so a
@@ -96,91 +146,94 @@ own, or start one and run the verifier from another machine.
 The masseuse.ai web app does the same verification in the browser before it
 sends any media: JWT signature against the same JWKS, the same claims
 against the policy the trainer publishes at
-`https://masseuse.ai/api/tee-policy`, and the evidence-key binding. Then,
-on every WebRTC leg, it verifies the enclave's Ed25519 signature over the
-SDP answer's DTLS fingerprint, the session, the leg and its own nonce
-(`X-Masseuse-Evidence`), and refuses the connection if it does not hold.
-The browser cannot read the TLS certificate it negotiated, so the
-`nonce.tls-spki` check is the verifier's job; the browser's DTLS
-fingerprint check gives the media the same property.
+`https://masseuse.ai/api/tee-policy` (the signing key it accepts, the
+minimum release once one is set, the source repository and public image
+repository the provenance must name, the debug and GPU posture), and the
+evidence-key binding. Then, on every WebRTC leg, it verifies the enclave's
+Ed25519 signature over the SDP answer's DTLS fingerprint, the session, the
+leg and its own nonce (`X-Masseuse-Evidence`), and refuses the connection
+if it does not hold. The browser cannot read the TLS certificate it
+negotiated, so the `nonce.tls-spki` check is the verifier's job; the
+browser's DTLS fingerprint check gives the media the same property.
 
 The home-network connector (`masseuse-camlink`) runs the same checks
-before it dials a slot (`internal/attest` there is a port of `verifier/`)
-and additionally pins the slot's TLS key to the SPKI hash in the token.
+before it dials a slot (`internal/attest` there is a port of `verifier/`),
+additionally pins the slot's TLS key to the SPKI hash in the token, and
+logs the `slsa-verifier` and `cosign` commands for the digest and release
+your session attested.
 
-## Published digests
+## Release history
 
-| digest | since | notes |
-| --- | --- | --- |
-| `sha256:a1e224492978c5a90c3c1faad81b2ebd83dfd302675291db6373210b5d95331e` | 2026-09-09 | **`v0.1.0`**, the first image built from this repository: tag [`v0.1.0`](https://github.com/FemLed/masseuse-video-tee/releases/tag/v0.1.0) by [`release.yml`](.github/workflows/release.yml) run `34383875573`, SLSA provenance and a keyless signature on `ghcr.io/femled/masseuse-video-tee@sha256:a1e22449…` (same digest), promoted by digest into the registry above and signed there with the KMS key. Debug image (`confidential-space-debug`, `dbgstat=enabled`); not a production posture. `ubuntu:24.04` base, zstd layers, live streams decoded at a pinned geometry, the directly reachable external camera (`PUT /ingest/source`) and the home-network camera connector's gateway (`masseuse-camlink-gateway` from the public [FemLed/masseuse-camlink](https://github.com/FemLed/masseuse-camlink) release `v0.1.0`, reproduced by the image build from `camlink.lock`, which refuses any other bytes). The producer is split: the pixel path (`workload/pixel`, `workload/producer`) is this tree, and the analysis of its keypoints and descriptors is the pinned bundle `2026.09.09-1` (`analysis.lock`, SHA-256 `d5c53436…`), run under its own user behind the local socket (`analysis/protocol.md`). `tee-verify -allow-debug` with `-cosign` passed every check on the pinned slot 2026-09-09 18:11 UTC; `slsa-verifier verify-image` and `cosign verify` passed on the `ghcr.io` digest in the release's own `promote` job before the copy. Left the trainer's policy on 2026-09-09 when `v0.2.2` was pinned. |
-| `sha256:c4d5dbb5a6c3c9f209772c28ad6fb810e64543b3697f399a0f8df11fbf23cb8b` | 2026-09-09 | **`v0.2.1`**: tag [`v0.2.1`](https://github.com/FemLed/masseuse-video-tee/releases/tag/v0.2.1), `release.yml` run `34392988036`, provenance and keyless signature on `ghcr.io/femled/masseuse-video-tee@sha256:c4d5dbb5…`, promoted and KMS-signed the same way. Same posture and base as `v0.1.0`; adds the audio path (`workload/audio`): the stream's audio track decoded to 16 kHz inside the enclave and classified into non-speech vocalization categories by the CED tagger built into the image (`libced.so` from a pinned ced.cpp commit, `ced-small-f16.gguf` at a pinned revision and SHA-256), with level and pitch; the labels cross the local socket to the analysis bundle `2026.09.09-2` (`analysis.lock`, SHA-256 `e1253179…`), which consumes them. Frames and audio stay in the public code. `tee-verify -allow-debug` with `-cosign` passed every check on the pinned slot 2026-09-09 19:25 UTC; the boot log shows the bundle fetched, checked and started under its own user, and the release's smoke test loaded the classifier (`ced.cpp-abi1:ced-small-f16.gguf`, 527 labels). (`v0.2.0` was tagged but its build failed before any image was pushed; no digest carries it.) Left the trainer's policy on 2026-09-09 when `v0.2.3` was pinned. |
-| `sha256:8b4a90f9b1442c1f00866b0c120babb86672f70c01563dced695d862a01f39d7` | 2026-09-09 | **`v0.2.2`**: tag [`v0.2.2`](https://github.com/FemLed/masseuse-video-tee/releases/tag/v0.2.2), `release.yml` run `34403106483`, provenance and keyless signature on `ghcr.io/femled/masseuse-video-tee@sha256:8b4a90f9…`, promoted and KMS-signed the same way. Same posture, base and analysis bundle (`2026.09.09-2`) as `v0.2.1`; the audio stage now reports the level of each window it scores (`audioDbfs` in the telemetry line, -90 being digital silence) and relays its ffmpeg's description of the track and its warnings into the log, after two `v0.2.1` sessions measured a phone's track as silence that a third did not (the cause is open; the phone's publisher now also checks its own microphone clone is heard). The trainer verified this digest on the pinned slot in a phone session 2026-09-09 21:07 UTC, in which the stage heard the room at -61 dBFS and a played sound at -20 dBFS, and the analysis bundle reported a vocalization event from it; `slsa-verifier verify-image` and `cosign verify` passed on the `ghcr.io` digest in the release's own `promote` job before the copy. Left the trainer's policy on 2026-09-09 when `v0.2.4` was pinned. |
-| `sha256:d3a66ace02fd692a1ceb02bf83f8e2358d06e976748e5e84096a00db21b15785` | 2026-09-09 | **`v0.2.3`**: tag [`v0.2.3`](https://github.com/FemLed/masseuse-video-tee/releases/tag/v0.2.3), `release.yml` run `34406935409`, provenance and keyless signature on `ghcr.io/femled/masseuse-video-tee@sha256:d3a66ace…`, promoted and KMS-signed the same way. Same posture, base and analysis bundle as `v0.2.2`; the relay (`workload/tee/mediamtx.tee.yml`) now waits 15 s rather than 2 for the first packet of each track a publisher's offer declared, after a phone whose video encoder started later than its microphone came online as an audio-only path the producer then crashed on; a stream with no video track now ends the producer session with a said reason (`producer: RuntimeError: no video track on …` in the trainer). `slsa-verifier verify-image` and `cosign verify` passed on the `ghcr.io` digest in the release's own `promote` job before the copy. The trainer verified this digest on the pinned slot in a phone session 2026-09-09 22:01 UTC: the relay gathered both tracks (`H264`, `Opus`), and over 129 readings the audio stage put the room at -75 to -79 dBFS and three played sounds at -20 to -25 dBFS with a pitch of 109-122 Hz at the seconds they were played. Ran the slot in the production posture from 22:20 UTC (the paragraph below): `tee-verify` without `-allow-debug` passed all 22 checks against it, and a phone session at 22:22 UTC attested `dbgstat=disabled-since-boot` on this digest and heard the room at -75 to -79 dBFS and three played sounds at -19 to -25 dBFS. Left the trainer's policy at 23:00 UTC when `v0.2.4` had carried two phone sessions. |
-| `sha256:e8770401112a084556d0157f470074fabb182e435e47443ef9fe45d7e41b244b` | 2026-09-09 | **`v0.2.4`**: tag [`v0.2.4`](https://github.com/FemLed/masseuse-video-tee/releases/tag/v0.2.4), `release.yml` run `34412608072`, provenance and keyless signature on `ghcr.io/femled/masseuse-video-tee@sha256:e8770401…`, promoted and KMS-signed the same way. Same posture, base and analysis bundle as `v0.2.3`; the producer verifies the trainer's ID token with a 30 s clock-skew allowance (`TOKEN_CLOCK_SKEW_S` in `workload/producer/tee_mode.py`), after the first production-image boot refused the trainer's tokens for four seconds as not yet valid (the fresh VM's clock lagged the token service by a few seconds; the token is minted in the second it is presented). `slsa-verifier verify-image` and `cosign verify` passed on the `ghcr.io` digest in the release's own `promote` job before the copy. The trainer verified this digest on the slot in two phone sessions from a cold slot, 2026-09-09 22:43 and 22:52 UTC (booting to ready in 2.5 min, no token refused, `dbgstat=disabled-since-boot`): in the first the publishing browser's microphone was unavailable (a closed laptop lid) and both of its connections carried digital silence, which the audio stage reported as -90 dBFS on every one of 96 readings; in the second, over 95 readings, it put the room at -51 to -78 dBFS and two played sounds at -18 to -26 dBFS with a pitch of 109-122 Hz at the seconds they were played. Left the trainer's policy on 2026-09-10 at 03:09 UTC when `v0.3.0` was pinned, with no slot on it. |
-| `sha256:1353ffe108cd7646a7c63b673b83580609404ef556a9167333c9b51089f978d9` | 2026-09-10 | **`v0.3.0`**, the pinned image: tag [`v0.3.0`](https://github.com/FemLed/masseuse-video-tee/releases/tag/v0.3.0), `release.yml` run `34429398635`, provenance and keyless signature on `ghcr.io/femled/masseuse-video-tee@sha256:1353ffe1…`, promoted and KMS-signed the same way; `slsa-verifier verify-image` and `cosign verify` passed on the `ghcr.io` digest in the release's own `promote` job before the copy, and the release's smoke stage ran the torch-dependent tests (29) inside the image. Same posture, base and analysis bundle as `v0.2.4`; the pose step is GPU-resident (`workload/pixel/gpu_graph.py`, `pose_post.py`, `pose_track.py`, `live_pose.py`): the frame is uploaded once, the detector's resize and the pose crop run on the device, each forward is replayed as a CUDA graph with its post-processing captured inside, one small tensor per model comes back, and at boot each graph is checked against its eager twin, the verdict logged and reported as gauges (`docs/OPERATIONS.md`). Validated 2026-09-10 on a debug-image slot, the trainer's policy allowing debug images for the window (02:39-03:09 UTC): two boots captured both graphs (detector 718-791 ms, pose 262-280 ms once the weights were loaded) and logged `detectGraph=on poseGraph=on` with all four parity gauges at 0.0000; a 300 s phone session (301 readings, the trainer attesting this digest with `dbgstat=enabled`) ran at `poseInfer` p50 48 ms / p95 55-61 ms, `detect` 8 / 9-11 ms, `frameUpload` 1 / 1-2 ms and `pose` p50 50-58 ms with no pose dropped and `realtimeFactor` rising from 0.75 to 0.99, where `v0.2.4` ran `poseInfer` at 80-87 ms and `detect` at 65 ms and dropped 13-23 % of poses at the same cadence; the audio stage put the room at -64 to -82 dBFS and three played sounds at -21.5 to -25 dBFS at the seconds they were played. Pinned in the production posture at 03:09 UTC: `tee-verify` without `-allow-debug`, with `-cosign`, passed all 22 checks against the slot at 03:12 UTC (`dbgstat=disabled-since-boot`, `[LATEST STABLE USABLE]`, signature key `cfb085b9…`), and a phone session at 03:12 UTC attested `dbgstat=disabled-since-boot` on this digest over 94 readings. |
+Every release since `v0.1.0` has a GitHub Release at
+[github.com/FemLed/masseuse-video-tee/releases](https://github.com/FemLed/masseuse-video-tee/releases),
+created by the release workflow run that built it. Its body names the
+image digest (the same on `ghcr.io` and in the enclave's registry), the
+base image digest, the workflow run, and the commands that tie the digest
+to the tag; the operators append what the image changed, when `tee-verify`
+passed against a slot running it and when a session carried it, and when
+it left the trainer's policy. That record is the history this document
+used to hold as a table of digests, and it is written by the release, not
+ahead of it.
 
-Retired: the debug images from the first days of the enclave (2026-09-08
-and 2026-09-09), built by Cloud Build from a tree that was not yet public
-and carrying no provenance: `sha256:efe3d2b7…`, `sha256:3c3fa7f0…`,
-`sha256:80df7800…`, `sha256:c95761f4…`, `sha256:4866753a…`,
-`sha256:e7c80084…`.
+Images before `v0.1.0` were built by Cloud Build in the enclave's project
+from a source tree that was not yet public, with the same Dockerfiles but
+no provenance, all in the debug posture; they were retired on 2026-09-09.
+They were signed by the same key by the build system of the time, so the
+signature alone does not exclude them: the production posture does
+(`dbgstat`), the deployment's digest pin keeps the weights from them, and
+so will the minimum release the clients pin once every running image
+carries a stamp, since none of them does.
 
-Production posture since 2026-09-09 22:20 UTC, except for the `v0.3.0`
-validation window on 2026-09-10 (02:39-03:09 UTC, its row): the slot boots the
-STABLE `confidential-space` image with debugging disabled since boot
-(`debug_mode = false`; `cs.dbgstat` = `disabled-since-boot`,
-`cs.support_attributes` = `[LATEST STABLE USABLE]`), the trainer's policy
-refuses a debug image (`allowDebug: false`, `requireStable: true`), and the
-container's output is not redirected anywhere (`tee.launch_policy.log_redirect`
-= `debugonly`): what the enclave does is observable only through the
-attestation, the readings and this repository. `tee-verify` without
-`-allow-debug`, with `-cosign`, passed all 22 checks against the pinned slot
-at 22:20 UTC on `v0.2.3`, and a phone session at 22:22 UTC attested
-`dbgstat=disabled-since-boot` on the same digest. A digest's row stays
-here when its image is retired and says when it left the trainer's policy;
-the policy (`/api/tee-policy`) allows the pinned digest, with `imageSources`
-naming the release tag it was built from.
+Production posture since 2026-09-09 22:20 UTC (`v0.2.3`), except for two
+debug windows on 2026-09-10 recorded on the `v0.3.0` and `v0.3.1`
+Releases: the slot boots the STABLE `confidential-space` image with
+debugging disabled since boot (`debug_mode = false`; `cs.dbgstat` =
+`disabled-since-boot`, `cs.support_attributes` = `[LATEST STABLE USABLE]`),
+the trainer's policy refuses a debug image (`allowDebug: false`,
+`requireStable: true`), and the container's output is not redirected
+anywhere (`tee.launch_policy.log_redirect` = `debugonly`): what the enclave
+does is observable only through the attestation, the readings and this
+repository.
 
 ## How the image is built
 
-From `v0.1.0` on, every published digest is built by GitHub Actions from a
-tagged commit of this repository ([`.github/workflows/release.yml`](.github/workflows/release.yml)):
+From `v0.1.0` on, every image is built by GitHub Actions from a tagged
+commit of this repository ([`.github/workflows/release.yml`](.github/workflows/release.yml)):
 two Dockerfiles (an `ubuntu:24.04` base with Python, the pinned torch
 2.14.0+cu130 set split into five layers and the model code; then the TEE
-layer with Caddy and MediaMTX by digest, the ACME and attestation tooling
-and the launch-policy labels), built with BuildKit through `buildx` so every
-layer is zstd and the push is a single OCI manifest, which is what a digest
-names. The workflow pushes to `ghcr.io/femled/masseuse-video-tee`, signs the
-digest keyless with cosign (the certificate's identity is the workflow at
-the tag), attaches SLSA provenance with the
+layer with Caddy and MediaMTX by digest, the ACME and attestation tooling,
+the release stamp and the launch-policy labels), built with BuildKit
+through `buildx` so every layer is zstd and the push is a single OCI
+manifest, which is what a digest names. The workflow pushes to
+`ghcr.io/femled/masseuse-video-tee`, signs the digest keyless with cosign
+(the certificate's identity is the workflow at the tag), attaches SLSA
+provenance with the
 [slsa-github-generator](https://github.com/slsa-framework/slsa-github-generator)
 container generator, and then a separate job copies the digest, unchanged,
 into the registry the attestation names and signs it there with the KMS key
-below, so the launcher's signature check is what it was. To check a digest
-against its source:
+below, so the launcher's signature check is what it was; a last job writes
+the GitHub Release. To check the digest a token names against its source:
 
 ```sh
-DIGEST=sha256:...   # from the attestation, the table above or /api/tee-policy
-TAG=v0.2.3          # the release the table (or imageSources) names for it
+DIGEST=sha256:...   # submods.container.image_digest in the token (tee-verify prints it)
+TAG=vX.Y.Z          # submods.container.env.TEE_IMAGE_VERSION in the same token
 slsa-verifier verify-image ghcr.io/femled/masseuse-video-tee@$DIGEST \
-    --source-uri github.com/FemLed/masseuse-video-tee --source-tag $TAG
+    --source-uri github.com/FemLed/masseuse-video-tee --source-tag $TAG --print-provenance
 cosign verify ghcr.io/femled/masseuse-video-tee@$DIGEST \
     --certificate-oidc-issuer https://token.actions.githubusercontent.com \
     --certificate-identity-regexp '^https://github.com/FemLed/masseuse-video-tee/.github/workflows/release.yml@refs/tags/v[0-9.]+$'
 ```
 
-(`cosign` 3.x is needed: the signature is stored as a Sigstore bundle.
-The digest on `ghcr.io` and in `us-central1-docker.pkg.dev` is the same
-string, so the provenance verified on one is the provenance of the other.)
-The trainer's `/api/tee-policy` carries the same mapping as `imageSources`,
-which is what the home-camera connector reads to log the command for the
-digest your session attested.
+The printed provenance's source commit must be the token's
+`TEE_IMAGE_COMMIT` (that is what `tee-verify -slsa-verifier` compares).
+For an image released before `v0.4.0`, which carries no stamp, take the
+tag from the Release whose body names the digest and leave `--source-tag`
+off to verify only the repository. (`cosign` 3.x is needed: the signature
+is stored as a Sigstore bundle. The digest on `ghcr.io` and in
+`us-central1-docker.pkg.dev` is the same string, so the provenance verified
+on one is the provenance of the other.)
 
-Digests before `v0.1.0` were built by Cloud Build in the enclave's project
-from a source tree that was not yet public, with the same Dockerfiles but
-no provenance; what they did is only as verifiable as this document.
-
-Since `e7c80084…` the image carries one binary that is not built from the
+Since `v0.1.0` the image carries one binary that is not built from the
 workload tree: `masseuse-camlink-gateway`, the enclave half of the
 home-network camera connector, from the public
 [FemLed/masseuse-camlink](https://github.com/FemLed/masseuse-camlink)
@@ -192,14 +245,16 @@ then `sha256sum -c` against the checksum in `camlink.lock`, which is the
 `checksums.txt` (signed keyless by its release workflow, covered by SLSA
 provenance, and shown by its `reproduce` job to be what `go install`
 yields; `VERIFY.md` there). A mismatch fails the image build, so the
-gateway inside a published digest is byte for byte the published,
-verifiable release, and `camlink.lock` in this repository says which one.
+gateway inside a released image is byte for byte the published,
+verifiable release, and `camlink.lock` at the tag says which one.
 
 ## Image signing key
 
 Cosign signatures are made by a Cloud KMS `EC_SIGN_P256_SHA256` key
-(`terraform/signing.tf`) that only the project's build identity may use;
-every build signs its digest.
+(`terraform/signing.tf`) that only the release workflow's identity may use
+(`terraform/github-release.tf`: a Workload Identity Federation pool that
+admits runs of `release.yml` on `v*` tags of this repository and nothing
+else); every release signs its digest.
 
 - key_id (hex SHA-256 of the DER public key, what the attestation reports
   in `submods.container.image_signatures[].key_id`):
@@ -215,14 +270,17 @@ FpCB6iIi0saIIRUf4khO033wXPEVc9NZj17GLaAXkPgtgNScFvem5HV6Jg==
 ```
 
 Check the fingerprint yourself: `openssl pkey -pubin -in signer.pub
--outform DER | openssl dgst -sha256`.
+-outform DER | openssl dgst -sha256`. The key is the one stable identity
+in the chain: a new key would be a new fingerprint here, in the trainer's
+policy and in the WIF provider, all in this repository's history.
 
 ## What this does not prove
 
-- That the source code is what it says, for the digests above: a digest
-  pins an image, and tying the image to source needs a build attestation.
-  That is what the provenance described under "How the image is built"
-  adds for digests built from this repository.
+- That the source is what it says, for images released before `v0.1.0`:
+  they carry no provenance. For every release since, the provenance
+  (`provenance.source`) is the tie between the digest and a commit of this
+  repository, and the stamp (`image.release`) is the image's own statement
+  of which; the two must agree.
 - That the JavaScript your phone runs is the published one. It is served by
   FemLed through Cloudflare. A modified bundle could skip the checks above,
   which is why the checks are also documented for you to run from outside,
@@ -241,14 +299,17 @@ Check the fingerprint yourself: `openssl pkey -pubin -in signer.pub
 
 - Google: the hardware root of trust (TDX, the H100's attestation) and the
   Confidential Space launcher and attestation service.
+- GitHub: the runners that build every release, the OIDC identity the
+  signing key is granted to, and the Sigstore provenance chain. Sigstore's
+  transparency log records every keyless signature the workflow makes.
 - Google Trust Services (Cloud Public CA): issues the TLS certificate to
   the key in the enclave over TLS-ALPN-01 at every boot (chain: leaf →
   `WR1` → `GTS Root R1`). The ACME account is registered with an External
   Account Binding the enclave mints for itself with its attested identity;
-  only a digest-pinned image on TDX with the GPU in CC mode may mint one.
-  The CAA record on `tee.masseuse.ai` (`0 issue "pki.goog"`) allows no other
-  CA. Each boot's certificate is public in the CT logs: a timestamp per
-  session start, no identity.
-- FemLed: the policy (which digests are allowed) and the JavaScript, as
-  above. The published digest list and this verifier are how that trust is
-  checked rather than assumed.
+  only a signed image on TDX with the GPU in CC mode may mint one. The CAA
+  record on `tee.masseuse.ai` (`0 issue "pki.goog"`) allows no other CA.
+  Each boot's certificate is public in the CT logs: a timestamp per session
+  start, no identity.
+- FemLed: the policy (which signing key and minimum release the clients
+  accept) and the JavaScript, as above. The provenance, the Releases and
+  this verifier are how that trust is checked rather than assumed.

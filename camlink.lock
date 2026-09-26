@@ -6,7 +6,7 @@
 # checksums.txt, which is signed keyless by the release workflow and covered
 # by its SLSA provenance (masseuse-camlink/VERIFY.md).
 #
-# To roll the gateway: change both lines, then follow README "Rolling the
-# enclave image" (the image digest changes, so tee_policy changes).
+# To roll the gateway: change both lines, then follow docs/OPERATIONS.md
+# "Rolling an image" (a new release; the deployment's digest pin changes).
 CAMLINK_VERSION=v0.1.0
 CAMLINK_SHA256=87ecd6822ae52f614815ad5d562a0a39bd8a6244b714953e591583b7f16ab068

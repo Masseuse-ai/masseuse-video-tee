@@ -1,5 +1,7 @@
 # Copy to terraform.tfvars. The image reference and digest come from the
-# Cloud Build run (README, "build"); everything else has a default.
+# release: the GitHub Release the release workflow created for the tag
+# names the promoted digest (docs/OPERATIONS.md, "Rolling an image");
+# everything else has a default.
 container_image        = "us-central1-docker.pkg.dev/prod-masseuse-video-tee/masseuse-video-tee/masseuse-video-tee@sha256:0000000000000000000000000000000000000000000000000000000000000000"
 container_image_digest = "sha256:0000000000000000000000000000000000000000000000000000000000000000"
 
@@ -15,7 +17,7 @@ vm_running = true
 
 acme_contact_email = "ops@femled.ai"
 
-# Who runs Terraform and Cloud Build here (IAM members). Never commit real ones.
+# Who runs Terraform here (IAM members). Never commit real ones.
 operator_members = [
   "user:operator@example.org",
 ]

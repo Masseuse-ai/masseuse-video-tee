@@ -48,18 +48,26 @@ then promotes: `crane copy` by digest into this project's Artifact Registry
 and `cosign sign --key gcpkms://...` with the key in `signing.tf`, in the
 layout the launcher reads. The promote job authenticates as the
 `github-release` service account through the GitHub OIDC pool in
-`terraform/github-release.tf`, which admits only tag refs of this
-repository. Its step summary prints the `terraform.tfvars` and `tee_policy`
+`terraform/github-release.tf`, which admits only `release.yml` runs on
+`v*` tag refs of this repository; nothing else can sign with the key. The
+TEE build gets the tag and commit as build arguments and the image carries
+them as `TEE_IMAGE_VERSION` and `TEE_IMAGE_COMMIT` in its environment
+(attested in `submods.container.env`) and as OCI labels; promote refuses
+an image whose stamp is not the tag it is releasing. The last job writes
+the GitHub Release for the tag: image digest, base digest, run, the
+verification commands. Its step summary prints the `terraform.tfvars`
 lines for the roll; the digest is identical on ghcr.io and in Artifact
 Registry (`VERIFY.md`, "How the image is built").
 
 `bash build.sh` runs the same two builds locally, without a push (gzip layers,
-so a different digest), for iterating on the tree.
+so a different digest, and no stamp), for iterating on the tree.
 
 Put the digest into `terraform.tfvars` (`container_image` and
-`container_image_digest`) and into the trainer's `tee_policy`
-(`allowed_image_digests`, and `image_sources` with the tag so the policy
-says where it was built). While rolling from one digest to another, list
+`container_image_digest`): that is the deployment's pin, what the VM boots
+and which principal may read the weights. The trainer's policy does not
+take the digest: it pins the signing key (`image_signatures`) and, once
+every running image is stamped, a floor (`min_release`); a roll changes it
+only when the floor moves. While rolling from one digest to another, list
 the new one in `candidate_image_digests` first so its VM can read the
 weights on its first boot.
 
@@ -276,7 +284,11 @@ posture.
 - `confidential-space-debug` image: container stdout in Cloud Logging and
   on the serial console; memory metrics; SSH via IAP with OS Login
   (`gcloud compute ssh masseuse-video-tee-slot-0 --tunnel-through-iap`),
-  then `sudo ctr -n k8s.io containers list` / `nvidia-smi` on the host.
+  then `sudo ctr -n k8s.io containers list` on the host, and the driver's
+  own tools from where the launcher installed them:
+  `sudo /var/lib/nvidia/bin/nvidia-smi --query-gpu=clocks.sm,power.draw,temperature.gpu,utilization.gpu,clocks_throttle_reasons.active --format=csv`
+  (not on the host's `PATH`) reads the GPU's clocks and power while the
+  workload runs.
 - The producer's control plane through the same tunnel:
   `gcloud compute ssh ... --tunnel-through-iap -- -N -L 18080:127.0.0.1:8080`
   puts the producer's loopback port on the laptop. Control routes want a
@@ -295,8 +307,11 @@ posture.
 - The pose graph batch bench (`workload/pixel/pose_bench.py`): with the
   slot `TERMINATED`, `gcloud compute instances add-metadata
   masseuse-video-tee-slot-0 --zone us-central1-a
-  --metadata tee-env-POSE_GRAPH_BENCH=1,2,4,8`, then start it by hand. The
-  boot runs its usual capture and parity check, then for each batch size
+  --metadata='^;^tee-env-POSE_GRAPH_BENCH=1,2,4,8'` (the `^;^` prefix
+  changes gcloud's list separator, which is otherwise the comma the value
+  needs), then start it by hand. The order given is the order run, so
+  `8,4,2,1` on a second boot tells a batch effect from a drift over time.
+  The boot runs its usual capture and parity check, then for each batch size
   captures a graph over that many pose crops, times it, checks every slot
   of the batch against the production batch-of-one graph and frees it,
   and prints one line per batch to Cloud Logging:
@@ -364,13 +379,18 @@ us-central1` runs it by hand and returns the list of instances it stopped.
 ## The verifier (`verifier/`, `VERIFY.md`)
 
 `go build ./verifier` gives a standalone checker anybody can point at a slot
-(`-origin https://slot-0.tee.masseuse.ai -allowed-digests sha256:...
--signer-key-ids <fingerprint>`); it fetches `/attestation` with a fresh
-nonce and `/evidence-key`, verifies the RS256 signature against Google's
-JWKS and checks every claim the clients do plus the TLS SPKI binding (the
-browser cannot see its certificate; this can), and optionally re-runs
-`cosign verify`. `go test ./verifier` covers the checks against a fake
-slot.
+(`-origin https://slot-0.tee.masseuse.ai -signer-key-ids <fingerprint>
+-slsa-verifier "$(command -v slsa-verifier)"`, plus `-expect-release
+vX.Y.Z` on a roll); it fetches `/attestation` with a fresh nonce and
+`/evidence-key`, verifies the RS256 signature against Google's JWKS and
+checks every claim the clients do plus the TLS SPKI binding (the browser
+cannot see its certificate; this can), reads the release stamp off the
+attested environment, runs `slsa-verifier` for the running digest against
+this repository at that release and compares the provenance's commit to
+the stamp's, and optionally re-runs `cosign verify`. `-allowed-digests`
+pins a list when one is wanted; the default reports the digest and relies
+on the signature and the stamp. `go test ./verifier` covers the checks
+against a fake slot and a stub `slsa-verifier`.
 
 ## Certificate authority (`tools/gts-acme-test.sh`)
 
@@ -438,27 +458,40 @@ the SPKI nonce binding would stay safe.
 
 ## Rolling an image
 
-Every change to what runs in the enclave is a digest roll, and the order
-matters because the trainer refuses to lease, and the clients refuse to
-send media to, a digest that is not in the policy:
+Every change to what runs in the enclave is a release, and a release is
+what the clients trust: they pin the signing key only the release workflow
+holds and, once every running image is stamped, a minimum release, so a
+roll touches the trainer's policy only when that floor moves. The
+deployment's own pin is the digest, in this repository's `terraform.tfvars`:
 
-1. Release the image (tag; the workflow builds, signs, attests and
-   promotes). Note the digest.
+1. Release the image (tag; the workflow builds, stamps, signs, attests,
+   promotes and writes the GitHub Release). Take the digest from the
+   Release.
 2. Here, with no slot running: the new digest into `container_image` /
    `container_image_digest` (the VM's `tee-image-reference`) and the
    previous one into `candidate_image_digests` (so it keeps its WIF
    bindings and can be pinned back), `terraform apply`.
-3. Trainer: the new digest into its policy beside the previous one (so a
-   phone mid-session is not refused) with its `image_sources` entry (the
-   release tag), apply.
-4. Hand-boot a slot with no lease (`gcloud compute instances start
+3. Hand-boot a slot with no lease (`gcloud compute instances start
    masseuse-video-tee-slot-0 --zone us-central1-a`; the VM's power state is
-   not Terraform's after creation, see `vm.tf`) and run `tee-verify`
-   against it within the boot idle window; every check passes. Append the
-   row to `VERIFY.md` (tag, digest, what changed).
-5. Carry a session end to end from a phone.
-6. Drop the previous digest from the trainer's policy and from
-   `candidate_image_digests` once no slot runs it.
+   not Terraform's after creation, see `vm.tf`) and run `tee-verify
+   -expect-release vX.Y.Z -slsa-verifier ...` against it within the boot
+   idle window; every check passes, `image.release` names the tag and
+   `provenance.source` its commit.
+4. Carry a session end to end from a phone; the trainer's diagnostics show
+   the release beside the digest.
+5. Append the validation to the Release body (what changed, when
+   `tee-verify` passed, the session), through the release identity that
+   writes this repository. The Release, not this tree, is where a digest
+   is written down.
+6. Drop the previous digest from `candidate_image_digests` once no slot
+   runs it. When the previous release was the last unstamped one, or when a
+   release must not be booted again, move the trainer's `min_release` up
+   to the new tag and apply there: the clients then refuse the older
+   images by their stamp, and a slot still on one is benched.
+
+Pinning back is the same in reverse: the previous digest back into
+`container_image_digest`, and, if the floor had moved past it, the floor
+back too.
 
 Rolling the gateway alone (a new `masseuse-camlink` release) is the same
 with one step in front: `camlink.lock` gets the new tag and the
@@ -487,7 +520,7 @@ the sweeper have applied.
    `require_gpu_cc = true`, `image_signatures = [the fingerprint]`.
 3. `tee-verify` without `-allow-debug` exits 0 with `cs.dbgstat`,
    `cs.support_attributes.STABLE`, `image.signature` and `nonce.tls-spki`
-   all passing. Note it in `VERIFY.md`.
+   all passing. Note it on the running release's GitHub Release.
 
 What the flip forfeits: container stdout. The production image sends
 nothing to Cloud Logging, so the producer's status route through the

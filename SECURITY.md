@@ -38,9 +38,12 @@ against production, and a check that should hold but does not is a report.
 
 ## Supply chain
 
-Container images are pinned by digest in `terraform/terraform.tfvars` and in
-the trainer's published policy (`https://masseuse.ai/api/tee-policy`), signed
-with a Cloud KMS key the attestation reports, and listed with their
-provenance in `VERIFY.md`. Third-party binaries in the image (MediaMTX,
-Caddy, the camera connector's gateway) are pinned by digest or by release
-checksum (`camlink.lock`).
+Container images are built and signed only by the release workflow of this
+repository from a tag, with SLSA provenance and a release stamp baked in;
+the deployment pins the digest in `terraform/terraform.tfvars`, and the
+trainer's published policy (`https://masseuse.ai/api/tee-policy`) pins the
+signing key the attestation reports and a minimum release. `VERIFY.md` says
+how the running digest is tied to this source; each release's digest is on
+its GitHub Release. Third-party binaries in the image (MediaMTX, Caddy, the
+camera connector's gateway) are pinned by digest or by release checksum
+(`camlink.lock`).

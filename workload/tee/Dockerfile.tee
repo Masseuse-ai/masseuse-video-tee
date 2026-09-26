@@ -27,8 +27,11 @@
 #   allow_cmd_override=false the baked entrypoint is the workload; no tee-cmd.
 #   allow_env_override       exactly the deployment knobs the entrypoint reads;
 #                            none of them can change what code runs or where
-#                            the camera goes (the phone checks the image
-#                            digest and the origin it is talking to).
+#                            the camera goes (the phone checks the image's
+#                            signature and release stamp and the origin it
+#                            is talking to). The stamp itself
+#                            (TEE_IMAGE_VERSION, TEE_IMAGE_COMMIT) is not
+#                            in the list.
 #   allow_mount_destinations the two tmpfs mounts: weights and the boot's
 #                            ephemeral state (TLS key, capture rows).
 #                            Colon-separated (a comma makes one bad path and
@@ -43,6 +46,16 @@
 # The base image (workload/Dockerfile), by digest in the release workflow;
 # the default is what bash build.sh tags locally.
 ARG BASE=masseuse-video-tee-base:local
+# The release stamp: the tag and the commit the release workflow builds
+# from (release.yml passes $GITHUB_REF_NAME and $GITHUB_SHA). Baked into the
+# image as ENV, they ride in the attestation token's container environment
+# (submods.container.env), so anyone holding a slot's token can read which
+# release is running without a list of digests kept anywhere; the trainer,
+# the phone and masseuse-camlink refuse a release below their policy's
+# minRelease. Not in allow_env_override: the launcher cannot be told to
+# change them. A local build leaves them empty (an unstamped image).
+ARG TEE_IMAGE_VERSION=""
+ARG TEE_IMAGE_COMMIT=""
 # bluenviron/mediamtx v1.20.1 (2026-08-18); the WebRTC keys in
 # mediamtx.tee.yml are this version's.
 FROM bluenviron/mediamtx@sha256:1b029d11049be75630e9b73bb0d5f47b08a7db4eaee89a80bf8f53bc40e56414 AS mediamtx
@@ -176,6 +189,17 @@ ENV TEE_TLS_CERT_DIR=/run/tee/caddy/certificates \
 # routes and /attestation); the deployment appends the trainer's own origin
 # for the direct path (terraform phone_origins).
 ENV TEE_ALLOWED_ORIGINS=https://masseuse.ai,https://www.masseuse.ai
+
+# The release stamp (see the ARGs at the top): attested with the rest of
+# this environment, and repeated as the standard OCI labels so a registry
+# shows the same thing.
+ARG TEE_IMAGE_VERSION
+ARG TEE_IMAGE_COMMIT
+ENV TEE_IMAGE_VERSION=${TEE_IMAGE_VERSION} \
+    TEE_IMAGE_COMMIT=${TEE_IMAGE_COMMIT}
+LABEL org.opencontainers.image.version="${TEE_IMAGE_VERSION}" \
+      org.opencontainers.image.revision="${TEE_IMAGE_COMMIT}" \
+      org.opencontainers.image.source="https://github.com/FemLed/masseuse-video-tee"
 
 LABEL "tee.launch_policy.log_redirect"="debugonly"
 LABEL "tee.launch_policy.allow_cmd_override"="false"

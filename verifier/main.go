@@ -14,10 +14,16 @@
 //  3. Checks the GPU claims: nvidia_gpu.cc_mode ON and an H100 in
 //     confidential-computing mode, so the pose model runs on an
 //     attestation-bound GPU, not just a TDX CPU.
-//  4. Pins the workload: image digest in the allowed list, image reference
-//     under the project's Artifact Registry, TRAINER_URL env as expected,
-//     and (once signing is required) a cosign signature by the expected
-//     KMS key in image_signatures[].
+//  4. Pins the workload: a signature by the release KMS key in
+//     image_signatures[] (the launcher verified it before starting the
+//     image; only the release workflow can sign with that key), the image
+//     reference under the project's Artifact Registry, TRAINER_URL env as
+//     expected, and the release stamp the workflow baked into the image
+//     (TEE_IMAGE_VERSION, TEE_IMAGE_COMMIT in the attested environment):
+//     which release is running, held to -expect-release / -min-release
+//     when given. The digest is reported, and pinned only if a list is
+//     passed with -allowed-digests: no list of digests lives anywhere,
+//     since one kept in a repository is always a release behind the image.
 //  5. Checks the nonce bindings in eat_nonce: the caller's nonce (fresh
 //     token, not a replay), sha256(evidence key) fetched from
 //     /evidence-key (the key that signs each SDP answer's DTLS
@@ -25,7 +31,12 @@
 //     certificate this very connection negotiated. The last one is what a
 //     browser cannot do, and it is what proves the TLS endpoint you are
 //     talking to terminates inside the enclave that minted the token.
-//  6. Optionally shells out to `cosign verify --key` to confirm the
+//  6. Optionally shells out to `slsa-verifier verify-image` for the digest
+//     the token names, in the public registry, against the source
+//     repository at the release the token names: the SLSA provenance
+//     proves which commit of the public source produced the running
+//     image, and its commit must be the one the image stamp says.
+//  7. Optionally shells out to `cosign verify --key` to confirm the
 //     signature over the running digest independently of the launcher.
 //
 // Exit codes: 0 every check passed; 1 a check failed (report on stdout);
@@ -37,6 +48,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
@@ -59,13 +71,15 @@ import (
 )
 
 const (
-	defaultJWKSURL  = "https://www.googleapis.com/service_accounts/v1/metadata/jwk/signer@confidentialspace-sign.iam.gserviceaccount.com"
-	expectedIssuer  = "https://confidentialcomputing.googleapis.com"
-	expectedSWName  = "CONFIDENTIAL_SPACE"
-	expectedHWModel = "GCP_INTEL_TDX"
-	expectedGPU     = "GCP_NVIDIA_H100"
-	dbgstatProd     = "disabled-since-boot"
-	dbgstatDebug    = "enabled"
+	defaultJWKSURL   = "https://www.googleapis.com/service_accounts/v1/metadata/jwk/signer@confidentialspace-sign.iam.gserviceaccount.com"
+	expectedIssuer   = "https://confidentialcomputing.googleapis.com"
+	expectedSWName   = "CONFIDENTIAL_SPACE"
+	expectedHWModel  = "GCP_INTEL_TDX"
+	expectedGPU      = "GCP_NVIDIA_H100"
+	dbgstatProd      = "disabled-since-boot"
+	dbgstatDebug     = "enabled"
+	defaultSourceURI = "github.com/FemLed/masseuse-video-tee"
+	defaultImageRepo = "ghcr.io/femled/masseuse-video-tee"
 )
 
 type config struct {
@@ -77,12 +91,103 @@ type config struct {
 	allowedDigests  []string
 	trainerURL      string
 	signerKeyIDs    []string
+	minRelease      string
+	expectRelease   string
+	slsaVerifierBin string
+	sourceURI       string
+	imageRepo       string
 	allowDebug      bool
 	insecureTLS     bool
 	cosignBin       string
 	cosignPublicKey string
 	timeout         time.Duration
 	verbose         bool
+}
+
+// release is the stamp the release workflow bakes into the image and the
+// launcher attests with the rest of the container environment.
+type release struct {
+	Version string `json:"version"`
+	Commit  string `json:"commit"`
+}
+
+// releaseOf reads the stamp off the attested environment; nil for an image
+// built before the stamp existed.
+func releaseOf(env map[string]any) *release {
+	version, _ := env["TEE_IMAGE_VERSION"].(string)
+	if version == "" {
+		return nil
+	}
+	commit, _ := env["TEE_IMAGE_COMMIT"].(string)
+	return &release{Version: version, Commit: commit}
+}
+
+// releaseNumbers parses "vMAJOR.MINOR.PATCH[-pre][+build]"; ok is false for
+// anything else.
+func releaseNumbers(tag string) (nums [3]int, pre string, ok bool) {
+	if !strings.HasPrefix(tag, "v") {
+		return nums, "", false
+	}
+	rest := tag[1:]
+	if i := strings.IndexByte(rest, '+'); i >= 0 {
+		rest = rest[:i]
+	}
+	if i := strings.IndexByte(rest, '-'); i >= 0 {
+		rest, pre = rest[:i], rest[i+1:]
+		if pre == "" {
+			return nums, "", false
+		}
+	}
+	parts := strings.Split(rest, ".")
+	if len(parts) != 3 {
+		return nums, "", false
+	}
+	for i, p := range parts {
+		if p == "" || len(p) > 9 {
+			return nums, "", false
+		}
+		n := 0
+		for _, c := range p {
+			if c < '0' || c > '9' {
+				return nums, "", false
+			}
+			n = n*10 + int(c-'0')
+		}
+		nums[i] = n
+	}
+	return nums, pre, true
+}
+
+func validRelease(tag string) bool {
+	_, _, ok := releaseNumbers(tag)
+	return ok
+}
+
+// compareRelease orders two release tags: -1, 0 or +1. A pre-release
+// precedes its release; two pre-releases of one version compare as strings.
+func compareRelease(a, b string) int {
+	an, ap, _ := releaseNumbers(a)
+	bn, bp, _ := releaseNumbers(b)
+	for i := range an {
+		if an[i] != bn[i] {
+			if an[i] < bn[i] {
+				return -1
+			}
+			return 1
+		}
+	}
+	switch {
+	case ap == bp:
+		return 0
+	case ap == "":
+		return 1
+	case bp == "":
+		return -1
+	case ap < bp:
+		return -1
+	default:
+		return 1
+	}
 }
 
 type attestationDoc struct {
@@ -122,6 +227,7 @@ type check struct {
 type report struct {
 	Origin       string   `json:"origin"`
 	ImageDigest  string   `json:"imageDigest,omitempty"`
+	Release      *release `json:"release,omitempty"`
 	InstanceID   string   `json:"instanceId,omitempty"`
 	DbgStat      string   `json:"dbgstat,omitempty"`
 	TLSSpki      string   `json:"tlsSpkiSha256,omitempty"`
@@ -169,9 +275,14 @@ func parseFlags() (*config, error) {
 	flag.StringVar(&cfg.jwksURL, "jwks-url", defaultJWKSURL, "Confidential Space attestation signer JWKS")
 	flag.StringVar(&cfg.projectID, "project-id", "prod-masseuse-video-tee", "expected submods.gce.project_id")
 	flag.StringVar(&cfg.imageRefPrefix, "image-ref-prefix", "us-central1-docker.pkg.dev/prod-masseuse-video-tee/masseuse-video-tee/", "expected prefix of submods.container.image_reference")
-	flag.StringVar(&digests, "allowed-digests", "", "comma-separated sha256:... digests the slot may run (VERIFICATION.md publishes the list); empty prints the digest without pinning")
+	flag.StringVar(&digests, "allowed-digests", "", "comma-separated sha256:... digests to pin the slot to; empty (the norm) reports the digest and relies on the signature and the release stamp")
 	flag.StringVar(&cfg.trainerURL, "trainer-url", "https://masseuse-trainer-125139120897.us-central1.run.app", "expected TRAINER_URL in the workload env (where readings go)")
-	flag.StringVar(&signers, "signer-key-ids", "", "comma-separated hex sha256 fingerprints of accepted cosign signing keys (terraform output image_signer_fingerprint); empty skips the signature check")
+	flag.StringVar(&signers, "signer-key-ids", "", "comma-separated hex sha256 fingerprints of accepted cosign signing keys (terraform output image_signer_fingerprint, or VERIFY.md); empty skips the signature check")
+	flag.StringVar(&cfg.minRelease, "min-release", "", "the lowest release (vX.Y.Z) the image may be, held against its attested TEE_IMAGE_VERSION; empty accepts any, including images built before the stamp")
+	flag.StringVar(&cfg.expectRelease, "expect-release", "", "the exact release (vX.Y.Z) the image must be stamped with (a roll's check that the new image is what booted)")
+	flag.StringVar(&cfg.slsaVerifierBin, "slsa-verifier", "", "path to slsa-verifier; verifies the SLSA provenance of the running digest in -image-repo against -source-uri at the release the token names, and that the provenance's commit is the image's TEE_IMAGE_COMMIT")
+	flag.StringVar(&cfg.sourceURI, "source-uri", defaultSourceURI, "the source repository the provenance must name")
+	flag.StringVar(&cfg.imageRepo, "image-repo", defaultImageRepo, "the public registry holding the same digest with its provenance")
 	flag.BoolVar(&cfg.allowDebug, "allow-debug", false, "accept dbgstat=enabled and no STABLE attribute (a debug image; never for production verification)")
 	flag.BoolVar(&cfg.insecureTLS, "insecure-tls", false, "do not verify the server certificate chain (Let's Encrypt staging during debug); the SPKI binding is still checked")
 	flag.StringVar(&cfg.cosignBin, "cosign", "", "path to cosign; with -cosign-public-key, verifies the signature over the running digest independently")
@@ -195,6 +306,15 @@ func parseFlags() (*config, error) {
 		}
 	}
 	cfg.signerKeyIDs = splitTrim(signers)
+	if cfg.minRelease != "" && !validRelease(cfg.minRelease) {
+		return nil, fmt.Errorf("-min-release %q is not a release tag (vX.Y.Z)", cfg.minRelease)
+	}
+	if cfg.expectRelease != "" && !validRelease(cfg.expectRelease) {
+		return nil, fmt.Errorf("-expect-release %q is not a release tag (vX.Y.Z)", cfg.expectRelease)
+	}
+	if cfg.slsaVerifierBin != "" && (cfg.sourceURI == "" || cfg.imageRepo == "") {
+		return nil, errors.New("-slsa-verifier needs -source-uri and -image-repo")
+	}
 	if (cfg.cosignBin == "") != (cfg.cosignPublicKey == "") {
 		return nil, errors.New("-cosign and -cosign-public-key go together")
 	}
@@ -292,17 +412,22 @@ func run(ctx context.Context, cfg *config, r *report) error {
 	gpuOK, gpuDetail := gpuModel(claims.Submods)
 	r.add("gpu.hwmodel", gpuOK, gpuDetail)
 
-	// Workload.
+	// Workload. The digest is the identity the token names; what pins it is
+	// the signature (the release key, usable only by the release workflow)
+	// and the release stamp, not a list.
 	if len(cfg.allowedDigests) > 0 {
 		r.add("image.digest", contains(cfg.allowedDigests, r.ImageDigest), r.ImageDigest)
 	} else {
-		r.add("image.digest", r.ImageDigest != "", r.ImageDigest+" (not pinned: pass -allowed-digests)")
+		r.add("image.digest", r.ImageDigest != "", r.ImageDigest+" (reported, not pinned to a list: the signature and the release stamp identify the image)")
 	}
 	ref := nestedString(claims.Submods, "container", "image_reference")
 	r.add("image.reference", strings.HasPrefix(ref, cfg.imageRefPrefix), ref)
 	env, _ := nestedAny(claims.Submods, "container", "env").(map[string]any)
 	trainer, _ := env["TRAINER_URL"].(string)
 	r.add("image.env.TRAINER_URL", strings.TrimRight(trainer, "/") == strings.TrimRight(cfg.trainerURL, "/"), trainer)
+	r.Release = releaseOf(env)
+	relOK, relDetail := releaseCheck(cfg, r.Release)
+	r.add("image.release", relOK, relDetail)
 	r.SignerKeyIDs = signatureKeyIDs(claims.Submods)
 	if len(cfg.signerKeyIDs) > 0 {
 		ok := false
@@ -326,6 +451,13 @@ func run(ctx context.Context, cfg *config, r *report) error {
 			"eat_nonce contains sha256(SPKI) of the certificate this connection negotiated")
 	}
 
+	// Provenance: the public copy of the running digest, its SLSA
+	// provenance, the source repository at the release the token names.
+	if cfg.slsaVerifierBin != "" && r.ImageDigest != "" {
+		provOK, provDetail := provenanceCheck(ctx, cfg, r.ImageDigest, r.Release)
+		r.add("provenance.source", provOK, provDetail)
+	}
+
 	// Independent cosign check.
 	if cfg.cosignBin != "" && r.ImageDigest != "" {
 		imageRef := strings.TrimSuffix(cfg.imageRefPrefix, "/") + "/masseuse-video-tee@" + r.ImageDigest
@@ -336,6 +468,129 @@ func run(ctx context.Context, cfg *config, r *report) error {
 		r.add("cosign.verify", err == nil, truncate(strings.TrimSpace(string(out)), 300))
 	}
 	return nil
+}
+
+// releaseCheck holds the image's release stamp to -expect-release and
+// -min-release. Without either, the stamp is reported and an unstamped
+// image (built before the stamp existed) passes, saying so.
+func releaseCheck(cfg *config, rel *release) (bool, string) {
+	if rel == nil {
+		if cfg.expectRelease != "" || cfg.minRelease != "" {
+			return false, "image carries no release stamp (TEE_IMAGE_VERSION), built before releases were stamped"
+		}
+		return true, "unstamped (built before releases were stamped); the signature alone identifies the build"
+	}
+	detail := rel.Version
+	if rel.Commit != "" {
+		detail += " @ " + rel.Commit
+	}
+	if !validRelease(rel.Version) {
+		return false, detail + " (not a release tag)"
+	}
+	if cfg.expectRelease != "" && rel.Version != cfg.expectRelease {
+		return false, detail + " (expected " + cfg.expectRelease + ")"
+	}
+	if cfg.minRelease != "" && compareRelease(rel.Version, cfg.minRelease) < 0 {
+		return false, detail + " (older than the minimum " + cfg.minRelease + ")"
+	}
+	return true, detail
+}
+
+// provenanceCheck runs slsa-verifier over the running digest in the public
+// registry: the provenance must name -source-uri (at the token's release
+// tag when the image is stamped) and its commit must be the one the image
+// stamp names.
+func provenanceCheck(ctx context.Context, cfg *config, digest string, rel *release) (bool, string) {
+	args := []string{"verify-image", cfg.imageRepo + "@" + digest, "--source-uri", cfg.sourceURI, "--print-provenance"}
+	if rel != nil && validRelease(rel.Version) {
+		args = append(args, "--source-tag", rel.Version)
+	}
+	cmd := exec.CommandContext(ctx, cfg.slsaVerifierBin, args...)
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &stdout, &stderr
+	if err := cmd.Run(); err != nil {
+		return false, truncate(strings.TrimSpace(stderr.String()+" "+stdout.String()), 300)
+	}
+	commit, ref := provenanceSource(stdout.Bytes())
+	detail := cfg.sourceURI
+	if ref != "" {
+		detail += "@" + ref
+	}
+	if commit != "" {
+		detail += " commit " + commit
+	}
+	if rel != nil && rel.Commit != "" && commit != "" && commit != rel.Commit {
+		return false, detail + " (the image stamp says " + rel.Commit + ")"
+	}
+	if rel == nil {
+		detail += " (image unstamped: the tag is not checked)"
+	}
+	return true, detail
+}
+
+// provenanceSource pulls the source commit and ref out of the provenance
+// slsa-verifier prints: SLSA v1 (buildDefinition.resolvedDependencies with
+// a gitCommit digest, externalParameters.workflow.ref) or v0.2
+// (invocation.configSource, materials).
+func provenanceSource(out []byte) (commit, ref string) {
+	i := bytes.IndexByte(out, '{')
+	if i < 0 {
+		return "", ""
+	}
+	var doc map[string]any
+	if err := json.Unmarshal(bytes.TrimSpace(out[i:]), &doc); err != nil {
+		return "", ""
+	}
+	pred, _ := doc["predicate"].(map[string]any)
+	refOf := func(uri string) string {
+		if j := strings.Index(uri, "@refs/tags/"); j >= 0 {
+			return uri[j+len("@refs/tags/"):]
+		}
+		if j := strings.Index(uri, "@refs/heads/"); j >= 0 {
+			return uri[j+len("@refs/heads/"):]
+		}
+		return ""
+	}
+	if bd, ok := pred["buildDefinition"].(map[string]any); ok {
+		deps, _ := bd["resolvedDependencies"].([]any)
+		for _, d := range deps {
+			m, _ := d.(map[string]any)
+			dg, _ := m["digest"].(map[string]any)
+			if c, _ := dg["gitCommit"].(string); c != "" {
+				commit = c
+				uri, _ := m["uri"].(string)
+				ref = refOf(uri)
+				break
+			}
+		}
+		if ref == "" {
+			if wf, ok := nestedAny(bd, "externalParameters", "workflow").(map[string]any); ok {
+				if r, _ := wf["ref"].(string); r != "" {
+					ref = strings.TrimPrefix(strings.TrimPrefix(r, "refs/tags/"), "refs/heads/")
+				}
+			}
+		}
+		return commit, ref
+	}
+	if cs, ok := nestedAny(pred, "invocation", "configSource").(map[string]any); ok {
+		uri, _ := cs["uri"].(string)
+		ref = refOf(uri)
+		if dg, ok := cs["digest"].(map[string]any); ok {
+			commit, _ = dg["sha1"].(string)
+		}
+	}
+	if commit == "" {
+		mats, _ := pred["materials"].([]any)
+		for _, mat := range mats {
+			m, _ := mat.(map[string]any)
+			dg, _ := m["digest"].(map[string]any)
+			if c, _ := dg["sha1"].(string); c != "" {
+				commit = c
+				break
+			}
+		}
+	}
+	return commit, ref
 }
 
 // tlsClient returns an HTTP client and a function that yields the leaf

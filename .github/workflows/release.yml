@@ -5,11 +5,13 @@ name: release
 #
 #   image       workload/Dockerfile (torch + ffmpeg on ubuntu:24.04) and
 #               workload/tee/Dockerfile.tee (MediaMTX, Caddy, the gateway,
-#               the entrypoint, the launch-policy labels) pushed to ghcr.io
-#               as one OCI manifest per image, every layer zstd; then the
-#               smoke test of workload/tee/buildx.sh on the pushed image,
-#               and a keyless cosign signature (Fulcio certificate naming
-#               this workflow at this tag, Rekor entry).
+#               the entrypoint, the launch-policy labels, the release stamp:
+#               this tag and commit baked in as TEE_IMAGE_VERSION and
+#               TEE_IMAGE_COMMIT, which the attestation token then carries)
+#               pushed to ghcr.io as one OCI manifest per image, every layer
+#               zstd; then the smoke test of workload/tee/buildx.sh on the
+#               pushed image, and a keyless cosign signature (Fulcio
+#               certificate naming this workflow at this tag, Rekor entry).
 #   provenance  slsa-github-generator's container generator attaches SLSA
 #               v1 build provenance to the image on ghcr.io: which commit,
 #               which workflow, which builder produced the digest.
@@ -21,12 +23,21 @@ name: release
 #               (<repo>:sha256-<digest>.sig with the sigalg/pub
 #               annotations). Runs as the github-release service account
 #               through the GitHub OIDC pool in terraform/github-release.tf,
-#               only for tag refs of this repository.
+#               only for tag builds of this workflow in this repository;
+#               that key is what the trainer, the phone and the connector
+#               require in the token's image_signatures[].
+#   release     the GitHub Release for the tag: the digests, the stamp and
+#               the verify commands, written by the workflow the moment the
+#               image exists. This is the record of what each release is;
+#               nothing about a digest is committed to the tree, because a
+#               digest is known only after the build and a list kept in
+#               commits would always be one release behind the image that
+#               runs. The validation of the roll is appended to the same
+#               Release afterwards (docs/OPERATIONS.md, "Rolling an image").
 #
 # The digest is the same in all three places; the promote job checks that
-# and prints the terraform.tfvars / tee_policy lines for the roll
-# (README "Rolling the enclave image"). Verifying a running slot against
-# this workflow: VERIFY.md.
+# and prints the terraform.tfvars lines for the roll. Verifying a running
+# slot against this workflow: VERIFY.md.
 
 on:
   push:
@@ -111,6 +122,8 @@ jobs:
             --build-arg "BASE=${BASE_IMAGE}@${{ steps.base.outputs.digest }}" \
             --build-arg "CAMLINK_VERSION=${CAMLINK_VERSION}" \
             --build-arg "CAMLINK_SHA256=${CAMLINK_SHA256}" \
+            --build-arg "TEE_IMAGE_VERSION=${GITHUB_REF_NAME}" \
+            --build-arg "TEE_IMAGE_COMMIT=${GITHUB_SHA}" \
             .
           digest=$(buildx_last_digest)
           echo "digest=${digest}" >> "$GITHUB_OUTPUT"
@@ -205,8 +218,9 @@ jobs:
         run: crane auth login ghcr.io -u "${{ github.actor }}" --password-stdin <<< "${GITHUB_TOKEN}"
       - name: What was built is what gets promoted
         # The keyless signature names this workflow at this tag; the SLSA
-        # provenance names this repository at this tag. Both must hold for
-        # the digest before it goes anywhere near the launcher.
+        # provenance names this repository at this tag; the image's own
+        # release stamp names both. All three must hold for the digest
+        # before it goes anywhere near the launcher.
         run: |
           cosign verify "${IMAGE}@${DIGEST}" \
             --certificate-oidc-issuer https://token.actions.githubusercontent.com \
@@ -215,6 +229,11 @@ jobs:
           slsa-verifier verify-image "${IMAGE}@${DIGEST}" \
             --source-uri "github.com/${GITHUB_REPOSITORY}" \
             --source-tag "${GITHUB_REF_NAME}"
+          crane config "${IMAGE}@${DIGEST}" > config.json
+          jq -r '.config.Env[]' config.json | grep -qx "TEE_IMAGE_VERSION=${GITHUB_REF_NAME}"
+          jq -r '.config.Env[]' config.json | grep -qx "TEE_IMAGE_COMMIT=${GITHUB_SHA}"
+          test "$(jq -r '.config.Labels["org.opencontainers.image.revision"]' config.json)" = "${GITHUB_SHA}"
+          echo "stamped ${GITHUB_REF_NAME} @ ${GITHUB_SHA}"
       - uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
         id: gcp
         with:
@@ -238,7 +257,8 @@ jobs:
         # dev.cosignproject.cosign/sigalg and dev.cosignproject.cosign/pub
         # (the unpadded base64 of the public key PEM); without them the .sig
         # exists but no token lists it. No Rekor upload: the Artifact
-        # Registry repository is private and VERIFY.md is the public record.
+        # Registry repository is private; the public record is the keyless
+        # signature and provenance on ghcr.io and the GitHub Release.
         run: |
           cosign2 public-key --key "${KMS_KEY}" > signer.pub
           openssl pkey -pubin -in signer.pub -outform DER | openssl dgst -sha256 | awk '{print "signer key_id " $NF}'
@@ -256,14 +276,12 @@ jobs:
           {
             echo "## Promoted ${GITHUB_REF_NAME}"
             echo
-            echo "Signed by the KMS key, digest identical on ghcr.io and Artifact Registry."
+            echo "Signed by the KMS key, digest identical on ghcr.io and Artifact Registry, stamped ${GITHUB_REF_NAME} @ ${GITHUB_SHA}."
             echo
             echo '```hcl'
             echo "# terraform/terraform.tfvars"
             echo "container_image        = \"${AR_IMAGE}@${DIGEST}\""
             echo "container_image_digest = \"${DIGEST}\""
-            echo "# masseuse-trainer tee_policy.allowed_image_digests / image_sources"
-            echo "\"${DIGEST}\" = { repo = \"${IMAGE}\", tag = \"${GITHUB_REF_NAME}\" }"
             echo '```'
             echo
             echo "Verify from anywhere:"
@@ -276,3 +294,56 @@ jobs:
             echo "  --certificate-identity https://github.com/${GITHUB_REPOSITORY}/.github/workflows/release.yml@refs/tags/${GITHUB_REF_NAME}"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
+
+  release:
+    # The GitHub Release is the record of the tag: written here, by the
+    # workflow, as soon as the promoted digest exists, so the record never
+    # lags the image. The roll's validation (which slot booted it, what
+    # tee-verify said, the session it carried) is appended to this body
+    # later by the repository's code agent; that never rewrites what is
+    # written here.
+    needs: [image, promote]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write # the Release
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GH_REPO: ${{ github.repository }}
+      DIGEST: ${{ needs.image.outputs.digest }}
+      BASE_DIGEST: ${{ needs.image.outputs.base_digest }}
+      AR_IMAGE: us-central1-docker.pkg.dev/prod-masseuse-video-tee/masseuse-video-tee/masseuse-video-tee
+    steps:
+      - name: Create the Release for the tag
+        run: |
+          if gh release view "${GITHUB_REF_NAME}" > /dev/null 2>&1; then
+            echo "release ${GITHUB_REF_NAME} already exists; leaving it as it is" | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          {
+            echo "## Image"
+            echo
+            echo "Built by this repository's release workflow from \`${GITHUB_SHA}\` and stamped into the image as \`TEE_IMAGE_VERSION=${GITHUB_REF_NAME}\`, \`TEE_IMAGE_COMMIT=${GITHUB_SHA}\` (the attestation token reports both under \`submods.container.env\`)."
+            echo
+            echo '```'
+            echo "${IMAGE}@${DIGEST}"
+            echo "${AR_IMAGE}@${DIGEST}"
+            echo "${BASE_IMAGE}@${BASE_DIGEST}   (base)"
+            echo '```'
+            echo
+            echo "The same digest is on ghcr.io (public, with SLSA provenance and a keyless signature) and in the Artifact Registry repository the enclave boots from (signed with the release KMS key the policy names)."
+            echo
+            echo "## Verify"
+            echo
+            echo '```sh'
+            echo "slsa-verifier verify-image ${IMAGE}@${DIGEST} \\"
+            echo "  --source-uri github.com/${GITHUB_REPOSITORY} --source-tag ${GITHUB_REF_NAME}"
+            echo "cosign verify ${IMAGE}@${DIGEST} \\"
+            echo "  --certificate-oidc-issuer https://token.actions.githubusercontent.com \\"
+            echo "  --certificate-identity https://github.com/${GITHUB_REPOSITORY}/.github/workflows/release.yml@refs/tags/${GITHUB_REF_NAME}"
+            echo '```'
+            echo
+            echo "A running slot: \`tee-verify -origin https://<slot> -expect-release ${GITHUB_REF_NAME} -slsa-verifier slsa-verifier\` (VERIFY.md)."
+          } > body.md
+          gh release create "${GITHUB_REF_NAME}" --verify-tag --title "${GITHUB_REF_NAME}" --notes-file body.md
+          echo "release: $(gh release view "${GITHUB_REF_NAME}" --json url -q .url)" | tee -a "$GITHUB_STEP_SUMMARY"

@@ -55,11 +55,15 @@ speaks to the analysis module over a local socket; `tee/` is the container
 image and its entrypoint. `analysis/protocol.md` names every field that
 crosses to the analysis module and every field that comes back.
 
-Every published image is built from a tagged commit of this repository by
-its release workflow (`.github/workflows/release.yml`) on GitHub Actions,
-with SLSA provenance and a keyless signature, and the digest the enclave
-attests is the digest that workflow built. `VERIFY.md` says how to check
-that for the digest your session attested, and which digests are current.
+Every image is built from a tagged commit of this repository by its
+release workflow (`.github/workflows/release.yml`) on GitHub Actions, with
+SLSA provenance and a keyless signature, then signed with a key only that
+workflow can use and stamped with its release tag and commit. The
+attestation the enclave gives your device names the digest, the signature
+and the stamp, so which release is running is read off the running image,
+never off a list kept here. `VERIFY.md` says how to check that for the
+digest and release your session attested; the digest and validation
+record of each release is on its GitHub Release.
 
 ## Trust boundary
 
@@ -69,13 +73,13 @@ that for the digest your session attested, and which digests are current.
   readings. It does not proxy WHIP/WHEP for enclave slots.
 - coturn is a TURN fallback the phone may use; it relays SRTP ciphertext.
 - The operator (the Google Cloud project owner) cannot read enclave memory,
-  SSH into the production image, redirect its logs, change the image without
-  changing the digest every client checks, or obtain the DTLS keys or the
-  capability.
-- Residual: the JavaScript bundle and the allowed-digest policy are
-  operator-served. Published digests with provenance, this verifier, and the
-  connector (which runs the checks itself, outside the browser) are the
-  mitigations.
+  SSH into the production image, redirect its logs, run an image the release
+  workflow did not build and sign from a tag of this repository, or obtain
+  the DTLS keys or the capability.
+- Residual: the JavaScript bundle and the policy (which signing key and
+  minimum release the clients accept) are operator-served. The provenance
+  on every release, this verifier, and the connector (which runs the checks
+  itself, outside the browser) are the mitigations.
 
 The two kinds of external camera keep the same boundary:
 
@@ -121,9 +125,10 @@ access.
 `VERIFY.md` walks through it: build `verifier/` (Go), point it at a live
 slot, and every claim above is checked against a token minted seconds ago
 for your nonce, including the two things a browser cannot check (that the
-TLS endpoint is the enclave, and the image signature). It also lists the
-published digests and the signing key. `SECURITY.md` says how to report a
-check that should hold and does not.
+TLS endpoint is the enclave, and the image signature), and, with
+`slsa-verifier`, that the running digest is this source at the release the
+image says it is. It also gives the signing key. `SECURITY.md` says how to
+report a check that should hold and does not.
 
 ## What is in this repository
 
@@ -137,12 +142,12 @@ check that should hold and does not.
 | `analysis/protocol.md` | What crosses the socket to the analysis module and what comes back |
 | `analysis.lock` | The analysis bundle (version and SHA-256) the image will run; copied into the image |
 | `camlink.lock` | The `masseuse-camlink-gateway` release (tag and checksum) the image carries |
-| `.github/workflows/release.yml` | The build: images to `ghcr.io`, SLSA provenance, keyless signature, promotion by digest into the enclave's registry, KMS signature |
+| `.github/workflows/release.yml` | The build: images to `ghcr.io` stamped with the tag and commit, SLSA provenance, keyless signature, promotion by digest into the enclave's registry, KMS signature, the GitHub Release that records the digest |
 | `terraform/` | The project: service account, Workload Identity Federation pool and providers keyed to the attestation, models bucket, Artifact Registry, static IP, firewall, the slot VM(s), the trainer's start/stop role, the KMS signing key, the release workflow's identity, the sweeper, VPC Service Controls (off until the project has an organization) |
 | `verifier/` | `tee-verify`, the standalone attestation checker |
 | `tools/` | `gts-acme-test.sh`: the rig that established Google Trust Services tolerates a fresh certificate on every boot |
 | `build.sh` | The same two image builds, locally, without a push |
-| `VERIFY.md` | How to verify a slot and the source of its image; published digests; signing key |
+| `VERIFY.md` | How to verify a slot and the source of its image: what identifies the image (signature, release stamp, provenance), the signing key, where the release history lives |
 | `docs/OPERATIONS.md` | Running it: infrastructure, build, boot, the on-demand lifecycle, signing, the sweeper, certificates |
 
 ## How it runs
