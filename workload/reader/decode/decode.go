@@ -28,8 +28,8 @@ import (
 	"github.com/bluenviron/mediacommon/v2/pkg/formats/mpegts"
 	mpegtscodecs "github.com/bluenviron/mediacommon/v2/pkg/formats/mpegts/codecs"
 
-	"github.com/FemLed/masseuse-video-tee/workload/reader/record"
-	"github.com/FemLed/masseuse-video-tee/workload/reader/source"
+	"github.com/Masseuse-ai/masseuse-video-tee/workload/reader/record"
+	"github.com/Masseuse-ai/masseuse-video-tee/workload/reader/source"
 )
 
 const (

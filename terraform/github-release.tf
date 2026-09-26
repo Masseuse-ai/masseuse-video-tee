@@ -25,7 +25,7 @@
 variable "github_repository" {
   description = "The GitHub repository whose release workflow may promote images into Artifact Registry and sign them (owner/name)."
   type        = string
-  default     = "FemLed/masseuse-video-tee"
+  default     = "Masseuse-ai/masseuse-video-tee"
 }
 
 resource "google_iam_workload_identity_pool" "github" {

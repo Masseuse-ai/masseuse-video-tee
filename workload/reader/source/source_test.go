@@ -9,7 +9,7 @@ import (
 	"github.com/bluenviron/gortsplib/v5"
 	"github.com/bluenviron/mediacommon/v2/pkg/codecs/h264"
 
-	"github.com/FemLed/masseuse-video-tee/workload/reader/testmedia"
+	"github.com/Masseuse-ai/masseuse-video-tee/workload/reader/testmedia"
 )
 
 // collect runs a source until `want` units arrived or the timeout.

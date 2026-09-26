@@ -63,9 +63,11 @@ FROM bluenviron/mediamtx@sha256:1b029d11049be75630e9b73bb0d5f47b08a7db4eaee89a80
 FROM caddy@sha256:c3d7ee5d2b11f9dc54f947f68a734c84e9c9666c92c88a7f30b9cba5da182adb AS caddy
 
 # masseuse-camlink-gateway: the enclave end of the home-camera tunnel
-# (github.com/FemLed/masseuse-camlink, Apache-2.0). Installed from the Go
-# module proxy at the pinned tag with the release's exact toolchain and
-# flags, then compared with the release's published checksum
+# (github.com/Masseuse-ai/masseuse-camlink, Apache-2.0). Installed from the Go
+# module proxy at the pinned tag, under the module path that tag declares
+# (github.com/FemLed/masseuse-camlink up to v0.24.0, the project's previous
+# home; the path below changes with the first camlink.lock bump past it),
+# with the release's exact toolchain and flags, then compared with the release's published checksum
 # (masseuse-video-tee/camlink.lock, from checksums.txt of that release): the
 # binary in this image is the signed, SLSA-attested release binary byte for
 # byte, and anyone can repeat this command to confirm it
@@ -220,7 +222,7 @@ ENV TEE_IMAGE_VERSION=${TEE_IMAGE_VERSION} \
     TEE_IMAGE_COMMIT=${TEE_IMAGE_COMMIT}
 LABEL org.opencontainers.image.version="${TEE_IMAGE_VERSION}" \
       org.opencontainers.image.revision="${TEE_IMAGE_COMMIT}" \
-      org.opencontainers.image.source="https://github.com/FemLed/masseuse-video-tee"
+      org.opencontainers.image.source="https://github.com/Masseuse-ai/masseuse-video-tee"
 
 LABEL "tee.launch_policy.log_redirect"="debugonly"
 LABEL "tee.launch_policy.allow_cmd_override"="false"

@@ -8,7 +8,7 @@ under their own licenses:
 
 - MediaMTX (github.com/bluenviron/mediamtx), MIT License
 - Caddy (github.com/caddyserver/caddy), Apache License 2.0
-- masseuse-camlink-gateway (github.com/FemLed/masseuse-camlink), Apache
+- masseuse-camlink-gateway (github.com/Masseuse-ai/masseuse-camlink), Apache
   License 2.0, pinned by release tag and checksum in camlink.lock
 - ced.cpp (github.com/localai-org/ced.cpp), MIT License, with its vendored
   ggml (MIT License), built as libced.so at a pinned commit

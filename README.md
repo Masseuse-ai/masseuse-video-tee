@@ -7,7 +7,7 @@ they are connected to is running exactly this.
 masseuse.ai looks at a camera while you use it. The camera is either the
 phone's own, a network camera behind you that the phone names, or, through
 the open-source connector
-[masseuse-camlink](https://github.com/FemLed/masseuse-camlink) running on
+[masseuse-camlink](https://github.com/Masseuse-ai/masseuse-camlink) running on
 the computer in the room, that computer's own camera and microphone or a
 camera on your home network. Whichever it is, the video is decrypted in two
 places only: on your own devices and inside a Google Cloud Confidential

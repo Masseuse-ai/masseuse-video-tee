@@ -3,7 +3,7 @@
 ## Reporting
 
 Report vulnerabilities privately through GitHub's
-[security advisory form](https://github.com/FemLed/masseuse-video-tee/security/advisories/new)
+[security advisory form](https://github.com/Masseuse-ai/masseuse-video-tee/security/advisories/new)
 for this repository. Do not open a public issue for a vulnerability. Reports
 are acknowledged within three business days.
 
@@ -16,7 +16,7 @@ against production, and a check that should hold but does not is a report.
 - It receives one camera stream per session: the phone's WebRTC publish
   (WHIP), or a camera the user names, either reachable directly (RTSPS) or
   through the home-network connector
-  ([FemLed/masseuse-camlink](https://github.com/FemLed/masseuse-camlink)).
+  ([Masseuse-ai/masseuse-camlink](https://github.com/Masseuse-ai/masseuse-camlink)).
   TLS and DTLS-SRTP terminate inside the enclave; the connector, the
   trainer and Cloudflare carry ciphertext or metadata only.
 - It runs a container image whose digest is in the attestation token every

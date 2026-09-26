@@ -46,8 +46,8 @@ on:
 permissions: {}
 
 env:
-  IMAGE: ghcr.io/femled/masseuse-video-tee
-  BASE_IMAGE: ghcr.io/femled/masseuse-video-tee-base
+  IMAGE: ghcr.io/masseuse-ai/masseuse-video-tee
+  BASE_IMAGE: ghcr.io/masseuse-ai/masseuse-video-tee-base
   # moby/buildkit:v0.32.2 (multi-arch index on Docker Hub); the BuildKit the
   # docker-container driver runs, so the layer bytes do not depend on the
   # runner image's Docker.
@@ -61,10 +61,10 @@ jobs:
     timeout-minutes: 120
     permissions:
       contents: read
-      packages: write # ghcr.io/femled/masseuse-video-tee, -base
+      packages: write # ghcr.io/masseuse-ai/masseuse-video-tee, -base
       id-token: write # keyless signing (Fulcio)
     outputs:
-      image: ghcr.io/femled/masseuse-video-tee
+      image: ghcr.io/masseuse-ai/masseuse-video-tee
       digest: ${{ steps.tee.outputs.digest }}
       base_digest: ${{ steps.base.outputs.digest }}
     steps:
@@ -140,7 +140,7 @@ jobs:
         # Fulcio issues a certificate to this workflow run's OIDC identity;
         # the signature and certificate are stored next to the image and
         # the entry goes to Rekor. `cosign verify --certificate-identity-regexp
-        # '^https://github.com/FemLed/masseuse-video-tee/.github/workflows/release.yml@refs/tags/v'
+        # '^https://github.com/Masseuse-ai/masseuse-video-tee/.github/workflows/release.yml@refs/tags/v'
         # --certificate-oidc-issuer https://token.actions.githubusercontent.com`
         # checks it (VERIFY.md).
         run: |

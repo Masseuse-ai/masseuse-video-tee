@@ -151,7 +151,7 @@ log "mediamtx advertising $TEE_PUBLIC_IP:8189"
 MTX_WEBRTCADDITIONALHOSTS="$TEE_PUBLIC_IP" mediamtx /app/tee/mediamtx.tee.yml &
 pids+=($!)
 
-# The home-camera tunnel gateway (github.com/FemLed/masseuse-camlink): Caddy
+# The home-camera tunnel gateway (github.com/Masseuse-ai/masseuse-camlink): Caddy
 # hands it /ingest/tunnel on 8090; MediaMTX dials 127.0.0.1:7441 as the
 # camera when the producer puts an external source into tunnel mode, and
 # 127.0.0.1:7442 - the own listener, every connection of which reaches the
