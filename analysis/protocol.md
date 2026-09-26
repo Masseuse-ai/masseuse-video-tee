@@ -285,6 +285,16 @@ standing, seated or wariza (no lying reference applies) and computed as
 before otherwise. The word is judged from one camera's 21 body keypoints in
 the body's own units and against each landmark's rest line, so the camera
 may be anywhere around him.
+From 2026.09.24-2 (`face/v5`) the reading's `face` object also carries
+`hazard`: the analysis's probability that the response peaks within 30 and
+within 60 seconds (`p30`, `p60`, their logits, and `featuresPresent`, the
+share of the model's inputs the object had), read from the `face` object's
+own fields alone (the indices and trend clocks, the channels, the regions,
+the head's speed) by a fixed model whose identity the `face` constants name
+(`hazard`: its version, horizons, column count and rule). It is `null`
+while the face is not present or its baseline is not ready. The passage of
+time is not in it: the analysis does not know how long a session has run,
+and the reader adds that. The fields from before are computed as before.
 
 ### `post`, at the post cadence
 
