@@ -372,6 +372,59 @@ def test_hud_lines_from_the_analysis_are_accepted_and_not_drawn():
     assert session.overlay.context == []
 
 
+def test_face_frames_from_the_analysis_go_to_the_poster_alone():
+    """A `face` message (analysis/protocol.md) is for the user's display:
+    it reaches the trainer through the poster's face slot and nothing
+    else, not the capture, not the record, not the session's events."""
+    class Poster:
+        def __init__(self):
+            self.readings = []
+            self.frames = []
+
+        def post(self, body):
+            self.readings.append(body)
+
+        def post_face(self, body):
+            self.frames.append(body)
+
+    class Capture:
+        def __init__(self):
+            self.calls = []
+
+        def __getattr__(self, name):
+            def note(*args, **kwargs):
+                self.calls.append(name)
+            return note
+
+    class Telemetry:
+        def __init__(self):
+            self.events = []
+
+        def emit(self, kind, body):
+            self.events.append(kind)
+
+        def count(self, *_):
+            pass
+
+    session = Session.__new__(Session)
+    session.poster = Poster()
+    session.capture = Capture()
+    session.telemetry = Telemetry()
+    frame = {"atS": 41.7, "present": True, "confidence": 0.97,
+             "baselineReady": True, "channels": {"jawOpen": 12.0}}
+    session._on_analysis({"kind": "face", "body": frame})
+    session._on_analysis({"kind": "face", "body": "not a frame"})
+    session._on_analysis({"kind": "face"})
+    assert session.poster.frames == [frame]
+    assert session.poster.readings == []
+    assert session.capture.calls == []
+    assert session.telemetry.events == []
+    # without a poster the frames go nowhere, quietly
+    session.poster = None
+    session._on_analysis({"kind": "face", "body": frame})
+    assert session.capture.calls == []
+
+
 def test_a_request_may_only_name_files_under_the_mount():
     """/produce takes a `track` path from the query; it must not reach
     anything but the bucket mount, however it is spelled."""

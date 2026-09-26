@@ -1002,6 +1002,12 @@ class Session:
                        if args.post_url else None)
         self.post_interval_s = float(
             getattr(args, "post_interval_s", 1.0) or 1.0)
+        # The face frames' cadence asked of the analysis (protocol.md
+        # `faceFrameIntervalS`), None for none: only with a face view and
+        # a post URL, since the frames go nowhere else.
+        face_interval = float(getattr(args, "face_frame_interval_s", 0.0) or 0.0)
+        self.face_frame_interval_s = (face_interval if face_interval > 0
+                                      and self.poster is not None else None)
         self.stopping = threading.Event()
         # The live view (overlay.py): None unless a publish URL is
         # configured, in which case it runs on its own thread and taps the
@@ -1050,7 +1056,9 @@ class Session:
             views=(["body", "face"] if self.face_stream else ["body"]),
             facePoseFps=(self.face_pose_fps if self.face_stream else None),
             faceView=(("connector" if self.face_view_stream else "phone")
-                      if self.face_stream else None))
+                      if self.face_stream else None),
+            faceFrameIntervalS=(self.face_frame_interval_s
+                                if self.face_stream else None))
         self._relink_lock = threading.Lock()
         self._relink_thread: threading.Thread | None = None
         try:
@@ -1176,6 +1184,14 @@ class Session:
             row = message.get("row")
             if isinstance(row, dict):
                 self.capture.vocal(row)
+        elif kind == "face":
+            # A face frame for the user's own display (protocol.md): to the
+            # trainer alone, beside the readings. Not the capture's or the
+            # record's (the reading's `face` object is there once a
+            # second) and not the session's event stream.
+            body = message.get("body")
+            if isinstance(body, dict) and self.poster is not None:
+                self.poster.post_face(body)
 
     def _on_analysis_error(self, text: str) -> None:
         """The link's word on a failure: a send that failed (the analysis
@@ -3329,6 +3345,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--post-url", default="")
     parser.add_argument("--post-interval-s", type=float, default=1.0,
                         help="reading cadence the analysis is asked for")
+    parser.add_argument("--face-frame-interval-s", type=float, default=0.0,
+                        help="ask the analysis for `face` frames after the "
+                             "face view's rows at most this often, sent to "
+                             "the post URL's /face route for the user's "
+                             "display (analysis/protocol.md); 0 = none")
     parser.add_argument("--audio", action="store_true",
                         help="also read the stream's audio track "
                              "(workload/audio): classify it into non-speech "

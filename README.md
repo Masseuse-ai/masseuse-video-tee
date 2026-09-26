@@ -130,7 +130,9 @@ record of each release is on its GitHub Release.
 - Cloudflare fronts `masseuse.ai` (HTML/JS, session API) but never carries
   SDP, media or the media capability, only the capability's SHA-256.
 - The masseuse (Cloud Run, run by masseuse.ai) orchestrates leases and
-  receives the readings. It does not proxy WHIP/WHEP for enclave slots.
+  receives the readings, and beside them the face frames for the user's
+  own display (`analysis/protocol.md`, `face`: channel values, never
+  keypoints). It does not proxy WHIP/WHEP for enclave slots.
   Of a live stream the user opens it learns that one is on and to which
   host, may stop it, and sends the words of the HUD card drawn into it;
   the destination itself goes from the phone to the enclave alone.

@@ -228,6 +228,144 @@ def test_the_poster_never_blocks_the_pipeline_and_keeps_the_newest():
     assert counters["postsCoalesced"] == 2
 
 
+def keepalive_server(hold: threading.Event | None = None, idle_s: float | None = None):
+    """An HTTP/1.1 route that keeps the connection open between requests
+    (closing one idle for `idle_s`, when given) and notes which connection
+    each request came in on."""
+    received = []
+    connections = []
+
+    class Handler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+        timeout = idle_s
+
+        def log_message(self, *_):
+            return
+
+        def handle(self):
+            connections.append(1)  # once per connection, however many requests it carries
+            super().handle()
+
+        def do_POST(self):
+            length = int(self.headers.get("Content-Length", 0))
+            received.append({"path": self.path, "body": json.loads(self.rfile.read(length))})
+            if hold is not None:
+                hold.wait(5)
+            self.send_response(200)
+            self.send_header("Content-Length", "2")
+            self.end_headers()
+            self.wfile.write(b"{}")
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return server, received, connections
+
+
+def test_the_connection_is_kept_across_sends_and_frames_go_to_the_face_route():
+    """One connection carries readings and face frames alike; the frames
+    take the readings' URL with `face` for its last segment."""
+    server, received, connections = keepalive_server()
+    telemetry = Telemetry()
+    poster = Poster(f"http://127.0.0.1:{server.server_address[1]}/api/pose-signals/slot/s1/readings",
+                    telemetry, token_supplier=lambda: "t")
+    for i in range(3):
+        poster.post({"atS": float(i)})
+        assert settled(telemetry, "postsOk", i + 1)
+        poster.post_face({"atS": i + 0.5, "present": True, "channels": {"jawOpen": 1.0}})
+        assert settled(telemetry, "facePostsOk", i + 1)
+    poster.close(timeout_s=5)
+    server.shutdown()
+
+    assert [r["path"] for r in received] == [
+        "/api/pose-signals/slot/s1/readings", "/api/pose-signals/slot/s1/face"] * 3
+    assert received[1]["body"]["channels"] == {"jawOpen": 1.0}
+    assert len(connections) == 1, "six sends, one connection"
+    counters = telemetry.snapshot()["counters"]
+    assert counters["postsOk"] == 3 and counters["facePostsOk"] == 3
+    assert "postsReconnected" not in counters
+
+
+def test_a_connection_the_far_end_closed_is_reopened_once():
+    """The far end may drop an idle connection; the next send fails on
+    the reuse, is counted as a reconnect and goes out again, open."""
+    server, received, connections = keepalive_server(idle_s=0.2)
+    telemetry = Telemetry()
+    poster = Poster(f"http://127.0.0.1:{server.server_address[1]}/x/readings",
+                    telemetry, token_supplier=lambda: "t")
+    poster.post({"atS": 1.0})
+    assert settled(telemetry, "postsOk", 1)
+    time.sleep(0.6)  # the far end has closed the idle connection by now
+    poster.post({"atS": 2.0})
+    assert settled(telemetry, "postsOk", 2)
+    poster.close(timeout_s=5)
+    server.shutdown()
+    counters = telemetry.snapshot()["counters"]
+    assert counters["postsReconnected"] == 1
+    assert "postsFailed" not in counters
+    assert [r["body"]["atS"] for r in received] == [1.0, 2.0]
+    assert len(connections) == 2
+
+
+def test_a_frame_never_displaces_or_delays_a_reading():
+    """With the sink holding a send, readings and frames queue in slots of
+    their own: each collapses to its newest, and the reading goes first."""
+    hold = threading.Event()
+    server, received, _ = keepalive_server(hold)
+    telemetry = Telemetry()
+    poster = Poster(f"http://127.0.0.1:{server.server_address[1]}/x/readings",
+                    telemetry, timeout_s=10, token_supplier=lambda: "t")
+    poster.post_face({"atS": 0.1})
+    for _ in range(500):
+        if received:
+            break
+        time.sleep(0.01)
+    assert received, "the first frame is in flight, held by the sink"
+    poster.post_face({"atS": 0.3})
+    poster.post({"atS": 1.0})
+    poster.post_face({"atS": 0.5})
+    poster.post({"atS": 2.0})
+    hold.set()
+    poster.close(timeout_s=10)
+    server.shutdown()
+
+    assert [(r["path"].rsplit("/", 1)[1], r["body"]["atS"]) for r in received] == [
+        ("face", 0.1), ("readings", 2.0), ("face", 0.5)]
+    counters = telemetry.snapshot()["counters"]
+    assert counters["postsOk"] == 1 and counters["facePostsOk"] == 2
+    assert counters["postsCoalesced"] == 1 and counters["facePostsCoalesced"] == 1
+
+
+def test_frames_are_dropped_when_the_readings_url_has_no_readings_segment():
+    telemetry = Telemetry()
+    poster = Poster("http://127.0.0.1:9/api/pose-signals/post", telemetry,
+                    timeout_s=0.2, token_supplier=lambda: "t")
+    poster.post_face({"atS": 0.1})
+    poster.post_face({"atS": 0.2})
+    poster.close(timeout_s=5)
+    counters = telemetry.snapshot()["counters"]
+    assert counters["facePostsUnrouted"] == 1
+    assert "facePostsFailed" not in counters and "postsFailed" not in counters
+
+
+def test_a_refused_frame_is_said_once_apart_from_the_readings(capsys):
+    server, _ = answering_server(404)
+    telemetry = Telemetry()
+    poster = Poster(f"http://127.0.0.1:{server.server_address[1]}/x/readings",
+                    telemetry, token_supplier=lambda: "t")
+    poster.post_face({"atS": 0.1})
+    assert settled(telemetry, "facePostsRefused4xx", 1)
+    poster.post_face({"atS": 0.2})
+    assert settled(telemetry, "facePostsRefused4xx", 2)
+    poster.post({"atS": 1.0})
+    assert settled(telemetry, "postsRefused4xx", 1)
+    poster.close(timeout_s=5)
+    server.shutdown()
+    lines = [line for line in capsys.readouterr().out.splitlines() if line.startswith("poster:")]
+    assert len(lines) == 2
+    assert "a face frame" in lines[0] and "HTTP 404" in lines[0]
+    assert "a reading" in lines[1]
+
+
 def test_capture_records_posts_for_the_consumers_gates(tmp_path):
     from sinks import Capture
 

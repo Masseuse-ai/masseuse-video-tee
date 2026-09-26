@@ -419,6 +419,37 @@ def test_without_a_face_source_the_session_runs_exactly_two_decoders(monkeypatch
     assert link.fields["faceView"] == "phone"
     assert session.views()["faceViewSource"] == "phone"
     assert "faceView" not in session.views()
+    # No post URL: the face frames would go nowhere, so none are asked for.
+    assert link.fields["faceFrameIntervalS"] is None
+
+
+def test_face_frames_are_asked_for_only_with_a_post_url_and_a_face_view(monkeypatch, tmp_path):
+    """The hello's faceFrameIntervalS (analysis/protocol.md): the flag's
+    value when the frames have somewhere to go, null otherwise."""
+    class QuietPoster:
+        timeout_s = 0.1
+
+        def __init__(self, url, telemetry):
+            pass
+
+        def post(self, body):
+            pass
+
+        def post_face(self, body):
+            pass
+
+        def close(self, timeout_s=None):
+            pass
+
+    monkeypatch.setattr(producer, "Poster", QuietPoster)
+    _, _, link = run_session(monkeypatch, tmp_path, post_url="https://t.example/api/pose-signals/slot/s/readings",
+                             face_frame_interval_s=0.2)
+    assert link.fields["faceFrameIntervalS"] == 0.2
+    _, _, link = run_session(monkeypatch, tmp_path, post_url="https://t.example/api/pose-signals/slot/s/readings",
+                             face_frame_interval_s=0.0)
+    assert link.fields["faceFrameIntervalS"] is None
+    _, _, link = run_session(monkeypatch, tmp_path, post_url="", face_frame_interval_s=0.2)
+    assert link.fields["faceFrameIntervalS"] is None
 
 
 def test_the_connectors_camera_is_decoded_for_the_inset_alone_and_the_face_pose_reads_the_phone(monkeypatch, tmp_path):

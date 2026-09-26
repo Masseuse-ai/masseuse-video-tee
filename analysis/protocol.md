@@ -93,6 +93,11 @@ not cross it.
   cadence (`null` with one view): the body's unless the producer was
   started with a different one for the face, and picked from the face
   view's own decode grid the same way.
+- `faceFrameIntervalS` (absent in older producers, `null` when the
+  producer has nowhere to send them; then none are sent): asks for `face`
+  messages (below) after the face view's rows, at most this many seconds
+  of stream time apart. The enclave passes `0.2`. Only meaningful with a
+  `face` view; a bundle from before 2026.09.25-6 ignores it.
 
 ### `pose`, every keypoint-model result, in order
 
@@ -357,6 +362,34 @@ record (`workload/producer/record.py`, described in the README under
 descriptors, audio measurements and the analysis's rows, written to the
 attested capture bucket under the prefix the trainer's lease named. Frames
 and samples are on neither path.
+
+### `face`, after a face row, at the frame cadence
+
+Only when `hello` carried `faceFrameIntervalS`, from bundle 2026.09.25-6.
+
+```json
+{"kind": "face", "body": {"atS": 41.7, "present": true, "confidence": 0.97,
+ "baselineReady": true, "channels": {"eyeBlinkL": 12.3, "jawOpen": 0.0, "...": "..."}}}
+```
+
+A frame for the user's own display: the channel values the reading's
+`face` object carries (the same names, the same units, read from the
+same smoothed rows), sent between readings so the display can follow the
+face at the face rows' pace rather than once a second. `body.atS` is the
+newest face row's clock; `present` whether a face was on it and the rows
+are fresh; `confidence` the model's on that row; `baselineReady` whether
+the first-minute baseline the channels are measured against is in; and
+`channels` the twenty-seven channel values the display reads (the
+contract's rig channels and five more), or `null` before the baseline or
+while no face is present. Nothing else of the reading's `face` object is
+in it: no aggregate, clock, region, witness or hazard, and, like every
+message on this socket, no keypoint. The producer treats `body` as opaque
+JSON and sends it to the trainer alone, at the readings' URL with the last
+path segment `face` in place of `readings`: it is not appended to the
+capture or the record (the record's `posts` stream has the `face` object
+once a second) and not emitted on the session's event stream. A frame that
+is still unsent when the next arrives is replaced by it, and a frame never
+displaces a reading.
 
 ### `onset`, `event`, `payload`
 

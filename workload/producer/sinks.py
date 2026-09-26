@@ -14,13 +14,14 @@ lease's prefix in the attested capture bucket, the full 308-keypoint result
 of both views among them, uploaded as each part closes. `Capture` takes
 the record and routes to it; the session never knows which shape it has.
 
-The POST client sends the readings to the trainer; it stays optional and
-failures are counted, never fatal - a sink must not be able to stall the
-pipeline.
+The POST client sends the readings, and the analysis's face frames, to the
+trainer; it stays optional and failures are counted, never fatal - a sink
+must not be able to stall the pipeline.
 """
 
 from __future__ import annotations
 
+import http.client
 import json
 import threading
 import time
@@ -230,21 +231,40 @@ def metadata_identity_token(audience: str) -> str | None:
         return None
 
 
+def face_path(readings_path: str) -> str | None:
+    """The face frames' path from the readings': the last path segment
+    `readings` replaced by `face` (the trainer's route beside it), None
+    when the readings' path does not end so (then no frame is sent)."""
+    path, sep, query = readings_path.partition("?")
+    if not path.endswith("/readings"):
+        return None
+    return path[:-len("readings")] + "face" + (sep + query if sep else "")
+
+
 class Poster:
-    """Best-effort POST of the analysis's readings to the trainer.
+    """Best-effort POST of the analysis's readings, and of its face frames,
+    to the trainer.
 
-    The analysis process assembles the body at its own cadence; this class
-    only signs and sends. Authenticates like the other machine callers in
-    this stack: a metadata OIDC ID token with the post URL's origin as
-    audience, refreshed before the hour is up. A sink must never stall the
-    pipeline, so token failures and post failures are counted, not raised.
+    The analysis process assembles the bodies at its own cadences; this
+    class only signs and sends. Authenticates like the other machine
+    callers in this stack: a metadata OIDC ID token with the post URL's
+    origin as audience, refreshed before the hour is up. A sink must never
+    stall the pipeline, so token failures and post failures are counted,
+    not raised.
 
-    Sends happen on the poster's own thread. Each post is a fresh HTTPS
-    connection, 50-100 ms of handshake even when the far end answers in
-    2 ms, and at 1 Hz that is a tenth of a second the descriptors thread
-    cannot spare. `post` hands the body over and returns; a body still
-    unsent when the next arrives is replaced, since the consumer wants the
-    newest reading, not a backlog of stale ones.
+    Sends happen on the poster's own thread, over one connection kept open
+    across them: a fresh HTTPS connection is 50-100 ms of handshake even
+    when the far end answers in 2 ms, which at 1 Hz was a tenth of a second
+    the descriptors thread could not spare and at the frames' 5 Hz would be
+    most of the wire. The far end may close an idle connection; a send that
+    fails on a reused connection is tried once more on a new one
+    (`postsReconnected`), a send that fails on a new one is a failure.
+    `post` and `post_face` hand a body over and return; a body still unsent
+    when the next of its kind arrives is replaced, since the consumer wants
+    the newest, not a backlog of stale ones. The two kinds wait in slots of
+    their own and a reading is sent before a waiting frame, so a frame
+    never displaces or delays a reading. Frames go to the readings' URL
+    with its last path segment `readings` replaced by `face` (face_path).
 
     The body goes out compact (no separators' whitespace): a reading is a
     few kilobytes and grows with the analysis, and the receiving route has
@@ -253,7 +273,8 @@ class Poster:
     `postsOk`; `postsRefused4xx` for a refusal (a body it would not read, a
     caller it would not take, no session listening); `postsFailed5xx` for
     the far end failing; `postsFailed` for that and for a send that never
-    got an answer (the transport). The first refusal of a session is
+    got an answer (the transport). The frames' counters are the same names
+    under `facePosts`. The first refusal of a session, of each kind, is
     printed once with its status and the body's size, since a route
     refusing every reading otherwise leaves no trace but the counter.
     """
@@ -265,6 +286,10 @@ class Poster:
         self.timeout_s = timeout_s
         parts = urllib.parse.urlsplit(url)
         self.audience = f"{parts.scheme}://{parts.netloc}"
+        self._scheme = parts.scheme
+        self._netloc = parts.netloc
+        self._path = (parts.path or "/") + (f"?{parts.query}" if parts.query else "")
+        self._face_path = face_path(self._path)
         self._token_supplier = (token_supplier
                                 or (lambda: metadata_identity_token(
                                     self.audience)))
@@ -272,8 +297,14 @@ class Poster:
         self._token_at = 0.0
         self._state = threading.Condition()
         self._pending: dict | None = None
+        self._pending_face: dict | None = None
         self._closed = False
-        self._refusal_printed = False
+        self._unrouted_said = False
+        self._refusal_printed: set[str] = set()
+        # The sender's connection, its thread's alone; None until the first
+        # send and after a failure.
+        self._connection: http.client.HTTPConnection | None = None
+        self._connection_used = False
         self._sender = threading.Thread(target=self._send_loop, daemon=True)
         self._sender.start()
 
@@ -291,13 +322,30 @@ class Poster:
         return headers
 
     def post(self, body: dict) -> None:
-        """Hand a body to the sender; returns at once. Newest wins."""
+        """Hand a reading to the sender; returns at once. Newest wins."""
         with self._state:
             if self._closed:
                 return
             if self._pending is not None and self.telemetry:
                 self.telemetry.count("postsCoalesced")
             self._pending = body
+            self._state.notify()
+
+    def post_face(self, body: dict) -> None:
+        """Hand a face frame to the sender; returns at once. Newest wins,
+        in the frames' own slot. Nothing is sent when the readings' URL
+        has no `/readings` to put `/face` beside (counted once)."""
+        with self._state:
+            if self._closed:
+                return
+            if self._face_path is None:
+                if not self._unrouted_said:
+                    self._unrouted_said = True
+                    self._count("facePosts", "Unrouted")
+                return
+            if self._pending_face is not None:
+                self._count("facePosts", "Coalesced")
+            self._pending_face = body
             self._state.notify()
 
     def close(self, timeout_s: float | None = None) -> None:
@@ -310,41 +358,84 @@ class Poster:
     def _send_loop(self) -> None:
         while True:
             with self._state:
-                while self._pending is None and not self._closed:
+                while (self._pending is None and self._pending_face is None
+                       and not self._closed):
                     self._state.wait()
-                if self._pending is None:
+                if self._pending is not None:
+                    # a reading first: a frame never delays one
+                    body, self._pending = self._pending, None
+                    path, kind = self._path, "posts"
+                elif self._pending_face is not None:
+                    body, self._pending_face = self._pending_face, None
+                    path, kind = self._face_path or self._path, "facePosts"
+                else:
+                    self._drop_connection()
                     return
-                body, self._pending = self._pending, None
-            self._send(body)
+            self._send(path, kind, body)
 
-    def _send(self, body: dict) -> None:
-        data = json.dumps(body, separators=(",", ":")).encode()
-        try:
-            request = urllib.request.Request(
-                self.url, data=data, headers=self._headers())
-            with urllib.request.urlopen(request, timeout=self.timeout_s):
+    def _open(self) -> http.client.HTTPConnection:
+        make = (http.client.HTTPSConnection if self._scheme == "https"
+                else http.client.HTTPConnection)
+        self._connection = make(self._netloc, timeout=self.timeout_s)
+        self._connection_used = False
+        return self._connection
+
+    def _drop_connection(self) -> None:
+        connection, self._connection = self._connection, None
+        if connection is not None:
+            try:
+                connection.close()
+            except OSError:
                 pass
-            if self.telemetry:
-                self.telemetry.count("postsOk")
-        except urllib.error.HTTPError as error:
+
+    def _count(self, kind: str, name: str) -> None:
+        if self.telemetry:
+            self.telemetry.count(kind + name)
+
+    def _send(self, path: str, kind: str, body: dict) -> None:
+        data = json.dumps(body, separators=(",", ":")).encode()
+        headers = self._headers()
+        status: int | None = None
+        for attempt in (1, 2):
+            connection = self._connection or self._open()
+            reused = self._connection_used
+            try:
+                connection.request("POST", path, body=data, headers=headers)
+                response = connection.getresponse()
+                response.read()  # drained, so the connection serves the next send
+                status = int(response.status)
+                self._connection_used = True
+                if response.will_close:
+                    # the far end's last word on this connection (HTTP/1.0,
+                    # or `Connection: close`): the next send opens anew
+                    self._drop_connection()
+                break
+            except (http.client.HTTPException, OSError, ValueError):
+                # No answer: the transport. A connection the far end had
+                # closed while it sat idle fails on its first reuse and is
+                # tried once more, open; anything else is a failure.
+                self._drop_connection()
+                if reused and attempt == 1:
+                    self._count(kind, "Reconnected")
+                    continue
+                self._count(kind, "Failed")
+                return
+        if status is None:
+            return
+        if 200 <= status < 300:
+            self._count(kind, "Ok")
+        elif 400 <= status < 500:
             # An answer, and a refusal: the far end read the request and
-            # would not take it (4xx), or failed on it (5xx).
-            status = int(error.code)
-            if 400 <= status < 500:
-                if self.telemetry:
-                    self.telemetry.count("postsRefused4xx")
-                if not self._refusal_printed:
-                    self._refusal_printed = True
-                    print(f"poster: the readings' route refused a reading: "
-                          f"HTTP {status}, body {len(data)} bytes; further "
-                          f"refusals are counted (postsRefused4xx)",
-                          flush=True)
-            else:
-                if self.telemetry:
-                    self.telemetry.count("postsFailed")
-                    if status >= 500:
-                        self.telemetry.count("postsFailed5xx")
-        except (urllib.error.URLError, OSError, ValueError):
-            # No answer: the transport.
-            if self.telemetry:
-                self.telemetry.count("postsFailed")
+            # would not take it.
+            self._count(kind, "Refused4xx")
+            if kind not in self._refusal_printed:
+                self._refusal_printed.add(kind)
+                what = "a reading" if kind == "posts" else "a face frame"
+                print(f"poster: the route refused {what}: HTTP {status}, "
+                      f"body {len(data)} bytes; further refusals are "
+                      f"counted ({kind}Refused4xx)", flush=True)
+        else:
+            # The far end failing on it.
+            self._count(kind, "Failed")
+            if status >= 500:
+                self._count(kind, "Failed5xx")
