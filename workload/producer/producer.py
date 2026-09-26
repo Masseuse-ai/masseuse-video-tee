@@ -55,6 +55,7 @@ import struct
 import subprocess
 import sys
 import threading
+import uuid
 import time
 from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -75,7 +76,7 @@ from camlink_gateway import (CamlinkGateway, GatewayError,  # noqa: E402
                              parse_expectation)
 from external_source import ExternalSource, SourceError  # noqa: E402
 from live_pose import GpuPose, SideloadPose, prefetch_model_store  # noqa: E402
-from motion import DescriptorWorker, RowAssembler  # noqa: E402
+from motion import FRAMES_PER_POSE, DescriptorWorker, RowAssembler  # noqa: E402
 from overlay import build_renderer, parse_renditions  # noqa: E402
 from record import DEFAULT_PART_S, Record, RecordKeeper  # noqa: E402
 from relay_proxy import (RelayProxy, location_secret,  # noqa: E402
@@ -158,6 +159,25 @@ def mounted_path(candidate: str) -> str | None:
 PENDING_CAP = 256
 # Decided frames waiting for the descriptors thread; ~8 MB of 4K luma each.
 DESCRIPTORS_QUEUE_DEPTH = 128
+# The last slots of that queue are kept for frames on the 6 fps grid
+# (every FRAMES_PER_POSE-th frame, motion.py): the slow descriptor needs
+# both frames of its pair, so a dropped grid frame costs two slow rows,
+# and the analysis's state path is laid out on that grid. Under load the
+# 30 fps path thins first; the 6 fps series stays whole until the queue
+# is full outright. 2026-09-16 half of all frames' descriptors were
+# dropped and the 6 fps series arrived at a fifth of its density.
+DESCRIPTORS_GRID_RESERVE = 24
+
+
+def descriptors_admit(frame: int, queued: int,
+                      depth: int = DESCRIPTORS_QUEUE_DEPTH,
+                      reserve: int = DESCRIPTORS_GRID_RESERVE) -> bool:
+    """Whether a decided frame may join the descriptors queue: a frame on
+    the 6 fps grid while there is any room, any other while the reserve
+    is untouched. `queued` is the queue's depth now."""
+    if frame % FRAMES_PER_POSE == 0:
+        return queued < depth
+    return queued < depth - reserve
 STALL_RESTART_S = 10.0
 # A video track that is announced but carries no frame yet - the connector
 # drops video while its tunnel catches up and resumes at the next keyframe,
@@ -993,15 +1013,25 @@ class Session:
         # text, gauges and segment requests come back through _on_analysis.
         # Opened last so a session that fails to reach it has nothing else
         # to tear down.
+        # `sessionId`: the lease's session (the record's), or this run's
+        # id: what a reconnect names to take the analysis's session up
+        # again after a broken link (analysis/protocol.md `resume`).
+        record_spec = getattr(args, "record", None)
+        session_id = (str(record_spec.get("sessionId"))
+                      if isinstance(record_spec, dict) and record_spec.get("sessionId")
+                      else (self.run_id or self.run_name or uuid.uuid4().hex))
         hello = dict(
             fps=FPS, poseFps=self.pose_fps,
             postIntervalS=self.post_interval_s,
             run=self.run_name or None,
+            sessionId=session_id,
             audio=self.audio_classifier is not None,
             audioModel=(self.audio_classifier.version
                         if self.audio_classifier is not None else None),
             views=(["body", "face"] if self.face_stream else ["body"]),
             facePoseFps=(self.face_pose_fps if self.face_stream else None))
+        self._relink_lock = threading.Lock()
+        self._relink_thread: threading.Thread | None = None
         try:
             self.analysis = open_link(
                 getattr(args, "analysis_socket", "") or "",
@@ -1102,7 +1132,12 @@ class Session:
                     if isinstance(value, (int, float)):
                         self.telemetry.gauge(str(name), float(value))
         elif kind == "log":
-            print(f"analysis: {message.get('text', '')}", flush=True)
+            # The analysis's own words (a handler that failed, a design
+            # mismatch): to stdout, and to the record's `log` stream, since
+            # stdout leaves the enclave with nobody to read it.
+            text = str(message.get("text", ""))
+            print(f"analysis: {text}", flush=True)
+            self._log_line("analysis", text)
         elif kind == "classify":
             # A span of the audio history to measure (audio_stage.segment):
             # queued for the audio thread, the only one that may touch the
@@ -1121,8 +1156,72 @@ class Session:
                 self.capture.vocal(row)
 
     def _on_analysis_error(self, text: str) -> None:
+        """The link's word on a failure: a send that failed (the analysis
+        closed its end, or died), a message a handler could not take, a
+        line that was not JSON. Counted, printed, kept in the record, and
+        a broken link is reconnected from here (_relink)."""
         self.telemetry.count("analysisErrors")
         print(text, flush=True)
+        self._log_line("producer", text)
+        if getattr(self.analysis, "broken", False) and not self.stopping.is_set():
+            self._relink()
+
+    def _log_line(self, source: str, text: str) -> None:
+        """One line for the record's `log` stream (record.py): what the
+        two processes said about a failure, with the wall clock, so a
+        session that lost its readings can be read afterwards."""
+        capture = getattr(self, "capture", None)
+        if capture is not None:
+            capture.log(source, text)
+
+    def _relink(self) -> None:
+        """Reconnect the analysis link, once at a time, on its own thread:
+        the reader thread that reports the break must not block on it."""
+        with self._relink_lock:
+            if self._relink_thread is not None and self._relink_thread.is_alive():
+                return
+            self._relink_thread = threading.Thread(
+                target=self._relink_loop, name="analysis-relink", daemon=True)
+            self._relink_thread.start()
+
+    def _relink_loop(self) -> None:
+        """Try again after 1, 2, 5, then every 10 s until the link is back
+        or the session ends. Each attempt is one `analysis` event on the
+        session's stream (lost, then resumed or restarted) and one line in
+        the record, so the trainer and the record know the readings'
+        gap for what it was."""
+        link = self.analysis
+        waits = [1.0, 2.0, 5.0]
+        attempt = 0
+        self.telemetry.emit("analysis", {"state": "lost", "attempt": attempt})
+        while not self.stopping.is_set() and getattr(link, "broken", False):
+            wait_s = waits[attempt] if attempt < len(waits) else 10.0
+            if self.stopping.wait(wait_s):
+                return
+            attempt += 1
+            try:
+                ready = link.reconnect()
+            except Exception as error:  # noqa: BLE001 - said aloud, tried again
+                self.telemetry.count("analysisReconnectFailures")
+                text = f"analysis reconnect {attempt} failed: {error!r}"
+                print(text, flush=True)
+                self._log_line("producer", text)
+                self.telemetry.emit("analysis", {"state": "lost", "attempt": attempt,
+                                                 "error": str(error)[:200]})
+                continue
+            resumed = ready.get("resumed") is True
+            self.telemetry.count("analysisReconnects")
+            if not resumed:
+                self.telemetry.count("analysisRestarts")
+            state = "resumed" if resumed else "restarted"
+            text = (f"analysis link back after {attempt} attempt(s): the session "
+                    f"{'resumed where it was' if resumed else 'started over (the analysis had not kept it)'}; "
+                    f"{link.dropped} message(s) dropped meanwhile")
+            print(text, flush=True)
+            self._log_line("producer", text)
+            self.telemetry.emit("analysis", {"state": state, "attempt": attempt,
+                                             "dropped": link.dropped})
+            return
 
     # -- what goes to it -----------------------------------------------------
 
@@ -1381,13 +1480,22 @@ class Session:
                     if not decoder.paced:
                         work.put((row, gray_row))
                         continue
+                    on_grid = row["frame"] % FRAMES_PER_POSE == 0
+                    if not descriptors_admit(row["frame"], work.qsize()):
+                        # The reserve is the grid's: a 30 fps pair is lost,
+                        # the 6 fps pair behind it is not.
+                        self.telemetry.count(
+                            "descriptorsDroppedGrid" if on_grid else "descriptorsDropped")
+                        continue
                     try:
                         work.put_nowait((row, gray_row))
                     except queue.Full:
                         # Counted, not waited for: a frame whose descriptors
                         # are lost breaks one pair, a stalled decode breaks
-                        # the pose cadence for everything behind it.
-                        self.telemetry.count("descriptorsDropped")
+                        # the pose cadence for everything behind it. A grid
+                        # frame lost here is the queue full outright.
+                        self.telemetry.count(
+                            "descriptorsDroppedGrid" if on_grid else "descriptorsDropped")
                 self._gauges(at_s, wall_start, work.qsize())
                 now = time.monotonic()
                 if now - last_log >= LOG_EVERY_S:

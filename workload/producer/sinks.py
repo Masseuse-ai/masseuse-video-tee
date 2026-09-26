@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import json
 import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -43,6 +44,8 @@ class Capture:
         self.run_id = run_id
         if record is not None and run_id is None:
             self.run_id = record.begin_run(None)
+        self._log_window: tuple[float, int] = (0.0, 0)
+        self._log_dropped = 0
         self._files = {} if record is not None else {
             name: open(directory / f"{name}.jsonl", "a", buffering=1)
             for name in ("onsets", "events", "payloads", "posts", "poses")
@@ -109,6 +112,32 @@ class Capture:
         the `frame`, `audio` and `segment` kinds."""
         if self.record is not None:
             self.record.outbound(message)
+
+    # The `log` stream: what the two processes said about a failure, so a
+    # session that lost its readings can be read afterwards (the enclave's
+    # stdout leaves it with nobody to read it; 2026-09-16 the analysis's
+    # death was a counter and nothing else). Rate-limited, since a fault
+    # that repeats every frame would otherwise fill a part with one line.
+    LOG_LINE_CHARS = 300
+    LOG_LINES_PER_S = 10
+
+    def log(self, source: str, text: str) -> None:
+        if self.record is None:
+            return
+        now = time.monotonic()
+        window, count = self._log_window
+        if now - window >= 1.0:
+            self._log_window = (now, 0)
+            window, count = now, 0
+        if count >= self.LOG_LINES_PER_S:
+            self._log_dropped += 1
+            return
+        self._log_window = (window, count + 1)
+        row = {"source": str(source)[:16], "text": str(text)[:self.LOG_LINE_CHARS]}
+        if self._log_dropped:
+            row["droppedBefore"] = self._log_dropped
+            self._log_dropped = 0
+        self.record.append("log", row)
 
     def summary(self, summary: dict) -> None:
         """The run's summary: with a record, runs/<run>/summary.json in it

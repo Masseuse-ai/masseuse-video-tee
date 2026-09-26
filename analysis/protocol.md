@@ -30,7 +30,14 @@ not cross it.
 - One Unix stream socket, path passed to the producer as
   `--analysis-socket` (the enclave uses `/run/tee/analysis/analysis.sock`).
 - The analysis process listens; the producer connects once per session and
-  closes when the session ends.
+  closes when the session ends. A connection that breaks mid-session (a
+  send fails, the analysis's end closes) is not the session's end: the
+  producer connects again and greets with the same `sessionId` and
+  `resume: true`, and the analysis, which keeps a session whose connection
+  ended without `stop` for a grace period (two minutes), carries it on
+  where it was (`ready.resumed`). Nothing sent while the link was broken
+  is queued; the producer counts it (`analysisDropped` in its telemetry)
+  and the record's `log` stream says what happened.
 - Messages are JSON objects, one per line (`\n`-terminated, UTF-8). Floats
   are carried at full precision; `NaN` may appear (Python's `json` accepts
   it) where a statistic is undefined, for example a window with no rows.
@@ -44,7 +51,7 @@ not cross it.
 
 ```json
 {"kind": "hello", "protocol": 1, "fps": 30.0, "poseFps": 9.0,
- "postIntervalS": 1.0, "run": null,
+ "postIntervalS": 1.0, "run": null, "sessionId": "4ce25466-...",
  "audio": true, "audioModel": "ced.cpp-abi1:ced-small-f16.gguf"}
 ```
 
@@ -63,6 +70,12 @@ not cross it.
 - `postIntervalS`: how often the analysis is expected to emit a `post`.
 - `run`: the operator's name for a captured test session, or `null` in
   production.
+- `sessionId` (absent in older producers): the trainer's session id the
+  slot is leased to (the record's), or the run's own id without a lease;
+  an opaque string the analysis uses only as the key a `resume` names.
+- `resume` (only on a reconnect, `true`): take up the session parked
+  under `sessionId` if it is still there; otherwise this hello starts a
+  new one, and `ready.resumed` says which happened.
 - `audio`: whether the producer runs the audio stage for this session
   (`audio` messages may follow and `classify` requests are answered).
   `false` means the stream's sound is not read at all. `audioModel` names
@@ -225,11 +238,13 @@ The producer then waits (bounded) for `summary` and closes the socket.
 
 ```json
 {"kind": "ready", "protocol": 1, "version": "2026.09.09-1",
- "modelVersion": "analysis/v1", "vocal": {"...": "..."}}
+ "modelVersion": "analysis/v1", "resumed": false, "vocal": {"...": "..."}}
 ```
 
 `version` is the bundle version from `analysis.lock`; `modelVersion` is what
-the readings carry as their `modelVersion` field. `vocal`, when present, is
+the readings carry as their `modelVersion` field. `resumed` (absent in
+older bundles, then `false`) is whether this connection took up a parked
+session (`hello.resume`) rather than starting one. `vocal`, when present, is
 the constants the `vocal` rows below are judged against (thresholds, the
 labels' names, the bundle's vocal version): numbers and names, kept in the
 session record's `hello.json` so a row can be read back years later.
@@ -304,7 +319,10 @@ Numbers for the producer's telemetry line and `/status` snapshot.
 {"kind": "log", "text": "calibrated at 41.2s"}
 ```
 
-Printed by the producer to its own log.
+Printed by the producer to its own log and kept in the session record's
+`log` stream (`docs/SESSION_RECORD.md`) with `source: analysis`: a handler
+that could not take a message says so here, once per kind, and the
+message's failure is that message's alone; the session goes on.
 
 ### `classify`
 

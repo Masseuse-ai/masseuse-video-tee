@@ -271,3 +271,104 @@ def test_the_face_stream_needs_the_gpu_pose(monkeypatch, tmp_path, capsys):
     assert "needs --pose gpu" in capsys.readouterr().out
     session.run()
     assert [d.url for d in StubDecoder.made] == [BODY_URL]
+
+
+class BreakingLink(FakeLink):
+    """A link whose sends fail once told to, and which comes back on
+    `reconnect` after a scripted number of refusals (analysis_link.py's
+    shape; the real thing is tested in test_analysis_link.py)."""
+
+    connected = True
+
+    def __init__(self, fields, refusals: int = 1):
+        super().__init__(fields)
+        self.broken = False
+        self.dropped = 0
+        self.reconnects = 0
+        self.refusals = refusals
+        self.attempts = 0
+        self.on_error = None
+        self.resumed_answer = True
+
+    def send(self, message):
+        if self.broken:
+            self.dropped += 1
+            return
+        self.sent.append(message)
+
+    def reconnect(self, connect_timeout_s=None):
+        self.attempts += 1
+        if self.attempts <= self.refusals:
+            import analysis_link
+            raise analysis_link.LinkError("analysis socket: refused (test)")
+        self.broken = False
+        self.reconnects += 1
+        return {"protocol": 1, "resumed": self.resumed_answer}
+
+
+def test_a_broken_analysis_link_is_reconnected_with_backoff_and_said_on_the_stream(monkeypatch, tmp_path):
+    pose = StubPose()
+    links: list[BreakingLink] = []
+
+    def open_link(path, on_message, on_error, **fields):
+        link = BreakingLink(fields, refusals=1)
+        link.on_error = on_error
+        links.append(link)
+        return link
+
+    monkeypatch.setattr(producer, "acquire_gpu_pose", lambda args, telemetry: pose)
+    monkeypatch.setattr(producer, "Decoder", StubDecoder)
+    monkeypatch.setattr(producer, "open_link", open_link)
+    StubDecoder.made = []
+    StubDecoder.scripts = {BODY_URL: [(0, 0.0), (1, 1 / 30), (2, 2 / 30)],
+                           FACE_URL: [(0, 0.0), (10, 10 / 30)]}
+    StubDecoder.epochs = {BODY_URL: 1_000.0, FACE_URL: 1_002.0}
+    telemetry = Telemetry()
+    queue, _flag = telemetry.subscribe()
+    session = producer.Session(session_args(tmp_path), telemetry)
+    link = links[0]
+    # The hello names the session the analysis may be asked to resume
+    # (the lease's id when there is a record; a fresh one otherwise).
+    assert isinstance(link.fields["sessionId"], str) and len(link.fields["sessionId"]) >= 8
+    # No waiting in the test: the backoff is the loop's own.
+    session.stopping = threading.Event()
+    waits: list[float] = []
+    real_wait = session.stopping.wait
+
+    def instant_wait(timeout=None):
+        waits.append(timeout)
+        return real_wait(0.001)
+
+    session.stopping.wait = instant_wait  # type: ignore[method-assign]
+
+    # The link breaks: the reader's word arrives through on_error.
+    link.broken = True
+    link.on_error("analysis send failed: BrokenPipeError(32, 'Broken pipe')")
+    assert session._relink_thread is not None
+    session._relink_thread.join(5.0)
+    assert not link.broken and link.reconnects == 1 and link.attempts == 2
+    assert waits[:2] == [1.0, 2.0], "1 s, then 2 s before the attempt that took"
+    counters = telemetry.snapshot()["counters"]
+    assert counters["analysisErrors"] == 1
+    assert counters["analysisReconnectFailures"] == 1
+    assert counters["analysisReconnects"] == 1
+    assert "analysisRestarts" not in counters, "the analysis kept the session"
+    # The session's stream (what the trainer reads) heard it: lost, lost
+    # again with the refusal, then resumed.
+    import json
+    said = [json.loads(m) for m in queue if '"analysis"' in m]
+    assert [(e["kind"], e["state"]) for e in said] == [
+        ("analysis", "lost"), ("analysis", "lost"), ("analysis", "resumed")]
+    assert said[1]["error"].startswith("analysis socket") and said[2]["attempt"] == 2
+    # A second break while the first relink is still running does not start another.
+    link.broken = True
+    link.refusals = 10 ** 6
+    link.attempts = 0
+    link.on_error("analysis send failed: again")
+    first = session._relink_thread
+    link.on_error("analysis send failed: and again")
+    assert session._relink_thread is first
+    session.stopping.set()
+    first.join(5.0)
+    assert not first.is_alive()
+    assert telemetry.snapshot()["counters"]["analysisErrors"] == 3

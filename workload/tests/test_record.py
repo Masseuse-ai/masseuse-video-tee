@@ -352,6 +352,7 @@ def test_the_record_routes_every_stream_to_parts_under_the_prefix(tmp_path):
     record.append("payloads", {"kind": "clench", "atS": 2.0})
     record.append("posts", {"atS": 2.0, "ratePerMin": 12.0})
     record.append("vocal", {"kind": "decision", "atS": 2.0, "verdict": "vocal"})
+    record.append("log", {"source": "producer", "text": "analysis send failed: BrokenPipeError(32)"})
     assert record.append("poses", {"frame": 1}) is False, "keypoint streams take steps"
     assert record.append("nope", {}) is False
     xy, sc = keypoints(3)
@@ -398,10 +399,13 @@ def test_the_record_routes_every_stream_to_parts_under_the_prefix(tmp_path):
     names = sorted(gcs.objects)
     part = "part-20260915T051230Z"
     for stream in ("frames", "audio", "segments", "onsets", "events", "payloads", "posts",
-                   "vocal", "telemetry"):
+                   "vocal", "telemetry", "log"):
         assert f"{PREFIX}/{stream}/{part}.jsonl.gz" in names, stream
     assert f"{PREFIX}/poses/{part}.parquet" in names and f"{PREFIX}/faces/{part}.parquet" in names
     assert f"{PREFIX}/summary.json" in names
+    log_rows = rows_of(gcs, f"{PREFIX}/log/{part}.jsonl.gz")
+    assert [(r["source"], r["text"]) for r in log_rows] == [
+        ("producer", "analysis send failed: BrokenPipeError(32)")]
     assert rows_of(gcs, f"{PREFIX}/onsets/{part}.jsonl.gz") == [
         {"wallS": T0, "atS": 1.5}, {"wallS": T0 + 20.0, "atS": 9.0}], \
         "a row after the run's end rides in the same part"
@@ -434,7 +438,7 @@ def test_the_record_routes_every_stream_to_parts_under_the_prefix(tmp_path):
     assert record.close({"again": True})["drained"] is True and len(gcs.objects) == count
     assert record.append("onsets", {"atS": 9.0}) is False
     assert record.hello() is False
-    assert telemetry.snapshot()["counters"]["recordPartsUploaded"] == 15
+    assert telemetry.snapshot()["counters"]["recordPartsUploaded"] == 16  # the log stream is one more part
     assert not any(p.is_file() for p in (tmp_path / "rec").rglob("*")), "uploaded parts are gone"
 
 

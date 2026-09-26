@@ -22,7 +22,7 @@ gs://<TEE_CAPTURE_BUCKET>/<account uuid>/estim_sessions/<session uuid>/enclave/
     frames/part-20260915T051230Z.jsonl.gz
     audio/…      segments/…    vocal/…
     onsets/…     events/…      payloads/…    posts/…
-    telemetry/…
+    telemetry/…  log/…
 ```
 
 The two uuids are opaque identifiers the trainer minted; the trainer's own
@@ -115,6 +115,7 @@ One JSON object per line, `wallS` first. The rows are the messages of
 | `payloads/` | analysis payload | the payload's own fields |
 | `posts/` | reading posted to the trainer | the reading's own fields (`atS`, `modelVersion`, …) |
 | `telemetry/` | second | `counters`, `gauges`, `stages` of the producer's telemetry snapshot |
+| `log/` | line either process said about a failure | `source` (`producer` or `analysis`), `text` (a send that failed, a reconnect, a handler that could not take a message; at most 10 lines a second, `droppedBefore` counting what the cap held back). Empty in a session that went well; the enclave's stdout is not shipped, so this is where such a line is read afterwards |
 
 ## `hello.json`
 

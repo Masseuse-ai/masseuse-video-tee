@@ -366,3 +366,23 @@ def test_a_request_may_only_name_files_under_the_mount():
     assert mounted_path(f"{root}extra/x") is None
     assert mounted_path("/etc/passwd") is None
     assert mounted_path("relative/poses.jsonl") is None
+
+
+def test_the_descriptor_queue_keeps_its_last_slots_for_the_6fps_grid():
+    # A frame on the grid (every fifth) goes in while there is any room; the
+    # others stop at the reserve, so under load the 30 fps pairs thin first
+    # and the 6 fps series the analysis's state path is laid on stays whole
+    # (2026-09-16 it arrived at a fifth of its density).
+    import producer
+
+    depth, reserve = producer.DESCRIPTORS_QUEUE_DEPTH, producer.DESCRIPTORS_GRID_RESERVE
+    assert 0 < reserve < depth
+    for queued in range(depth - reserve):
+        assert producer.descriptors_admit(1, queued) and producer.descriptors_admit(5, queued)
+    for queued in range(depth - reserve, depth):
+        assert not producer.descriptors_admit(1, queued), queued
+        assert not producer.descriptors_admit(7, queued), queued
+        assert producer.descriptors_admit(0, queued) and producer.descriptors_admit(10, queued), queued
+    assert not producer.descriptors_admit(10, depth), "full outright: the grid frame is lost too"
+    assert not producer.descriptors_admit(10, depth + 1)
+    assert producer.descriptors_admit(3, 0, depth=4, reserve=1) and not producer.descriptors_admit(3, 3, depth=4, reserve=1)

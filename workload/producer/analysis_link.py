@@ -1,11 +1,20 @@
 """The producer's end of the analysis socket (analysis/protocol.md).
 
-One connection per session. `send` is the only way anything reaches the
-analysis process and `on_message` the only way anything comes back; both
-carry JSON objects, one per line, and this module neither inspects nor
-builds their contents beyond the `kind` field. What is allowed to cross is
-the protocol document's business, and the producer's (`producer.Session`),
-which decides what to put in and what to do with what comes out.
+One session, on one connection at a time. `send` is the only way anything
+reaches the analysis process and `on_message` the only way anything comes
+back; both carry JSON objects, one per line, and this module neither
+inspects nor builds their contents beyond the `kind` field. What is
+allowed to cross is the protocol document's business, and the producer's
+(`producer.Session`), which decides what to put in and what to do with
+what comes out.
+
+A send that fails marks the link `broken` (the analysis closed its end, or
+died) and says so through `on_error`; nothing is sent while it is, and
+the session keeps running without readings. `reconnect` opens a new
+connection and greets again with `resume: true`, so an analysis that kept
+the session (protocol.md: `ready.resumed`) carries it on where it was.
+Before 2026-09-16 the first failed send closed the link for the rest of
+the session, in silence but for a counter.
 
 `NullLink` stands in when no socket is configured: the producer then runs
 the pixel path alone, which is how the public tree is exercised without the
@@ -67,9 +76,25 @@ class AnalysisLink:
         self._ready_event = threading.Event()
         self._send_lock = threading.Lock()
         self._closed = False
+        # The link is broken from the first failed send until `reconnect`
+        # succeeds; what would have been sent meanwhile is counted, not
+        # queued (the analysis's streams are laid on the frames' own
+        # clock, and a burst of stale rows would only be more to drop).
+        self.broken = False
+        self.dropped = 0
+        self.reconnects = 0
+        self.hello_fields: dict = {}
+        # Each connection is a generation: the reader of an earlier
+        # socket must not hand its end-of-stream to the current one.
+        self._generation = 0
         self.sock = self._connect(connect_timeout_s)
+        self._open_reader()
+
+    def _open_reader(self) -> None:
+        self._generation += 1
         self._file = self.sock.makefile("rb")
-        self._reader = threading.Thread(target=self._read_loop, daemon=True)
+        self._reader = threading.Thread(target=self._read_loop,
+                                        args=(self._generation,), daemon=True)
         self._reader.start()
 
     def _connect(self, timeout_s: float) -> socket.socket:
@@ -89,11 +114,14 @@ class AnalysisLink:
                 time.sleep(0.25)
 
     def hello(self, **fields) -> dict:
-        """Send `hello`, wait for `ready`."""
+        """Send `hello`, wait for `ready`. The fields are kept for a
+        `reconnect`, which greets with them again."""
+        self.hello_fields = dict(fields)
+        self._ready_event.clear()
+        self.ready = None
         self.send({"kind": "hello", "protocol": PROTOCOL, **fields})
-        if not self._ready_event.wait(READY_TIMEOUT_S):
+        if not self._ready_event.wait(READY_TIMEOUT_S) or not self.ready:
             raise LinkError("analysis did not answer hello")
-        assert self.ready is not None
         if int(self.ready.get("protocol", 0)) != PROTOCOL:
             raise LinkError(
                 f"analysis speaks protocol {self.ready.get('protocol')}, "
@@ -103,19 +131,58 @@ class AnalysisLink:
     def send(self, message: dict) -> None:
         if self._closed:
             return
+        if self.broken:
+            self.dropped += 1
+            return
         data = (json.dumps(message, separators=(",", ":")) + "\n").encode()
         with self._send_lock:
+            if self.broken:
+                self.dropped += 1
+                return
             try:
                 self.sock.sendall(data)
             except OSError as error:
-                self._closed = True
+                self.broken = True
                 self.on_error(f"analysis send failed: {error!r}")
+
+    def reconnect(self, connect_timeout_s: float = CONNECT_TIMEOUT_S) -> dict:
+        """A new connection for the same session: connect, greet with the
+        hello's fields and `resume: true`, and carry on. Raises LinkError
+        when the analysis is not listening or does not answer; the link
+        stays broken for the caller to try again."""
+        if self._closed:
+            raise LinkError("the link is closed")
+        with self._send_lock:
+            old = self.sock
+            try:
+                old.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            try:
+                old.close()
+            except OSError:
+                pass
+            self.sock = self._connect(connect_timeout_s)
+            self._open_reader()
+            # The old reader's end-of-stream is not this connection's.
+            self._summary_event.clear()
+            # The new connection may send; hello() goes through send().
+            self.broken = False
+        try:
+            ready = self.hello(**{**self.hello_fields, "resume": True})
+        except LinkError:
+            self.broken = True
+            raise
+        self.reconnects += 1
+        return ready
 
     def stop(self, at_s: float | None = None,
              timeout_s: float = SUMMARY_TIMEOUT_S) -> dict:
-        """Send `stop`, return the analysis's summary (empty if none came)."""
-        self.send({"kind": "stop", "atS": at_s})
-        self._summary_event.wait(timeout_s)
+        """Send `stop`, return the analysis's summary (empty if none came;
+        at once when the link is broken, since nothing can be asked)."""
+        if not self.broken:
+            self.send({"kind": "stop", "atS": at_s})
+            self._summary_event.wait(timeout_s)
         self.close()
         return dict(self._summary or {})
 
@@ -130,9 +197,10 @@ class AnalysisLink:
         except OSError:
             pass
 
-    def _read_loop(self) -> None:
+    def _read_loop(self, generation: int) -> None:
+        handle = self._file
         try:
-            for line in self._file:
+            for line in handle:
                 if not line.strip():
                     continue
                 try:
@@ -159,13 +227,17 @@ class AnalysisLink:
         except (OSError, ValueError):
             pass
         finally:
-            # A reader that ends without a summary must not hang `stop`.
-            if self._summary is None:
+            if generation != self._generation:
+                return  # an earlier connection's reader: nothing to say
+            # The analysis closed its end (or died) without a summary:
+            # the link is broken, and a reader that ends without a
+            # summary must not hang `stop` or `hello`.
+            if not self._closed:
+                self.broken = True
+            if self._summary is None and self._closed:
                 self._summary = {}
             self._summary_event.set()
             self._ready_event.set()
-            if self.ready is None:
-                self.ready = {}
 
 
 def open_link(path: str, on_message: Callable[[dict], None],

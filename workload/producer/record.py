@@ -87,7 +87,7 @@ RECORD_PREFIX = re.compile(rf"^{UUID}/estim_sessions/{UUID}/enclave$")
 BUCKET_NAME = re.compile(r"^[a-z0-9][a-z0-9._-]{1,220}[a-z0-9]$")
 
 JSONL_STREAMS = ("frames", "audio", "segments", "vocal", "onsets", "events",
-                 "payloads", "posts", "telemetry")
+                 "payloads", "posts", "telemetry", "log")
 KEYPOINT_STREAMS = {"body": "poses", "face": "faces"}
 
 

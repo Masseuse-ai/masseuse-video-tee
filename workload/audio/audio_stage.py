@@ -260,10 +260,18 @@ class AudioStage(threading.Thread):
         end_s = self.end_s
         self.history = np.concatenate((self.history, pcm))[-self.history_samples:]
         window = self.history[-self.window_samples:]
+        # The hop's three costs, each its own stage beside the whole: the
+        # classifier over the window, the pitch summary over the window,
+        # the contour of the new samples. 2026-09-16 the whole read 750 ms
+        # (p50) per 0.5 s hop and nothing said which part; the stage fell
+        # to half real time and the pre-current baseline minute took two.
         with self.telemetry.time_stage("audio"):
-            scores = _round_scores(self.classifier.classify(window))
-            pitch = self.pitch_estimator(window, SAMPLE_RATE)
-            frames = self._fresh_frames(start_s, end_s)
+            with self.telemetry.time_stage("audioClassify"):
+                scores = _round_scores(self.classifier.classify(window))
+            with self.telemetry.time_stage("audioPitch"):
+                pitch = self.pitch_estimator(window, SAMPLE_RATE)
+            with self.telemetry.time_stage("audioFrames"):
+                frames = self._fresh_frames(start_s, end_s)
         self.hops += 1
         self.telemetry.count("audioHops")
         self.telemetry.gauge("audioS", end_s)

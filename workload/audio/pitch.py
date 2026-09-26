@@ -27,6 +27,34 @@ class PitchFrame(NamedTuple):
     dbfs: float
 
 
+def normalized_autocorrelation(frame: np.ndarray, autocorrelation: np.ndarray,
+                               min_lag: int, max_lag: int) -> np.ndarray:
+    """The autocorrelation at each lag in [min_lag, max_lag], divided by
+    the geometric mean of the two overlapping halves' energies (the
+    frame's first n - lag samples against its last n - lag), so that a
+    periodic frame reads near 1 at its period whatever its level.
+
+    The two energies are running sums read off one cumulative sum: the
+    lag loop this replaces made two `np.sum` calls per lag, some four
+    hundred numpy calls per 64 ms frame and a hundred and twenty-five
+    frames per two-second window, and was most of the audio stage's
+    750 ms per half-second hop (2026-09-16), the stage that fell to half
+    real time and doubled the pre-current baseline minute. Same numbers,
+    to the float noise of the summation order.
+    """
+    frame_sq = np.square(frame, dtype=np.float64)
+    cumulative = np.concatenate(([0.0], np.cumsum(frame_sq)))
+    total = cumulative[-1]
+    lags = np.arange(min_lag, max_lag + 1)
+    leading = cumulative[len(frame_sq) - lags]      # sum(frame_sq[:-lag])
+    trailing = total - cumulative[lags]             # sum(frame_sq[lag:])
+    denominator = np.sqrt(np.maximum(leading * trailing, 0.0))
+    normalized = np.zeros(len(lags), dtype=np.float64)
+    usable = denominator > 1e-12
+    normalized[usable] = autocorrelation[lags[usable]] / denominator[usable]
+    return normalized
+
+
 def rms_dbfs(wav: np.ndarray) -> float:
     if wav.size == 0:
         return -90.0
@@ -71,14 +99,8 @@ def pitch_frames(
         autocorrelation = np.fft.irfft(
             spectrum * np.conjugate(spectrum)
         )[:frame_length]
-        normalized = np.zeros(max_lag - min_lag + 1, dtype=np.float64)
-        frame_sq = np.square(frame)
-        for offset, lag in enumerate(range(min_lag, max_lag + 1)):
-            denominator = math.sqrt(
-                float(np.sum(frame_sq[:-lag]) * np.sum(frame_sq[lag:]))
-            )
-            if denominator > 1e-12:
-                normalized[offset] = autocorrelation[lag] / denominator
+        normalized = normalized_autocorrelation(
+            frame, autocorrelation, min_lag, max_lag)
 
         peak_offset = int(np.argmax(normalized))
         confidence = float(normalized[peak_offset])

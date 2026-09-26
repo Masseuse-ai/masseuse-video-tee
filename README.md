@@ -225,6 +225,7 @@ What the enclave writes (`workload/producer/record.py`):
 | `vocal/` | The analysis module's vocalization judgements, one row each | gzipped JSONL |
 | `onsets/`, `events/`, `payloads/`, `posts/` | What the analysis decided, and the readings it posted | gzipped JSONL |
 | `telemetry/` | The process's counters and gauges once a second | gzipped JSONL |
+| `log/` | What either process said about a failure (a link that broke and was reconnected, a message a handler could not take); empty in a session that went well | gzipped JSONL |
 | `hello.json`, `summary.json` | What the record is (the lease's terms, the keypoint layout, the image's release stamp) and how it ended when the lease did, with its production runs | JSON |
 | `runs/<start>/hello.json`, `runs/<start>/summary.json` | One pair per production run of the session (the trainer opens a new one when the camera changes): the two processes' `hello`/`ready`, the run's sources and views, and its summary | JSON |
 

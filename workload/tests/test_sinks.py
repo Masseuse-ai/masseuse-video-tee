@@ -248,3 +248,41 @@ def test_capture_upload_failures_are_counted_never_raised(tmp_path):
     counters = telemetry.snapshot()["counters"]
     assert counters["captureUploaded"] == 4
     assert counters["captureUploadFailed"] == 1 + 5
+
+
+def test_capture_log_lines_go_to_the_record_capped_per_second(tmp_path, monkeypatch):
+    from sinks import Capture
+
+    class FakeRecord:
+        def __init__(self):
+            self.rows: list[tuple[str, dict]] = []
+
+        def begin_run(self, name):
+            return "r1"
+
+        def append(self, stream, row):
+            self.rows.append((stream, row))
+            return True
+
+    clock = {"t": 100.0}
+    import sinks
+    monkeypatch.setattr(sinks.time, "monotonic", lambda: clock["t"])
+    record = FakeRecord()
+    capture = Capture(tmp_path, record=record)
+    capture.log("producer", "analysis send failed: BrokenPipeError(32, 'Broken pipe')")
+    capture.log("analysis", "frame at 483.1s failed: SystemExit('x')" + " y" * 300)
+    assert [s for s, _ in record.rows] == ["log", "log"]
+    assert record.rows[0][1] == {"source": "producer",
+                                 "text": "analysis send failed: BrokenPipeError(32, 'Broken pipe')"}
+    assert len(record.rows[1][1]["text"]) == Capture.LOG_LINE_CHARS
+    # A fault that repeats every frame is held to LOG_LINES_PER_S; the
+    # first line of the next second says how many were held back.
+    for i in range(30):
+        capture.log("analysis", f"frame {i} failed")
+    assert len(record.rows) == 2 + (Capture.LOG_LINES_PER_S - 2)
+    clock["t"] += 1.0
+    capture.log("analysis", "next second")
+    last = record.rows[-1][1]
+    assert last["text"] == "next second" and last["droppedBefore"] == 30 - (Capture.LOG_LINES_PER_S - 2)
+    # Without a record there is nowhere for a line to go, and that is fine.
+    Capture(tmp_path / "flat").log("producer", "nothing")
