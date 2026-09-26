@@ -389,8 +389,11 @@ in inner-canthal units (the `face` constants' `wire.displayRange`), where
 the reading's `channels` are a detector's, 100 at three robust units of
 the baseline minute's own jitter; the reading's `face` object carries the
 same twenty-seven on the display's scale as `wire` from that bundle, so a
-reading agrees with the frames around it, and `present` follows the same
-rule. Nothing else of the reading's `face` object is
+reading agrees with the frames around it. The reading's own `present`
+keeps its rule (the very last row placed): the `hazard` in the reading is
+a model fitted on readings read that way, and its trend windows move when
+a held second fills a gap (2026.09.26-1 held the reading's too, for one
+roll; 2026.09.26-2 restored it). Nothing else of the reading's `face` object is
 in it: no aggregate, clock, region, witness or hazard, and, like every
 message on this socket, no keypoint. The producer treats `body` as opaque
 JSON and sends it to the trainer alone, at the readings' URL with the last
