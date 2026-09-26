@@ -27,9 +27,22 @@ What goes in (analysis/protocol.md names the messages):
     onsets/, events/,  what the analysis decided, as the flat capture has
     payloads/, posts/  always kept them
     telemetry/         the process's counters and gauges, once a second
-    hello.json         what this session was: the hello and ready of the
-                       analysis link, the keypoint layout, the image
-    summary.json       the session's summary when it ends
+    hello.json         what this record is: the lease's terms, the image,
+                       the keypoint layout, each stream's format
+    runs/<start>/      one production run of the session (the trainer opens
+      hello.json       a new /produce when the camera changes: the phone's
+      summary.json     picture first, then a fixed camera, then with the face
+                       inset): the hello and ready of its analysis link, its
+                       sources and views; its summary when it ends
+    summary.json       the record's summary when the lease ends: every
+                       stream's counts, the runs, how it ended
+
+The record is the lease's, not a run's (RecordKeeper): a session's several
+productions write the same streams, so a window has one writer and one
+part, and hello.json and summary.json are written once each. (Before
+2026-09-15 every run opened its own record under the prefix: the second
+run's hello.json, summary.json and its part for the window the first run
+ended in were refused as already there, and lost.)
 
 Everything but the Parquet is gzipped JSONL, one object per line, each
 stamped `wallS` (unix seconds) at the append. Nothing here is a frame or
@@ -534,15 +547,18 @@ def _already_exists(error: Exception) -> bool:
 class Record:
     """A session's streams under its lease's prefix, with their uploader.
 
-    `hello(...)` writes hello.json once the analysis link has answered;
-    the stream methods take rows; `close(summary)` closes every part,
-    writes summary.json and waits, bounded, for the uploads. `flush()` is
-    close() for a SIGTERM: whatever is open leaves now.
+    `hello()` writes hello.json, once; `begin_run(name)` opens a production
+    run and `run_hello(run_id, ...)` writes its runs/<run_id>/hello.json
+    once its analysis link has answered; the stream methods take rows;
+    `end_run(run_id, summary)` writes the run's summary and leaves every
+    part open for the next run; `close(summary)` closes every part, writes
+    summary.json and waits, bounded, for the uploads. `flush()` is close()
+    for a SIGTERM: whatever is open leaves now.
     """
 
     def __init__(self, directory: Path, bucket: str, prefix: str,
                  session_id: str, *, part_s: int = DEFAULT_PART_S,
-                 telemetry=None, clock=time.time, client_factory=None,
+                 telemetry=None, clock=None, client_factory=None,
                  log=print, provenance: dict | None = None):
         self.directory = directory
         self.bucket = bucket
@@ -550,7 +566,10 @@ class Record:
         self.session_id = session_id
         self.part_s = max(1, int(part_s))
         self.telemetry = telemetry
-        self.clock = clock
+        # The wall clock, taken now (not at import) so a test's clock reaches
+        # a record the producer opens for it.
+        self.clock = clock if clock is not None else time.time
+        clock = self.clock
         self.log = log
         self.provenance = dict(provenance or {})
         self.started_wall_s = round(clock(), 3)
@@ -574,6 +593,11 @@ class Record:
             self.streams[name] = stream
             self.keypoints[view] = stream
         self.files: list[str] = []
+        # The production runs this record has seen (begin_run/end_run):
+        # {id, run, startedWallS, endedWallS}, for summary.json.
+        self.runs: list[dict] = []
+        self._runs_lock = threading.Lock()
+        self._hello_written = False
         self.closed = False
         self._closed_result: dict = {}
         self._closing = threading.Lock()
@@ -641,8 +665,14 @@ class Record:
 
     # -- files -------------------------------------------------------------------
 
-    def hello(self, **fields) -> None:
-        """hello.json: what this session was, written once."""
+    def hello(self, **fields) -> bool:
+        """hello.json: what this record is, written once; a second call
+        (the session's next production run) changes nothing and is False.
+        Nothing run-specific belongs here: that is run_hello's."""
+        with self._runs_lock:
+            if self._hello_written or self.closed:
+                return False
+            self._hello_written = True
         body = {
             "sessionId": self.session_id,
             "bucket": self.bucket, "prefix": self.prefix,
@@ -655,13 +685,76 @@ class Record:
                 **{name: {"format": "parquet", "view": view}
                    for view, name in KEYPOINT_STREAMS.items()},
             },
+            "runs": "runs/<start>/hello.json and summary.json, one per production run",
             **fields,
         }
         self._file("hello.json", body)
+        return True
+
+    # -- runs --------------------------------------------------------------------
+
+    def begin_run(self, run_name: str | None = None) -> str:
+        """A production run begins: its id is its start on the wall clock,
+        `20260915T221554Z`, made unique (`-2`, `-3`) should two begin in
+        the same second. The streams are untouched: an open part goes on."""
+        started = round(self.clock(), 3)
+        base = datetime.fromtimestamp(int(started), tz=timezone.utc).strftime(
+            "%Y%m%dT%H%M%SZ")
+        with self._runs_lock:
+            taken = {run["id"] for run in self.runs}
+            run_id, n = base, 1
+            while run_id in taken:
+                n += 1
+                run_id = f"{base}-{n}"
+            self.runs.append({"id": run_id, "run": run_name or None,
+                              "startedWallS": started, "endedWallS": None})
+        return run_id
+
+    def run_hello(self, run_id: str, **fields) -> None:
+        """runs/<run_id>/hello.json: the run as its two processes agreed
+        it (the producer's hello, the analysis's ready, the sources)."""
+        with self._runs_lock:
+            run = dict(self._run(run_id))
+        self._file(f"runs/{run_id}/hello.json", {
+            "sessionId": self.session_id, "runId": run_id,
+            "run": run.get("run"),
+            "startedWallS": run.get("startedWallS"),
+            "producer": self.provenance,
+            **fields,
+        })
+
+    def end_run(self, run_id: str, summary: dict | None = None) -> dict:
+        """The run ends: runs/<run_id>/summary.json carries its summary
+        and the record's counts as they stand; every part stays open for
+        the next run (a window has one writer). What is returned is what
+        the run's own printed summary carries under `record`."""
+        ended = round(self.clock(), 3)
+        with self._runs_lock:
+            run = self._run(run_id)
+            run["endedWallS"] = ended
+        state = {**self.snapshot(), "runId": run_id, "endedWallS": ended,
+                 "closed": False}
+        if summary is not None and not self.closed:
+            self._file(f"runs/{run_id}/summary.json", {
+                **summary, "runId": run_id,
+                "startedWallS": run.get("startedWallS"),
+                "endedWallS": ended,
+                "record": state,
+            })
+        return state
+
+    def _run(self, run_id: str) -> dict:
+        for run in self.runs:
+            if run["id"] == run_id:
+                return run
+        run = {"id": run_id, "run": None, "startedWallS": None, "endedWallS": None}
+        self.runs.append(run)
+        return run
 
     def _file(self, name: str, body: dict) -> None:
         path = self.directory / name
         try:
+            path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(json.dumps(body, indent=2, default=str) + "\n")
         except Exception as error:  # noqa: BLE001 - said, survived
             self._say(f"record: {name} failed: {error!r}")
@@ -702,20 +795,25 @@ class Record:
                     self._say(f"record: telemetry snapshot failed: {error!r}")
 
     def snapshot(self) -> dict:
+        with self._runs_lock:
+            runs = [dict(run) for run in self.runs]
         return {
             "bucket": self.bucket, "prefix": self.prefix,
             "partSeconds": self.part_s,
+            "startedWallS": self.started_wall_s,
             "streams": {name: stream.snapshot()
                         for name, stream in self.streams.items()},
             "files": list(self.files),
+            "runs": runs,
             "upload": self.uploader.snapshot(),
         }
 
     def close(self, summary: dict | None = None,
               timeout_s: float = CLOSE_TIMEOUT_S) -> dict:
-        """Every open part closed and queued, summary.json written, the
-        uploader drained (bounded). Idempotent; the second call returns
-        the first's result."""
+        """The lease's end: every open part closed and queued, summary.json
+        written (the record's counts, its runs, and `summary`'s own
+        fields: `ended` says why), the uploader drained (bounded).
+        Idempotent; the second call returns the first's result."""
         with self._closing:
             if self.closed:
                 return self._closed_result
@@ -731,6 +829,7 @@ class Record:
             drained = self.uploader.close(timeout_s)
             result = self.snapshot()
             result["drained"] = drained
+            result["closed"] = True
             if self.telemetry:
                 self.telemetry.gauge("recordPartsQueued", float(self.uploader.queue.qsize()))
             self._closed_result = result
@@ -740,6 +839,89 @@ class Record:
         """The SIGTERM path: close now with what there is, no summary
         beyond the record's own counts."""
         return self.close({"ended": "flush"}, timeout_s=timeout_s)
+
+
+class RecordKeeper:
+    """The slot's open records, one per lease prefix.
+
+    A session's productions come and go within one lease (the trainer opens
+    a new /produce when the camera changes); the record they write is the
+    lease's, opened by the first of them and closed when the lease ends
+    (`/stop`, `/teardown`, the idle exit, a SIGTERM) or another session's
+    lease replaces it. `open()` hands the same Record to every run under
+    the same bucket and prefix; `close_all()` ends what is open, bounded,
+    and is idempotent.
+    """
+
+    def __init__(self, log=print):
+        self.log = log
+        self._records: dict[tuple[str, str], Record] = {}
+        self._lock = threading.Lock()
+
+    def open(self, bucket: str, prefix: str, factory) -> Record:
+        """The open record for (bucket, prefix), or `factory()`'s, kept."""
+        key = (bucket, prefix.strip("/"))
+        with self._lock:
+            record = self._records.get(key)
+            if record is not None and not record.closed:
+                return record
+            record = factory()
+            self._records[key] = record
+            return record
+
+    def get(self, bucket: str, prefix: str) -> Record | None:
+        with self._lock:
+            return self._records.get((bucket, prefix.strip("/")))
+
+    def open_records(self) -> list[Record]:
+        with self._lock:
+            return [record for record in self._records.values() if not record.closed]
+
+    def close(self, bucket: str, prefix: str, ended: str,
+              timeout_s: float = CLOSE_TIMEOUT_S) -> dict | None:
+        """Close one record, saying why in its summary (`ended`)."""
+        record = self.get(bucket, prefix)
+        if record is None or record.closed:
+            return None
+        return self._close(record, ended, timeout_s)
+
+    def close_all(self, ended: str, timeout_s: float = CLOSE_TIMEOUT_S,
+                  keep: tuple[str, str] | None = None) -> list[dict]:
+        """Close every open record but `keep` (the (bucket, prefix) a new
+        lease names), each bounded by `timeout_s`."""
+        results = []
+        for record in self.open_records():
+            if keep is not None and (record.bucket, record.prefix) == (keep[0], keep[1].strip("/")):
+                continue
+            results.append(self._close(record, ended, timeout_s))
+        with self._lock:
+            for key in [k for k, r in self._records.items() if r.closed]:
+                del self._records[key]
+        return results
+
+    def _close(self, record: Record, ended: str, timeout_s: float) -> dict:
+        try:
+            result = record.close({"ended": ended}, timeout_s=timeout_s)
+        except Exception as error:  # noqa: BLE001 - said aloud
+            self.log(f"record: close of {record.prefix} failed: {error!r}", flush=True)
+            return {"prefix": record.prefix, "error": repr(error)}
+        streams = result.get("streams", {})
+        rows = sum(int(s.get("rows", 0)) for s in streams.values())
+        parts = sum(int(s.get("parts", 0)) for s in streams.values())
+        self.log(f"record: closed {record.prefix} ({ended}): {rows} rows in "
+                 f"{parts} parts, {len(result.get('runs', []))} run(s), "
+                 f"drained={result.get('drained')}", flush=True)
+        return result
+
+    def close_in_background(self, ended: str, timeout_s: float = CLOSE_TIMEOUT_S,
+                            keep: tuple[str, str] | None = None) -> threading.Thread:
+        """close_all on its own thread: for a request handler that must
+        answer now (the trainer's /stop); an exit that follows waits for
+        it, as Record.close is idempotent and blocks on a close under way."""
+        thread = threading.Thread(target=self.close_all, args=(ended, timeout_s, keep),
+                                  daemon=True, name="record-close")
+        thread.start()
+        return thread
 
 
 def keypoint_layout_or_none() -> dict | None:

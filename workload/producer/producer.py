@@ -77,7 +77,7 @@ from external_source import ExternalSource, SourceError  # noqa: E402
 from live_pose import GpuPose, SideloadPose, prefetch_model_store  # noqa: E402
 from motion import DescriptorWorker, RowAssembler  # noqa: E402
 from overlay import build_renderer, parse_renditions  # noqa: E402
-from record import DEFAULT_PART_S, Record  # noqa: E402
+from record import DEFAULT_PART_S, Record, RecordKeeper  # noqa: E402
 from relay_proxy import (RelayProxy, location_secret,  # noqa: E402
                          route as relay_route)
 from sinks import Capture, Poster  # noqa: E402
@@ -846,30 +846,46 @@ def capture_dir(sink_dir: str, run_name: str) -> Path:
     return root / run_name if run_name else root
 
 
-def open_record(args, telemetry: Telemetry) -> Record | None:
+def open_record(args, telemetry: Telemetry,
+                records: "RecordKeeper | None" = None) -> Record | None:
     """The record a leased session writes (record.py), from what the
     /produce handler put on the args (`args.record`: the lease's prefix and
     part length, the slot's bucket, the session id). None without one; a
     record that cannot be opened is said aloud and the session runs
-    without it, counted, rather than not at all."""
+    without it, counted, rather than not at all.
+
+    With `records` (the slot's RecordKeeper) the record is the lease's:
+    the session's next production run under the same prefix gets the same
+    open record, so a window has one writer and hello.json and
+    summary.json are written once. Without one (a test, the flat tools)
+    the record is this run's alone.
+    """
     spec = getattr(args, "record", None)
     if not isinstance(spec, dict) or not spec.get("prefix") or not spec.get("bucket"):
         return None
+    bucket, prefix = str(spec["bucket"]), str(spec["prefix"])
     directory = Path(args.sink_dir) / "record" / str(spec.get("sessionId") or "session")
     provenance = {
         "imageVersion": os.environ.get("TEE_IMAGE_VERSION") or None,
         "imageCommit": os.environ.get("TEE_IMAGE_COMMIT") or None,
         "slot": os.environ.get("SLOT_NAME") or None,
     }
+
+    def make() -> Record:
+        record = Record(directory, bucket, prefix,
+                        str(spec.get("sessionId") or ""),
+                        part_s=int(spec.get("partSeconds") or DEFAULT_PART_S),
+                        telemetry=telemetry, provenance=provenance)
+        record.hello()
+        return record
+
     try:
-        return Record(directory, str(spec["bucket"]), str(spec["prefix"]),
-                      str(spec.get("sessionId") or ""),
-                      part_s=int(spec.get("partSeconds") or DEFAULT_PART_S),
-                      telemetry=telemetry, provenance=provenance)
+        if records is not None:
+            return records.open(bucket, prefix, make)
+        return make()
     except Exception as error:  # noqa: BLE001 - said aloud, counted
         telemetry.count("recordErrors")
-        print(f"record: could not open {spec.get('bucket')}/{spec.get('prefix')}: "
-              f"{error!r}", flush=True)
+        print(f"record: could not open {bucket}/{prefix}: {error!r}", flush=True)
         return None
 
 
@@ -889,9 +905,13 @@ class Session:
     reads the body alone.
     """
 
-    def __init__(self, args, telemetry: Telemetry):
+    def __init__(self, args, telemetry: Telemetry,
+                 records: RecordKeeper | None = None):
         self.args = args
         self.telemetry = telemetry
+        # The slot's open records (record.RecordKeeper), when serving: the
+        # record this run writes is the lease's and outlives the run.
+        self.records = records
         if args.pose == "sideload":
             self.pose = SideloadPose(Path(args.track), telemetry)
             started = time.monotonic()
@@ -932,9 +952,13 @@ class Session:
         # A leased session's record (record.py): the lease named the
         # prefix, the slot's tee-env the bucket; every stream goes there
         # as 30-second parts. Without one the capture is the flat files.
-        self.record = open_record(args, telemetry)
+        # The record is the lease's (open_record, RecordKeeper); this run
+        # is one of its runs, with its own runs/<id>/ files in it.
+        self.record = open_record(args, telemetry, records)
+        self.run_id = (self.record.begin_run(self.run_name or None)
+                       if self.record is not None else None)
         self.capture = Capture(capture_dir(args.sink_dir, self.run_name),
-                               record=self.record)
+                               record=self.record, run_id=self.run_id)
         self.summary: dict | None = None
         # Why run() ended early, if it did not end on its own terms: said
         # over the /produce stream as an `error` event ahead of the summary.
@@ -983,10 +1007,14 @@ class Session:
                 getattr(args, "analysis_socket", "") or "",
                 self._on_analysis, self._on_analysis_error, **hello)
         except Exception as error:
-            # A session that never starts still closes what it opened: the
-            # record says so and its uploader thread goes with it.
+            # A session that never starts still ends its run in the record
+            # (runs/<id>/summary.json says why); the record is the lease's
+            # and closes with it. A run's own record (no keeper) closes.
             if self.record is not None:
-                self.record.close({"error": repr(error)}, timeout_s=5.0)
+                self.record.end_run(self.run_id, {"error": repr(error)})
+                if records is None:
+                    self.record.close({"ended": "error", "error": repr(error)},
+                                      timeout_s=5.0)
             raise
         if self.analysis.connected:
             ready = self.analysis.ready or {}
@@ -994,9 +1022,11 @@ class Session:
                   f"({ready.get('modelVersion', '?')}) on "
                   f"{args.analysis_socket}", flush=True)
         if self.record is not None:
-            # hello.json: the session as the two processes agreed it, the
-            # analysis's versions and constants with it.
-            self.record.hello(
+            # runs/<id>/hello.json: the run as the two processes agreed
+            # it, the analysis's versions and constants with it, the
+            # sources and views of this production.
+            self.record.run_hello(
+                self.run_id,
                 hello={key: value for key, value in hello.items() if key != "run"},
                 ready=(self.analysis.ready if self.analysis.connected else None),
                 sources=self._record_sources())
@@ -1414,11 +1444,16 @@ class Session:
             summary["captureDir"] = str(self.capture.directory)
             if self.overlay is not None:
                 summary["overlay"] = self.overlay.snapshot()
-            # With a record this closes its parts, writes summary.json and
-            # waits (bounded) for the uploads; the summary then carries
-            # what left under `record`.
+            # With a record this ends the run in it (runs/<id>/summary.json)
+            # and the summary carries the record's counts under `record`;
+            # the parts stay open for the session's next run and close
+            # with the lease (RecordKeeper). A run's own record (no
+            # keeper: a test, the flat tools) closes here instead.
             self.capture.summary(summary)
             self.capture.close()
+            if self.record is not None and self.records is None:
+                summary["record"] = self.record.close(
+                    {"ended": "run", **{k: v for k, v in summary.items() if k != "record"}})
             self.summary = summary
         return summary
 
@@ -1735,7 +1770,7 @@ def serve(args, telemetry: Telemetry) -> int:
     if tee is not None or getattr(args, "prewarm", False):
         if server.start_warmup():
             print("prewarm: booting the GPU pose ahead of the first /warmup", flush=True)
-    install_sigterm_flush(server.current)
+    install_sigterm_flush(server.current, records=getattr(server, "records", None))
     print(f"serving on :{server.server_address[1]}", flush=True)
     server.serve_forever()
     return 0
@@ -1745,11 +1780,13 @@ def serve(args, telemetry: Telemetry) -> int:
 SIGTERM_FLUSH_S = 10.0
 
 
-def install_sigterm_flush(current: dict, flush_s: float = SIGTERM_FLUSH_S) -> None:
+def install_sigterm_flush(current: dict, flush_s: float = SIGTERM_FLUSH_S,
+                          records: RecordKeeper | None = None) -> None:
     """A SIGTERM (the VM stopping, the launcher ending the container) with
-    a session running: the session's record flushes what it holds,
-    bounded, before the process exits 0. Without a record the exit is
-    immediate, as before."""
+    a record open: what it holds leaves now, bounded, before the process
+    exits 0 - the running session's record, and with `records` (the
+    slot's keeper) any record a lease left open between runs. Without a
+    record the exit is immediate, as before."""
     def on_sigterm(*_) -> None:
         session = current.get("session")
         if session is not None and getattr(session, "record", None) is not None:
@@ -1759,8 +1796,36 @@ def install_sigterm_flush(current: dict, flush_s: float = SIGTERM_FLUSH_S) -> No
                 session.flush_record(flush_s)
             except Exception as error:  # noqa: BLE001 - exiting anyway
                 print(f"sigterm: record flush failed: {error!r}", flush=True)
+        if records is not None and records.open_records():
+            print(f"sigterm: flushing the lease's record ({flush_s:.0f}s at most)",
+                  flush=True)
+            try:
+                records.close_all("flush", timeout_s=flush_s)
+            except Exception as error:  # noqa: BLE001 - exiting anyway
+                print(f"sigterm: record close failed: {error!r}", flush=True)
         sys.exit(0)
     signal.signal(signal.SIGTERM, on_sigterm)
+
+
+# How long a lease's end (/stop, /teardown, the idle exit) waits for the
+# record's last parts and summary to leave before the slot moves on.
+RECORD_CLOSE_S = 25.0
+
+
+def closing_exit(records: RecordKeeper, exit_impl=os._exit,
+                 close_s: float = RECORD_CLOSE_S):
+    """An exit that first closes what the keeper holds open, bounded: the
+    teardown's and the idle exit's `exit_impl`, so a record whose lease
+    ended without a /stop (an expiry, a drain) still gets its summary."""
+    def exit_(code: int = 0) -> None:
+        try:
+            if records.open_records():
+                print("exit: closing the lease's record first", flush=True)
+            records.close_all("exit", timeout_s=close_s)
+        except Exception as error:  # noqa: BLE001 - exiting anyway
+            print(f"exit: record close failed: {error!r}", flush=True)
+        exit_impl(code)
+    return exit_
 
 
 LEASE_BODY_CAP = 4096
@@ -1801,12 +1866,19 @@ def build_server(args, telemetry: Telemetry,
     # kept for the slot, so it outlives the session it was set in.
     view_prefs: dict = {"mirror": False}
     warmup: dict = {"thread": None, "error": None}
+    # The slot's open session records (record.RecordKeeper): a lease's
+    # record is shared by its production runs and closed when the lease
+    # ends - /stop, /teardown, the idle exit, a SIGTERM (serve()), or a
+    # lease for another session. Every exit closes it first.
+    records = RecordKeeper()
+    exit_impl = closing_exit(records)
     teardown = Teardown(
-        busy, drain_s=getattr(args, "teardown_drain_s", TEARDOWN_DRAIN_S))
+        busy, drain_s=getattr(args, "teardown_drain_s", TEARDOWN_DRAIN_S),
+        exit_impl=exit_impl)
     # TEE only: the slot exits on its own when nobody holds it (the VM then
     # stops); the caller starts it (serve()).
     idle_exit = (IdleExit(teardown, tee.lease, idle_s=tee.config.idle_exit_s,
-                          boot_idle_s=tee.config.boot_idle_s)
+                          boot_idle_s=tee.config.boot_idle_s, exit_impl=exit_impl)
                  if tee is not None else None)
 
     # Instance boot overlaps the two slowest independent costs instead of
@@ -1977,6 +2049,14 @@ def build_server(args, telemetry: Telemetry,
                 teardown.cancel("/lease")
                 print(f"lease: session {answer['sessionId']} until "
                       f"{answer['expiresAt']}", flush=True)
+                # Another session's record left open (a lease that ended
+                # without a /stop) closes now, off this request; the same
+                # session re-leasing (a trainer restart) keeps its own.
+                granted = answer.get("record") or {}
+                keep = ((str(granted.get("bucket") or ""), str(granted.get("prefix") or ""))
+                        if granted.get("prefix") else None)
+                if any((r.bucket, r.prefix) != keep for r in records.open_records()):
+                    records.close_in_background("lease", keep=keep)
                 # A new phone must not inherit the last one's camera; the
                 # same session re-leasing (a trainer restart) keeps it.
                 if (external is not None and external.active
@@ -2381,6 +2461,13 @@ def build_server(args, telemetry: Telemetry,
                     print(f"stop: {body}", flush=True)
                     if tee is not None:
                         tee.lease.clear()
+                        # The lease is over: its record closes (the last
+                        # parts, summary.json) off this request, which the
+                        # trainer is waiting on before its /teardown. A
+                        # session still winding down (`stopping`) closes
+                        # it itself when it ends (the /produce handler).
+                        if body.get("status") == "stopped" and records.open_records():
+                            records.close_in_background("stop")
                 payload = json.dumps(body).encode()
                 self.send_response(code)
                 self.send_header("Content-Type", "application/json")
@@ -2405,6 +2492,10 @@ def build_server(args, telemetry: Telemetry,
                 print(f"teardown: {body}", flush=True)
                 if tee is not None:
                     tee.lease.clear()
+                # The lease's record closes with it, off this request; the
+                # exit that follows (closing_exit) waits for the close.
+                if records.open_records():
+                    records.close_in_background("teardown")
                 if external is not None:
                     external.clear("teardown")
                 if gateway is not None:
@@ -2442,6 +2533,13 @@ def build_server(args, telemetry: Telemetry,
                                        if overlay is not None else None)
                 views = getattr(session, "views", None) if session else None
                 snapshot["views"] = views() if callable(views) else None
+                # The lease's record, open between runs or not: its prefix
+                # is the trainer's opaque ids, never a person.
+                snapshot["records"] = [
+                    {"prefix": r.prefix, "runs": len(r.runs),
+                     "rows": sum(int(s.get("rows", 0)) for s in r.snapshot()["streams"].values()),
+                     "upload": r.uploader.snapshot()}
+                    for r in records.open_records()]
                 if tee is not None:
                     snapshot["tee"] = tee.snapshot()
                     snapshot["tee"]["idleExit"] = idle_exit.snapshot()
@@ -2554,7 +2652,7 @@ def build_server(args, telemetry: Telemetry,
                 keepalive.start()
                 subscription = telemetry.subscribe()
                 try:
-                    session = Session(session_args, telemetry)
+                    session = Session(session_args, telemetry, records=records)
                 except Exception as error:  # noqa: BLE001 - said aloud
                     keepalive.stop()
                     # The 200 and headers are already gone; a boot crash must
@@ -2601,6 +2699,11 @@ def build_server(args, telemetry: Telemetry,
                 current["session"] = None
                 working.__exit__(None, None, None)
                 busy.release()
+                # A run that outlived its lease (a /stop answered
+                # `stopping`, an expiry mid-session): the record is
+                # nobody's now and closes, off this handler's tail.
+                if tee is not None and not tee.lease.active() and records.open_records():
+                    records.close_in_background("stop")
 
     # TEE: loopback only. The container shares the VM's network namespace,
     # so a wildcard bind would put the plain-HTTP control routes on the
@@ -2617,6 +2720,9 @@ def build_server(args, telemetry: Telemetry,
     server.gateway = gateway  # type: ignore[attr-defined]
     # The GPU boot, for serve() to start ahead of the first /warmup.
     server.start_warmup = start_warmup  # type: ignore[attr-defined]
+    # The slot's open session records, for serve()'s SIGTERM flush, tests
+    # and /statz.
+    server.records = records  # type: ignore[attr-defined]
     return server
 
 

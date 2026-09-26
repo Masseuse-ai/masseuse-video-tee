@@ -8,7 +8,11 @@
 #   - google.storage.objects.get to projects 870449385679 and 180376494128
 #     (the Confidential Space images and the GPU driver bucket),
 #   - InstancesService.Insert to project 30229352718 (the launcher's
-#     attestation flow).
+#     attestation flow),
+#   - google.storage.objects.create to the project holding the session
+#     records bucket (capture_bucket_project_number; the enclave writes a
+#     leased session's record there and nothing else, README "Session
+#     records").
 #
 # Access Context Manager policies are organization resources. The project
 # currently has no organization parent (Phase 0: `gcloud organizations
@@ -18,7 +22,8 @@
 # `dry_run` audit logs for a week, then enforce.
 # ---------------------------------------------------------------------------
 locals {
-  vpc_sc_on = var.vpc_sc_enabled && var.access_policy_id != ""
+  vpc_sc_capture_egress = var.capture_bucket != "" && var.capture_bucket_project_number != ""
+  vpc_sc_on             = var.vpc_sc_enabled && var.access_policy_id != ""
 
   vpc_sc_services = [
     "storage.googleapis.com",
@@ -86,6 +91,28 @@ resource "google_access_context_manager_service_perimeter" "tee" {
           }
         }
       }
+
+      # The session record (workload/producer/record.py): the enclave
+      # creates objects in the capture bucket, which lives in the trainer's
+      # project. Create only; nothing in the perimeter reads or deletes
+      # there.
+      dynamic "egress_policies" {
+        for_each = local.vpc_sc_capture_egress ? [1] : []
+        content {
+          egress_from {
+            identity_type = "ANY_IDENTITY"
+          }
+          egress_to {
+            resources = ["projects/${var.capture_bucket_project_number}"]
+            operations {
+              service_name = "storage.googleapis.com"
+              method_selectors {
+                method = "google.storage.objects.create"
+              }
+            }
+          }
+        }
+      }
     }
   }
 
@@ -121,6 +148,28 @@ resource "google_access_context_manager_service_perimeter" "tee" {
             service_name = "compute.googleapis.com"
             method_selectors {
               method = "InstancesService.Insert"
+            }
+          }
+        }
+      }
+
+      # The session record (workload/producer/record.py): the enclave
+      # creates objects in the capture bucket, which lives in the trainer's
+      # project. Create only; nothing in the perimeter reads or deletes
+      # there.
+      dynamic "egress_policies" {
+        for_each = local.vpc_sc_capture_egress ? [1] : []
+        content {
+          egress_from {
+            identity_type = "ANY_IDENTITY"
+          }
+          egress_to {
+            resources = ["projects/${var.capture_bucket_project_number}"]
+            operations {
+              service_name = "storage.googleapis.com"
+              method_selectors {
+                method = "google.storage.objects.create"
+              }
             }
           }
         }

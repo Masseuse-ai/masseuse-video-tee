@@ -172,6 +172,17 @@ variable "capture_bucket" {
   }
 }
 
+variable "capture_bucket_project_number" {
+  description = "The project number holding capture_bucket (the trainer's project), for the VPC Service Controls egress rule that lets the enclave create objects there (vpc-sc.tf). \"\" adds no rule; only needed once the perimeter is enforced."
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = var.capture_bucket_project_number == "" || can(regex("^[0-9]{6,20}$", var.capture_bucket_project_number))
+    error_message = "capture_bucket_project_number must be a project number or empty."
+  }
+}
+
 variable "phone_origins" {
   description = "Page origins the phone signals from (CORS allow-list for the slot's WHIP/WHEP and /attestation, TEE_ALLOWED_ORIGINS). The Cloudflare front door(s); trainer_url is added for the direct-to-Cloud-Run path used during the soak."
   type        = list(string)

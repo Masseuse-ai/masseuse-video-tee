@@ -622,6 +622,80 @@ def test_the_lease_names_the_sessions_record_when_the_slot_has_a_bucket():
         assert slot.tee.lease.record_for() is None
 
 
+def test_the_leases_record_outlives_its_runs_and_closes_with_the_lease(tmp_path):
+    """The record is the lease's (producer/record.py RecordKeeper): open
+    between a session's production runs, listed in /statz, closed by the
+    trainer's /stop once the run has let go, by /teardown, and by a lease
+    for another session - while the same session's re-lease keeps it."""
+    from test_record import BUCKET, PREFIX, FakeGcs  # noqa: PLC0415
+    from record import Record  # noqa: PLC0415
+
+    other = PREFIX.replace("019966a0-0000-7000-8000-000000000002",
+                           "019966a0-0000-7000-8000-000000000003")
+    json_type = {"Content-Type": "application/json"}
+    gcs = FakeGcs()
+
+    def opened(prefix, name):
+        return slot.server.records.open(BUCKET, prefix, lambda: Record(
+            tmp_path / name, BUCKET, prefix, name, client_factory=lambda: gcs))
+
+    def lease(session_id, prefix):
+        _, cap_hash = capability()
+        body = {"sessionId": session_id, "capabilityHash": cap_hash,
+                "record": {"prefix": prefix, "partSeconds": 30}}
+        code, _, _ = slot.as_trainer("POST", "/lease", json.dumps(body).encode(), json_type)
+        assert code == 200
+
+    def settled(predicate, timeout_s=5.0):
+        deadline = time.monotonic() + timeout_s
+        while not predicate():
+            assert time.monotonic() < deadline, "timed out"
+            time.sleep(0.02)
+
+    with Slot() as slot:
+        slot.tee.lease.capture_bucket = BUCKET
+        lease("sess-1", PREFIX)
+        record = opened(PREFIX, "r1")
+        record.append("posts", {"atS": 1.0})
+        code, _, statz = slot.as_trainer("GET", "/statz")
+        listed = json.loads(statz)["records"]
+        assert [r["prefix"] for r in listed] == [PREFIX] and listed[0]["rows"] == 1
+        # The same session leasing again (a trainer restart) keeps it.
+        lease("sess-1", PREFIX)
+        assert record.closed is False and slot.server.records.open_records() == [record]
+        # A /stop that finds nothing running leaves it (the lease stays).
+        slot.server.current["session"] = None
+        assert slot.as_trainer("POST", "/stop")[0] == 404
+        assert record.closed is False
+        # A /stop that ends the run closes it, off the request.
+        slot.server.current["session"] = argparse.Namespace(
+            stopping=threading.Event(), run_name="sess-1", overlay=None)
+        assert slot.as_trainer("POST", "/stop")[0] == 200
+        settled(lambda: record.closed)
+        settled(lambda: f"{PREFIX}/summary.json" in gcs.objects)
+        assert json.loads(gcs.objects[f"{PREFIX}/summary.json"][0])["ended"] == "stop"
+        assert f"{PREFIX}/posts/part-" in "".join(gcs.objects)
+        settled(lambda: slot.server.records.open_records() == [])
+
+        # Another session's lease closes what the last left open.
+        lease("sess-1", PREFIX)
+        second = opened(PREFIX, "r2")
+        lease("sess-2", other)
+        settled(lambda: second.closed)
+        assert json.loads(gcs.objects[f"{PREFIX}/summary.json"][0])["ended"] == "stop", \
+            "the first record's summary is untouched: objects are written once"
+        # (the second record's summary was refused as already there, and
+        # counted: the prefix was reused within one test only.)
+        third = opened(other, "r3")
+        third.append("onsets", {"atS": 2.0})
+        # /teardown closes it with the lease.
+        assert slot.as_trainer("POST", "/teardown?mode=drain")[0] == 200
+        settled(lambda: third.closed)
+        settled(lambda: f"{other}/summary.json" in gcs.objects)
+        assert json.loads(gcs.objects[f"{other}/summary.json"][0])["ended"] == "teardown"
+        settled(lambda: slot.server.records.open_records() == [])
+
+
 def test_an_answer_without_a_fingerprint_is_refused_and_hung_up(monkeypatch):
     with Slot() as slot:
         cap = slot.lease()

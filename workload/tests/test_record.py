@@ -316,17 +316,30 @@ def test_the_record_routes_every_stream_to_parts_under_the_prefix(tmp_path):
     record = Record(tmp_path / "rec", BUCKET, PREFIX, "s1", part_s=30, telemetry=telemetry,
                     clock=clock, client_factory=lambda: gcs,
                     provenance={"imageVersion": "v0.6.0", "imageCommit": "abc", "slot": "tee-0"})
-    record.hello(hello={"fps": 30, "views": ["body", "face"]},
-                 ready={"version": "2026.09.15-1", "vocal": {"x": 1}})
+    assert record.hello() is True
+    assert record.hello() is False, "hello.json is the record's, written once"
     wait_for(lambda: f"{PREFIX}/hello.json" in gcs.objects)
     hello = json.loads(gcs.objects[f"{PREFIX}/hello.json"][0])
     assert hello["sessionId"] == "s1" and hello["bucket"] == BUCKET and hello["partSeconds"] == 30
+    assert hello["startedWallS"] == T0
     assert hello["producer"]["imageVersion"] == "v0.6.0"
     assert hello["keypoints"]["count"] == 308 and hello["keypoints"]["body"]["0"] == "nose"
     assert hello["keypoints"]["face"] == [63, 307] and hello["keypoints"]["leftHand"] == [21, 41]
     assert hello["streams"]["poses"] == {"format": "parquet", "view": "body"}
     assert hello["streams"]["vocal"] == {"format": "jsonl.gz"}
-    assert hello["ready"]["vocal"] == {"x": 1} and hello["hello"]["views"] == ["body", "face"]
+    assert "hello" not in hello and "ready" not in hello, "a run's terms are the run's file"
+    # A production run: its own hello under runs/<start>/, the start being
+    # the record's clock in UTC.
+    run = record.begin_run("estim-s1-20260915T051230Z-a1")
+    assert run == "20260915T051230Z"
+    record.run_hello(run, hello={"fps": 30, "views": ["body", "face"]},
+                     ready={"version": "2026.09.15-1", "vocal": {"x": 1}})
+    wait_for(lambda: f"{PREFIX}/runs/{run}/hello.json" in gcs.objects)
+    run_hello = json.loads(gcs.objects[f"{PREFIX}/runs/{run}/hello.json"][0])
+    assert run_hello["runId"] == run and run_hello["run"] == "estim-s1-20260915T051230Z-a1"
+    assert run_hello["sessionId"] == "s1" and run_hello["startedWallS"] == T0
+    assert run_hello["ready"]["vocal"] == {"x": 1} and run_hello["hello"]["views"] == ["body", "face"]
+    assert run_hello["producer"]["slot"] == "tee-0"
 
     # What the session routes: analysis-bound messages of the kept kinds,
     # the analysis's records, the vocal rows, both views' keypoints.
@@ -362,9 +375,26 @@ def test_the_record_routes_every_stream_to_parts_under_the_prefix(tmp_path):
     record.telemetry_from(Source())
     wait_for(lambda: record.streams["telemetry"].snapshot()["rows"] >= 1, timeout_s=3.0)
 
+    # The run ends: its summary lands under runs/<start>/, the parts stay
+    # open (nothing but hello files in the bucket yet), the record's
+    # counts come back for the run's own printed summary.
+    clock.now = T0 + 20.0
+    state = record.end_run(run, {"counters": {"framesIn": 3}, "bootMs": {"weights": 1.0}})
+    assert state["runId"] == run and state["closed"] is False
+    assert state["streams"]["poses"]["rows"] == 2 and state["streams"]["poses"]["parts"] == 0
+    wait_for(lambda: f"{PREFIX}/runs/{run}/summary.json" in gcs.objects)
+    run_summary = json.loads(gcs.objects[f"{PREFIX}/runs/{run}/summary.json"][0])
+    assert run_summary["counters"] == {"framesIn": 3} and run_summary["bootMs"] == {"weights": 1.0}
+    assert run_summary["runId"] == run
+    assert run_summary["startedWallS"] == T0 and run_summary["endedWallS"] == T0 + 20.0
+    assert run_summary["record"]["streams"]["frames"]["rows"] == 1
+    assert not any(name.startswith(f"{PREFIX}/frames/") for name in gcs.objects), \
+        "the window is still open: its part waits for the next run or the window's end"
+    assert record.append("onsets", {"atS": 9.0}) is True, "the record is still open"
+
     clock.now = T0 + 31.0
-    result = record.close({"counters": {"framesIn": 3}})
-    assert result["drained"] is True
+    result = record.close({"ended": "stop"})
+    assert result["drained"] is True and result["closed"] is True
     names = sorted(gcs.objects)
     part = "part-20260915T051230Z"
     for stream in ("frames", "audio", "segments", "onsets", "events", "payloads", "posts",
@@ -372,6 +402,9 @@ def test_the_record_routes_every_stream_to_parts_under_the_prefix(tmp_path):
         assert f"{PREFIX}/{stream}/{part}.jsonl.gz" in names, stream
     assert f"{PREFIX}/poses/{part}.parquet" in names and f"{PREFIX}/faces/{part}.parquet" in names
     assert f"{PREFIX}/summary.json" in names
+    assert rows_of(gcs, f"{PREFIX}/onsets/{part}.jsonl.gz") == [
+        {"wallS": T0, "atS": 1.5}, {"wallS": T0 + 20.0, "atS": 9.0}], \
+        "a row after the run's end rides in the same part"
     assert rows_of(gcs, f"{PREFIX}/frames/{part}.jsonl.gz") == [
         {"wallS": T0, "frame": 1, "atS": 0.033, "keypoints": {}, "fast": None}]
     assert rows_of(gcs, f"{PREFIX}/segments/{part}.jsonl.gz")[0]["error"] == "no-audio"
@@ -385,16 +418,23 @@ def test_the_record_routes_every_stream_to_parts_under_the_prefix(tmp_path):
     assert faces["view"] == ["face", "face"] and faces["frameW"] == [720, None]
     assert faces["error"] == [None, "error"] and faces["people"] == [0, None]
     summary = json.loads(gcs.objects[f"{PREFIX}/summary.json"][0])
-    assert summary["counters"] == {"framesIn": 3}
+    assert summary["ended"] == "stop" and "counters" not in summary, \
+        "the record's summary is the record's: the run's numbers are the run's file"
     assert summary["record"]["streams"]["poses"]["rows"] == 2
     assert summary["record"]["streams"]["frames"]["rows"] == 1
+    assert summary["record"]["streams"]["onsets"]["rows"] == 2
     assert summary["record"]["endedWallS"] == T0 + 31.0
-    assert summary["record"]["files"] == ["hello.json"]
+    assert summary["record"]["startedWallS"] == T0
+    assert summary["record"]["files"] == ["hello.json", f"runs/{run}/hello.json",
+                                          f"runs/{run}/summary.json"]
+    assert summary["record"]["runs"] == [{"id": run, "run": "estim-s1-20260915T051230Z-a1",
+                                          "startedWallS": T0, "endedWallS": T0 + 20.0}]
     # Idempotent: the second close is the first's answer, nothing new lands.
     count = len(gcs.objects)
     assert record.close({"again": True})["drained"] is True and len(gcs.objects) == count
     assert record.append("onsets", {"atS": 9.0}) is False
-    assert telemetry.snapshot()["counters"]["recordPartsUploaded"] == 13
+    assert record.hello() is False
+    assert telemetry.snapshot()["counters"]["recordPartsUploaded"] == 15
     assert not any(p.is_file() for p in (tmp_path / "rec").rglob("*")), "uploaded parts are gone"
 
 
@@ -416,13 +456,21 @@ def test_a_capture_with_a_record_keeps_no_flat_files_and_routes_to_it(tmp_path):
     summary = {"counters": {}}
     capture.summary(summary)
     capture.close()
-    assert summary["record"]["drained"] is True
+    # The run ended in the record; the record itself is the lease's and
+    # stays open (the keeper closes it), so nothing is drained yet.
+    run = capture.run_id
+    assert run == "20260915T051230Z", "a capture without a run id begins one"
+    assert summary["record"]["runId"] == run and summary["record"]["closed"] is False
     streams = summary["record"]["streams"]
     assert streams["poses"]["rows"] == 1, "the posed row came through the listener, not here"
     assert streams["faces"]["rows"] == 1 and streams["onsets"]["rows"] == 1
     assert streams["events"]["rows"] == 1 and streams["payloads"]["rows"] == 1
     assert streams["posts"]["rows"] == 1 and streams["vocal"]["rows"] == 1
     assert streams["audio"]["rows"] == 1
+    assert record.closed is False
+    wait_for(lambda: f"{PREFIX}/runs/{run}/summary.json" in gcs.objects)
+    assert f"{PREFIX}/summary.json" not in gcs.objects
+    assert record.close({"ended": "stop"})["drained"] is True
     assert f"{PREFIX}/summary.json" in gcs.objects
     assert not (tmp_path / "summary.json").exists()
     # Without a record the flat capture is what it always was.
@@ -525,7 +573,9 @@ def test_a_leased_session_records_both_views_and_every_stream(monkeypatch, tmp_p
     link.on_message({"kind": "onset", "atS": 0.4})
     session.run()
     summary = session.summary
-    assert summary["record"]["drained"] is True
+    # Without a keeper (no serving slot) the run's record is its own and
+    # closes with it, drained.
+    assert summary["record"]["drained"] is True and summary["record"]["closed"] is True
     streams = summary["record"]["streams"]
     posed_body = sorted(i for v, i, _ in pose.steps if v == "body")
     posed_face = sorted(i for v, i, _ in pose.steps if v == "face")
@@ -536,15 +586,24 @@ def test_a_leased_session_records_both_views_and_every_stream(monkeypatch, tmp_p
     frames = [m for m in link.sent if m["kind"] == "frame"]
     assert streams["frames"]["rows"] == len(frames) >= 1
     objects = sorted(gcs.objects)
+    run = session.run_id
     assert f"{PREFIX}/hello.json" in objects and f"{PREFIX}/summary.json" in objects
+    assert f"{PREFIX}/runs/{run}/hello.json" in objects
+    assert f"{PREFIX}/runs/{run}/summary.json" in objects
     hello = json.loads(gcs.objects[f"{PREFIX}/hello.json"][0])
     assert hello["sessionId"] == "sess-1" and hello["producer"]["imageVersion"] == "v0.6.0"
     assert hello["producer"]["slot"] == "tee-slot-0"
-    assert hello["hello"]["views"] == ["body", "face"] and "run" not in hello["hello"]
-    assert hello["ready"]["version"] == "2026.09.15-1"
-    assert hello["sources"]["poses"]["stream"] == BODY_URL
-    assert hello["sources"]["faces"]["stream"] == FACE_URL
     assert hello["streams"]["poses"] == {"format": "parquet", "view": "body"}
+    run_hello = json.loads(gcs.objects[f"{PREFIX}/runs/{run}/hello.json"][0])
+    assert run_hello["hello"]["views"] == ["body", "face"] and "run" not in run_hello["hello"]
+    assert run_hello["ready"]["version"] == "2026.09.15-1"
+    assert run_hello["sources"]["poses"]["stream"] == BODY_URL
+    assert run_hello["sources"]["faces"]["stream"] == FACE_URL
+    run_summary = json.loads(gcs.objects[f"{PREFIX}/runs/{run}/summary.json"][0])
+    assert run_summary["runId"] == run and "bootMs" in run_summary
+    assert run_summary["record"]["streams"]["poses"]["rows"] == len(posed_body)
+    record_summary = json.loads(gcs.objects[f"{PREFIX}/summary.json"][0])
+    assert record_summary["ended"] == "run" and len(record_summary["record"]["runs"]) == 1
     poses = [name for name in objects if name.startswith(f"{PREFIX}/poses/")]
     faces = [name for name in objects if name.startswith(f"{PREFIX}/faces/")]
     assert poses and faces
@@ -580,6 +639,187 @@ def _uploader_init_with(gcs):
         original(self, bucket, prefix, telemetry, client_factory=lambda: gcs, **kwargs)
 
     return __init__
+
+
+def test_a_sessions_production_runs_share_the_leases_record(monkeypatch, tmp_path):
+    """The trainer opens a new /produce when the camera changes (the
+    phone's picture, then a fixed camera: 2026-09-15's first real session
+    had two runs in one lease). Under a keeper both runs write the same
+    record: one hello.json, one part per window even where the runs meet,
+    a runs/<start>/ pair each, and one summary.json when the lease ends -
+    where before the second run's files were refused as already there."""
+    from test_session_views import (BODY_URL, FakeLink, StubDecoder,  # noqa: PLC0415
+                                    StubPose, session_args)
+
+    class FullPose(StubPose):
+        def step(self, rgb, index, at_s, view=None):
+            state = self.view(view)
+            state.frame_size = (int(rgb.shape[1]), int(rgb.shape[0]))
+            xy, sc = keypoints(index)
+            share_full_result(state.taps(), None, index, at_s, xy, sc,
+                              (1.0, 2.0, 11.0, 12.0), 0.8, 1, False)
+            return super().step(rgb, index, at_s, view=view)
+
+    gcs = FakeGcs()
+    pose = FullPose()
+    clock = Clock()
+
+    def open_link(path, on_message, on_error, **fields):
+        link = FakeLink(fields)
+        link.connected = True
+        link.ready = {"protocol": 3, "version": "2026.09.15-1"}
+        link.on_message = on_message
+        return link
+
+    monkeypatch.setattr(producer, "acquire_gpu_pose", lambda args, telemetry: pose)
+    monkeypatch.setattr(producer, "Decoder", StubDecoder)
+    monkeypatch.setattr(producer, "open_link", open_link)
+    monkeypatch.setattr(record_module.Uploader, "__init__", _uploader_init_with(gcs))
+    monkeypatch.setattr(record_module.time, "time", clock)
+    StubDecoder.made = []
+    StubDecoder.scripts = {BODY_URL: [(0, 0.0), (5, 5 / 30)]}
+    StubDecoder.epochs = {BODY_URL: 1_000.0}
+    spec = {"bucket": BUCKET, "prefix": PREFIX, "partSeconds": 30, "sessionId": "sess-1"}
+    keeper = record_module.RecordKeeper(log=lambda *a, **k: None)
+    telemetry = Telemetry()
+
+    def session(run: str):
+        return producer.Session(
+            session_args(tmp_path, record=spec, run=run, face_stream="", audio_stream=""),
+            telemetry, records=keeper)
+
+    first = session("estim-sess-1-a1")
+    first.run()
+    assert first.summary["record"]["closed"] is False, "the record is the lease's"
+    record = first.record
+    assert keeper.open_records() == [record]
+    assert first.run_id == "20260915T051230Z"
+
+    clock.now = T0 + 12.0  # the same window: the phone's picture gave way to the camera
+    second = session("estim-sess-1-a2")
+    assert second.record is record, "the same open record"
+    assert second.run_id == "20260915T051242Z"
+    second.run()
+    assert second.summary["record"]["closed"] is False
+
+    hello_files = [name for name in gcs.objects if name.endswith("/hello.json")]
+    assert sorted(hello_files) == [f"{PREFIX}/hello.json",
+                                   f"{PREFIX}/runs/20260915T051230Z/hello.json",
+                                   f"{PREFIX}/runs/20260915T051242Z/hello.json"]
+    assert f"{PREFIX}/summary.json" not in gcs.objects, "not until the lease ends"
+    assert not any(name.startswith(f"{PREFIX}/poses/") for name in gcs.objects), \
+        "the window both runs wrote is one open part"
+
+    # The lease ends (/stop): the keeper closes the record, and the one
+    # part of the shared window carries both runs' rows.
+    clock.now = T0 + 40.0
+    results = keeper.close_all("stop")
+    assert len(results) == 1 and results[0]["drained"] is True
+    assert keeper.open_records() == []
+    part = f"{PREFIX}/poses/part-20260915T051230Z.parquet"
+    poses = [name for name in gcs.objects if name.startswith(f"{PREFIX}/poses/")]
+    assert poses == [part], poses
+    rows = read_parquet(gcs, part)
+    body_steps = [i for v, i, _ in pose.steps if v == "body"]
+    assert len(rows["frame"]) == len(body_steps) and len(body_steps) >= 2
+    assert min(rows["wallS"]) == T0 and max(rows["wallS"]) == T0 + 12.0
+    summary = json.loads(gcs.objects[f"{PREFIX}/summary.json"][0])
+    assert summary["ended"] == "stop"
+    assert [r["id"] for r in summary["record"]["runs"]] == ["20260915T051230Z", "20260915T051242Z"]
+    assert [r["run"] for r in summary["record"]["runs"]] == ["estim-sess-1-a1", "estim-sess-1-a2"]
+    assert all(r["endedWallS"] is not None for r in summary["record"]["runs"])
+    assert summary["record"]["upload"]["existed"] == 0, "nothing was refused as already there"
+    assert telemetry.snapshot()["counters"].get("recordPartsExisted", 0) == 0
+    # A third run after the lease ended would open a fresh record under
+    # the prefix (a re-lease of the same session); the closed one is gone
+    # from the keeper.
+    reopened = keeper.open(BUCKET, PREFIX, lambda: Record(
+        tmp_path / "rec2", BUCKET, PREFIX, "sess-1", clock=clock, client_factory=lambda: gcs))
+    assert reopened is not record and keeper.open_records() == [reopened]
+    reopened.close()
+
+
+def test_the_keeper_holds_one_record_per_prefix_and_closes_the_rest_on_a_new_lease(tmp_path):
+    gcs = FakeGcs()
+    clock = Clock()
+    said = []
+    keeper = record_module.RecordKeeper(log=lambda text, **k: said.append(text))
+    other = f"{ACCOUNT}/estim_sessions/019966a0-0000-7000-8000-000000000003/enclave"
+
+    def factory(prefix, name):
+        return lambda: Record(tmp_path / name, BUCKET, prefix, name, clock=clock,
+                              client_factory=lambda: gcs)
+
+    a = keeper.open(BUCKET, PREFIX, factory(PREFIX, "a"))
+    assert keeper.open(BUCKET, PREFIX + "/", factory(PREFIX, "a2")) is a, "a trailing slash is the same prefix"
+    b = keeper.open(BUCKET, other, factory(other, "b"))
+    assert b is not a and keeper.get(BUCKET, other) is b
+    assert set(map(id, keeper.open_records())) == {id(a), id(b)}
+    a.append("onsets", {"atS": 1.0})
+    # A lease for the second session: the first's record closes, the
+    # second's is kept; then the same again changes nothing.
+    thread = keeper.close_in_background("lease", keep=(BUCKET, other))
+    thread.join(5.0)
+    assert a.closed is True and b.closed is False
+    assert keeper.open_records() == [b]
+    assert f"{PREFIX}/summary.json" in gcs.objects
+    assert json.loads(gcs.objects[f"{PREFIX}/summary.json"][0])["ended"] == "lease"
+    assert f"{PREFIX}/onsets/part-20260915T051230Z.jsonl.gz" in gcs.objects
+    assert keeper.close_all("lease", keep=(BUCKET, other)) == []
+    assert any("closed" in line and "1 rows in 1 parts" in line for line in said)
+    # The rest: close one by name, an unknown is None, close_all is idempotent.
+    assert keeper.close(BUCKET, "nobody/estim_sessions/x/enclave", "stop") is None
+    assert keeper.close(BUCKET, other, "stop")["closed"] is True
+    assert keeper.close(BUCKET, other, "stop") is None
+    assert keeper.close_all("exit") == [] and keeper.open_records() == []
+    assert json.loads(gcs.objects[f"{other}/summary.json"][0])["ended"] == "stop"
+
+
+def test_the_exits_close_the_leases_record_first(tmp_path):
+    gcs = FakeGcs()
+    clock = Clock()
+    keeper = record_module.RecordKeeper(log=lambda *a, **k: None)
+    record = keeper.open(BUCKET, PREFIX, lambda: Record(
+        tmp_path / "rec", BUCKET, PREFIX, "s", clock=clock, client_factory=lambda: gcs))
+    record.append("posts", {"atS": 1.0})
+    exits = []
+    exit_ = producer.closing_exit(keeper, exit_impl=exits.append, close_s=5.0)
+    exit_(0)
+    assert exits == [0]
+    assert record.closed is True and f"{PREFIX}/summary.json" in gcs.objects
+    assert json.loads(gcs.objects[f"{PREFIX}/summary.json"][0])["ended"] == "exit"
+    assert f"{PREFIX}/posts/part-20260915T051230Z.jsonl.gz" in gcs.objects
+    # Nothing open: the exit is just the exit.
+    exit_(3)
+    assert exits == [0, 3]
+    # The teardown and the idle exit take it as their exit_impl.
+    teardown = producer.Teardown(threading.Lock(), drain_s=0.0, exit_impl=exit_,
+                                 sleep=lambda s: None)
+    keeper.open(BUCKET, PREFIX, lambda: Record(
+        tmp_path / "rec2", BUCKET, PREFIX, "s", clock=clock, client_factory=lambda: gcs))
+    code, body = teardown.request("now")
+    assert code == 200
+    wait_for(lambda: exits == [0, 3, 0])
+    assert keeper.open_records() == []
+
+
+def test_sigterm_flushes_the_leases_record_between_runs(monkeypatch, tmp_path):
+    gcs = FakeGcs()
+    clock = Clock()
+    keeper = record_module.RecordKeeper(log=lambda *a, **k: None)
+    record = keeper.open(BUCKET, PREFIX, lambda: Record(
+        tmp_path / "rec", BUCKET, PREFIX, "s", clock=clock, client_factory=lambda: gcs))
+    record.append("events", {"startS": 1.0, "releaseS": 2.0})
+    installed = {}
+    monkeypatch.setattr(producer.signal, "signal",
+                        lambda signum, handler: installed.update({signum: handler}))
+    producer.install_sigterm_flush({"session": None}, flush_s=3.0, records=keeper)
+    with pytest.raises(SystemExit) as exit_:
+        installed[signal.SIGTERM](signal.SIGTERM, None)
+    assert exit_.value.code == 0
+    assert record.closed is True
+    assert json.loads(gcs.objects[f"{PREFIX}/summary.json"][0])["ended"] == "flush"
+    assert f"{PREFIX}/events/part-20260915T051230Z.jsonl.gz" in gcs.objects
 
 
 def test_a_session_without_a_record_spec_runs_the_flat_capture(tmp_path):

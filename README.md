@@ -225,12 +225,14 @@ What the enclave writes (`workload/producer/record.py`):
 | `vocal/` | The analysis module's vocalization judgements, one row each | gzipped JSONL |
 | `onsets/`, `events/`, `payloads/`, `posts/` | What the analysis decided, and the readings it posted | gzipped JSONL |
 | `telemetry/` | The process's counters and gauges once a second | gzipped JSONL |
-| `hello.json`, `summary.json` | What the session was (the two processes' `hello`/`ready`, the keypoint layout, the image's release stamp) and how it ended | JSON |
+| `hello.json`, `summary.json` | What the record is (the lease's terms, the keypoint layout, the image's release stamp) and how it ended when the lease did, with its production runs | JSON |
+| `runs/<start>/hello.json`, `runs/<start>/summary.json` | One pair per production run of the session (the trainer opens a new one when the camera changes): the two processes' `hello`/`ready`, the run's sources and views, and its summary | JSON |
 
 Every row is stamped with the wall clock at the moment it was written. The
 record has no frame, no audio sample and nothing about the person but the
 numbers above; the account and session identifiers in its path are
-opaque ids the masseuse minted.
+opaque ids the masseuse minted. The layout in full (paths, the grid, each
+column and row, what is not there): `docs/SESSION_RECORD.md`.
 
 How the destination is bound:
 
@@ -279,6 +281,7 @@ report a check that should hold and does not.
 | `build.sh` | The same two image builds, locally, without a push |
 | `VERIFY.md` | How to verify a slot and the source of its image: what identifies the image (signature, release stamp, provenance), the signing key, where the release history lives |
 | `docs/OPERATIONS.md` | Running it: infrastructure, build, boot, the on-demand lifecycle, signing, the sweeper, certificates |
+| `docs/SESSION_RECORD.md` | The session record's layout: paths, the thirty-second grid, the Parquet and JSONL streams column by column, what is not in it |
 
 ## How it runs
 

@@ -32,10 +32,17 @@ from record import Record  # noqa: F401 - the record's type, for callers
 
 
 class Capture:
-    def __init__(self, directory: Path, record: "Record | None" = None):
+    def __init__(self, directory: Path, record: "Record | None" = None,
+                 run_id: str | None = None):
         directory.mkdir(parents=True, exist_ok=True)
         self.directory = directory
+        # The session's record (record.Record) and this run's id in it:
+        # the record is the lease's and outlives this run (RecordKeeper),
+        # so summary() ends the run in it and close() leaves it open.
         self.record = record
+        self.run_id = run_id
+        if record is not None and run_id is None:
+            self.run_id = record.begin_run(None)
         self._files = {} if record is not None else {
             name: open(directory / f"{name}.jsonl", "a", buffering=1)
             for name in ("onsets", "events", "payloads", "posts", "poses")
@@ -104,8 +111,11 @@ class Capture:
             self.record.outbound(message)
 
     def summary(self, summary: dict) -> None:
+        """The run's summary: with a record, runs/<run>/summary.json in it
+        and the record's counts under `record`; the record itself stays
+        open for the session's next run (the lease's end closes it)."""
         if self.record is not None:
-            summary["record"] = self.record.close(summary)
+            summary["record"] = self.record.end_run(self.run_id, summary)
             return
         (self.directory / "summary.json").write_text(
             json.dumps(summary, indent=2) + "\n")
@@ -113,8 +123,6 @@ class Capture:
     def close(self) -> None:
         for handle in self._files.values():
             handle.close()
-        if self.record is not None:
-            self.record.close()
 
     def flush(self, timeout_s: float = 10.0) -> None:
         """A SIGTERM: what the record holds leaves now, bounded."""
