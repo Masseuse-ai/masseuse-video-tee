@@ -41,6 +41,9 @@ STATE_TTL_S = 15.0
 # The one word of the card's own: what it says with nothing current to
 # show (no state yet, or the trainer's pushes older than STATE_TTL_S).
 EMPTY_WORD = "paused"
+# The dash a tile carries for no value (the trainer's HUD model's DASH): a
+# calibrating tile with it, and no word, draws its bar instead.
+EMPTY_VALUE = "\u2014"
 # A tile in this state has no reading behind it and is not drawn.
 SKIPPED_TILE_STATE = "none"
 # The palette: the phone's ink, bone and rose/mint, as RGBA.
@@ -288,10 +291,17 @@ class HudCard:
             draw.text((x0 + 12, y0 + tile_h // 2 - 12), glyph, font=self._fonts["glyph"], fill=colour)
             tx = x0 + 42
             draw.text((tx, y0 + 8), tile["label"].upper(), font=self._fonts["label"], fill=BONE_DIM)
-            if tile["state"] == "calibrating":
+            # A tile still calibrating shows a bar where its value will be,
+            # unless the trainer sent a word for the wait (the clench tile's
+            # `Calibrating`), which is drawn dim in the word font; a tile
+            # that is `ready` for its first number draws its word in the tint.
+            waiting = tile["state"] == "calibrating"
+            if waiting and tile["value"] in ("", EMPTY_VALUE):
                 draw.fill_rect((tx, y0 + 30, tx + 56, y0 + 44), 4, TRACK)
                 continue
-            word = tile["key"] == "posture"
+            if waiting:
+                colour = BONE_DIM
+            word = tile["key"] == "posture" or waiting or tile["state"] == "ready"
             font = self._fonts["word"] if word else self._fonts["value"]
             value_y = y0 + 26 if word else y0 + 22
             draw.text((tx, value_y), tile["value"], font=font, fill=colour)

@@ -91,6 +91,33 @@ def test_the_card_with_nothing_current_reads_paused_and_never_live():
     assert '"live"' not in inspect.getsource(hud_card.HudCard._empty)
 
 
+def _render(clench: dict) -> bytes:
+    card = HudCard()
+    card.set_state({"tiles": [clench, {"key": "posture", "label": "Posture", "value": "Settled", "state": "live"}], "unit": UNIT})
+    return card.render()
+
+
+def test_a_waiting_tile_draws_its_word_when_it_has_one_and_a_bar_when_it_does_not():
+    """The clench tile's first minute (the trainer's HUD model): `Calibrating`
+    dim while the analysis chooses its channel, `Ready` in the tint once it
+    has and waits on the first contraction, then the number; a calibrating
+    tile with the dash for a value (the other tiles' wait) keeps the bar
+    where the value will be."""
+    clench = {"key": "clench", "label": "Clench rate"}
+    bar = _render({**clench, "value": "\u2014", "state": "calibrating"})
+    # The dash and no value draw the same bar: nothing of the dash is written.
+    assert bar == _render({**clench, "value": "", "state": "calibrating"})
+    word = _render({**clench, "value": "Calibrating", "state": "calibrating"})
+    assert word != bar, "the word is drawn where the bar would be"
+    # The dim word is not the live tile's tinted number, nor the tinted word Ready is.
+    ready = _render({**clench, "value": "Ready", "state": "ready"})
+    assert ready != word and ready != bar
+    assert ready != _render({**clench, "value": "Ready", "state": "live"}), "Ready in the word font, not the number's"
+    assert _render({**clench, "value": "Calibrating", "state": "calibrating"}) != _render({**clench, "value": "Calibrating", "state": "ready"}), "dim while calibrating, tinted once ready"
+    # The state travels through the sanitizer as a word of its own.
+    assert sanitize_state({"tiles": [{"key": "clench", "value": "Ready", "state": "ready"}]})["tiles"][0]["state"] == "ready"
+
+
 def test_no_audience_is_drawn_whatever_an_older_trainer_sends():
     with_count = HudCard()
     with_count.set_state({"tiles": TILES, "unit": UNIT, "fans": {"watching": 12, "controlling": 3}})
