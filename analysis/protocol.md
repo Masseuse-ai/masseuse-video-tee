@@ -356,7 +356,13 @@ and the reader adds that. The fields from before are computed as before.
 The reading. The producer treats `body` as opaque JSON: it appends it to the
 session capture (`posts.jsonl`, or the record's `posts/` parts), emits it on
 the session's event stream, and POSTs it to the trainer URL it was started
-with. It carries numbers only. Besides the readings, a leased session's
+with. It carries numbers only. From bundle 2026.09.29-1 the body also
+carries `warmup` once the contraction detector's front end has calibrated
+on its first 45 s of descriptors: `readyAtS`, the stream instant it did,
+and `onsets`, how many contractions it decoded in that span, which it holds
+until its channel is final and never counts into the reading's recent
+onsets; `null` before, and the count may read 0 in the reading that carries
+the instant and fill in the next. Besides the readings, a leased session's
 record (`workload/producer/record.py`, described in the README under
 "Session records") is the other path out of the enclave: the keypoints,
 descriptors, audio measurements and the analysis's rows, written to the
