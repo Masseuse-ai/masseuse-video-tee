@@ -129,10 +129,19 @@ DEFAULT_POSE_FPS = 9.0
 # by ffmpeg as before, timed by arrival.
 STREAM_READER_BIN = os.environ.get("STREAM_READER_BIN", "/app/bin/stream-reader")
 # The record header, little-endian: magic, version, flags, codec,
-# reserved, seq, ntp_ns, rtp_ts, width, height, length.
-RECORD = struct.Struct("<4sBBBBIqIHHI")
+# reserved, seq, ntp_ns, rtp_ts, width, height, length; then the reader's
+# running counts for the connection - RTP packets lost, packets it could
+# not read, units it left out (damaged, or the decoder behind), units the
+# decoder gave no frame for - and the units queued for and inside the
+# decoder as the frame was written; four reserved bytes.
+RECORD = struct.Struct("<4sBBBBIqIHHIIIIIHH4x")
 RECORD_MAGIC = b"MSFR"
-RECORD_VERSION = 1
+RECORD_VERSION = 2
+# The running counts' telemetry counters, in header order, and the depths'
+# gauges; a second view's carry its name in front (`faceReaderPacketsLost`).
+READER_COUNTERS = ("readerPacketsLost", "readerErrors", "readerUnitsDropped",
+                   "readerUnitsSkipped")
+READER_GAUGES = ("readerQueued", "readerPending")
 RECORD_NTP_VALID = 0x01
 RECORD_KEYFRAME = 0x02
 RTP_CLOCK = 90000
@@ -282,6 +291,14 @@ class Decoder:
     arrival-time epoch, or, without the reader, on the ffmpeg cadence as
     before. Two views on `ntp` line up exactly (sync.py); a `file` keeps
     its own count.
+
+    Loss. The reader leaves out a unit that arrived damaged, or that came
+    while its decoder was behind, with every unit after it up to the next
+    whole keyframe, and each record says what it has lost and left out on
+    the connection so far. Those become this view's counters
+    (READER_COUNTERS) and the depths its gauges (READER_GAUGES), named for
+    the view: `view` is "" for the body, or the second view's name
+    ("face", "faceView"), which goes in front.
     """
 
     def __init__(self, url: str, telemetry: Telemetry,
@@ -289,8 +306,10 @@ class Decoder:
                  stopping: threading.Event | None = None,
                  lost_after_s: float = 0.0, clock=time.monotonic,
                  sleep=time.sleep, wait_for_track: bool = False,
-                 reader_bin: str | None = None, wall=time.time):
+                 reader_bin: str | None = None, wall=time.time,
+                 view: str = ""):
         self.url = url
+        self.view = view
         self.telemetry = telemetry
         self.stopping = stopping
         self.lost_after_s = float(lost_after_s or 0.0)
@@ -517,6 +536,13 @@ class Decoder:
             out += more
         return out
 
+    def _view_metric(self, name: str) -> str:
+        """`name` as this view's: the body's as it is, a second view's with
+        the view's name in front (`readerQueued`, `faceReaderQueued`)."""
+        if not self.view:
+            return name
+        return self.view + name[0].upper() + name[1:]
+
     def _frames_from_reader(self):
         """stream-reader's records, laid on the grid by their time."""
         width, height = self.size
@@ -531,6 +557,9 @@ class Decoder:
         rtp_pos = 0
         conn_wall: float | None = None
         conn_timing: str | None = None
+        # This connection's running counts as last reported (a new reader
+        # starts them over).
+        counted = (0,) * len(READER_COUNTERS)
         while True:
             if self._stopped():
                 return
@@ -539,6 +568,7 @@ class Decoder:
                 rtp_first = rtp_prev = None
                 rtp_pos = 0
                 conn_wall = conn_timing = None
+                counted = (0,) * len(READER_COUNTERS)
             header = self._read_exact(RECORD.size)
             if len(header) < RECORD.size:
                 ended, lost_since = self._ended(lost_since)
@@ -546,7 +576,7 @@ class Decoder:
                     return
                 continue
             (magic, version, flags, _codec, _pad, _seq, ntp_ns, rtp_ts,
-             rec_width, rec_height, length) = RECORD.unpack(header)
+             rec_width, rec_height, length, *counts) = RECORD.unpack(header)
             if (magic != RECORD_MAGIC or version != RECORD_VERSION
                     or (rec_width, rec_height) != (width, height)
                     or length != frame_bytes):
@@ -568,6 +598,13 @@ class Decoder:
                     return
                 continue
             lost_since = None
+            totals = tuple(counts[:len(READER_COUNTERS)])
+            for name, total, before in zip(READER_COUNTERS, totals, counted):
+                if total > before:
+                    self.telemetry.count(self._view_metric(name), total - before)
+            counted = totals
+            for name, depth in zip(READER_GAUGES, counts[len(READER_COUNTERS):]):
+                self.telemetry.gauge(self._view_metric(name), depth)
             now = self.wall()
             # This connection's timing, decided on its first frame.
             if conn_timing is None:
@@ -1441,7 +1478,7 @@ class Session:
             self.face_decoder = Decoder(
                 self.face_stream, self.telemetry,
                 realtime=self.args.pose == "gpu", stopping=self.stopping,
-                wait_for_track=True)
+                wait_for_track=True, view="face")
             face_worker = PoseWorker(
                 self.pose, None, self.assembler_lock, self.telemetry,
                 on_row=self.capture.face_pose,
@@ -1457,7 +1494,7 @@ class Session:
             self.face_view_decoder = Decoder(
                 self.face_view_stream, self.telemetry,
                 realtime=self.args.pose == "gpu", stopping=self.stopping,
-                wait_for_track=True)
+                wait_for_track=True, view="faceView")
             face_view_thread = threading.Thread(
                 target=self._face_view_loop, args=(self.face_view_decoder,),
                 daemon=True)

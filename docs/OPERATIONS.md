@@ -108,6 +108,27 @@ nine a second while they climb. A frozen picture (a paused camera) shows
 as the deferred counters stopping while the submitted ones go on: the
 cadence is kept with repeats after one slot's wait.
 
+The reader never decodes a frame whose reference is missing. A unit that
+arrived damaged (an RTP packet of it missing, or one it could not
+depacketize), or that comes while ffmpeg is more than a second behind the
+stream (`stream-reader -queue`), is left out with every unit after it up
+to the next whole keyframe (`workload/reader/gate`); what was already
+queued is still decoded. A stall therefore costs frames - repeats on the
+grid, or a `frameGap` - and never hands the keypoint models or the view a
+smeared picture. Every record says what the reader has lost and left out
+on its connection so far, and the producer keeps it per view:
+`readerPacketsLost`, `readerErrors` (packets it could not read or
+depacketize), `readerUnitsDropped` and `readerUnitsSkipped` (units ffmpeg
+gave no frame for) in the counters, `readerQueued` and `readerPending`
+(units waiting for ffmpeg and inside it) in the gauges, each with `face`
+in front for the phone's view beside a fixed camera and `faceView` for the
+connector's front-facing camera. On a clean stream the counters stay
+absent and the gauges near zero. `stream-reader -threads N` decodes N
+frames at once, for a stream too heavy for one thread, each thread past
+the first holding the picture a frame longer; the producer passes none,
+so every view decodes on one thread with each frame out as soon as it can
+be.
+
 The view returned to the phone is published in four renditions by one encoder
 process (`--overlay-renditions hi,half,small,lean` in `tee/entrypoint.sh`;
 `workload/producer/overlay.py`, `RENDITIONS`): `hi` is the canvas at 30
@@ -698,10 +719,12 @@ deployment's own pin is the digest, in this repository's `terraform.tfvars`:
    `provenance.source` its commit.
 4. Carry a session end to end from a phone; the trainer's diagnostics show
    the release beside the digest.
-5. Append the validation to the Release body (what changed, when
-   `tee-verify` passed, the session), through the release identity that
-   writes this repository. The Release, not this tree, is where a digest
-   is written down.
+5. Record the validation (when `tee-verify` passed, the session) in the
+   trainer's test plan (`masseuse-trainer`, `TEST_PLAN.md`). The Release
+   keeps what the workflow wrote and, above it, a `## Changes` of a
+   sentence or two on what changed, written through the release identity
+   that writes this repository. The Release, not this tree, is where a
+   digest is written down.
 6. Drop the previous digest from `candidate_image_digests` once no slot
    runs it. When the previous release was the last unstamped one, or when a
    release must not be booted again, move the trainer's `min_release` up

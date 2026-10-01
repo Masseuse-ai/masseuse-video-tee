@@ -17,6 +17,8 @@ import (
 	"github.com/bluenviron/gortsplib/v5/pkg/base"
 	"github.com/bluenviron/gortsplib/v5/pkg/description"
 	"github.com/bluenviron/gortsplib/v5/pkg/format"
+	"github.com/bluenviron/gortsplib/v5/pkg/format/rtph264"
+	"github.com/bluenviron/gortsplib/v5/pkg/format/rtph265"
 	"github.com/bluenviron/mediacommon/v2/pkg/codecs/h264"
 	"github.com/bluenviron/mediacommon/v2/pkg/codecs/h265"
 	"github.com/pion/rtp"
@@ -61,6 +63,22 @@ type AccessUnit struct {
 	NTPValid bool
 	// Keyframe is whether the unit is a random-access point.
 	Keyframe bool
+	// Damaged is whether a packet of the unit, or of a unit lost whole just
+	// before it, never arrived or could not be depacketized: what a decoder
+	// makes of it, and of every unit that refers to it, has pieces missing.
+	Damaged bool
+}
+
+// Stats counts what went wrong on the connection, from its first keyframe
+// on: joining a stream between keyframes is not a fault.
+type Stats struct {
+	// PacketsLost is how many RTP packets never arrived: the gaps in their
+	// sequence numbers.
+	PacketsLost uint64
+	// Errors is how many packets could not be read or depacketized.
+	Errors uint64
+	// Damaged is how many units went out marked Damaged.
+	Damaged uint64
 }
 
 // Default limits.
@@ -112,6 +130,12 @@ type Source struct {
 	since   time.Time
 	emit    func(*AccessUnit) error
 	err     error
+	// Damage since the last unit went out: lossPending is a gap the client
+	// reported ahead of the packet after it, damaged whether the unit being
+	// assembled has lost a piece.
+	lossPending bool
+	damaged     bool
+	stats       Stats
 }
 
 // Open connects to rawURL, describes the stream and sets up its first
@@ -131,17 +155,20 @@ func Open(ctx context.Context, rawURL string, opts Options) (*Source, error) {
 		opts.Logf = func(string, ...any) {}
 	}
 	tcp := gortsplib.ProtocolTCP
+	s := &Source{opts: opts}
 	c := &gortsplib.Client{
-		Scheme:      u.Scheme,
-		Host:        u.Host,
-		Protocol:    &tcp,
-		ReadTimeout: opts.ReadTimeout,
-		DialContext: opts.Dial,
+		Scheme:        u.Scheme,
+		Host:          u.Host,
+		Protocol:      &tcp,
+		ReadTimeout:   opts.ReadTimeout,
+		DialContext:   opts.Dial,
+		OnPacketsLost: s.onPacketsLost,
+		OnDecodeError: s.onDecodeError,
 	}
 	if err := c.Start(); err != nil {
 		return nil, fmt.Errorf("source: %w", err)
 	}
-	s := &Source{c: c, opts: opts}
+	s.c = c
 	if err := s.setup(ctx, u); err != nil {
 		c.Close()
 		return nil, err
@@ -230,9 +257,11 @@ func (s *Source) Size() (width, height int) {
 // Run plays the track and hands every access unit to emit, in order, until
 // the connection ends, ctx is done, or emit returns an error - which Run
 // then returns. Units before the first keyframe are dropped: nothing can
-// decode them. Units are held back while the sender's time is unknown (see
-// HoldForNTP) and released timed once it is known, so that the first unit
-// out already carries the sender's clock when the sender reports promptly.
+// decode them. A unit that lost a piece on the way goes out marked Damaged,
+// for the caller to leave out with what refers to it (see Stats). Units are
+// held back while the sender's time is unknown (see HoldForNTP) and released
+// timed once it is known, so that the first unit out already carries the
+// sender's clock when the sender reports promptly.
 func (s *Source) Run(ctx context.Context, emit func(*AccessUnit) error) error {
 	s.mu.Lock()
 	s.emit = emit
@@ -276,16 +305,37 @@ func (s *Source) onPacket(pkt *rtp.Packet) {
 		return // before the first packet whose timestamp is trustworthy
 	}
 	nalus, err := s.decode(pkt)
-	if err != nil {
-		// More packets needed, or a fragment whose start was lost.
-		return
-	}
-	keyframe := s.isKeyframe(nalus)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.err != nil {
 		return
 	}
+	loss := s.lossPending
+	s.lossPending = false
+	if s.started {
+		if err != nil && !normalDecodeError(err) {
+			// A fragment whose neighbour was lost, a unit past the
+			// depacketizer's limits: the unit is missing a piece.
+			s.stats.Errors++
+			if s.stats.Errors == 1 {
+				s.opts.Logf("source: %v; further errors are counted, not logged", err)
+			}
+			s.damaged = true
+		}
+		if loss {
+			s.damaged = true
+		}
+	}
+	if err != nil {
+		return // more packets needed, or a piece of the unit is gone
+	}
+	// A unit is out. With the marker set this packet was its last and the
+	// next unit starts whole; without one (a sender that splits units by
+	// timestamp alone) the unit ended at the previous packet and this one
+	// opened the next, which a loss just before it may have reached too.
+	damaged := s.damaged
+	s.damaged = loss && !pkt.Marker
+	keyframe := s.isKeyframe(nalus)
 	if !s.started {
 		if !keyframe {
 			return
@@ -295,8 +345,11 @@ func (s *Source) onPacket(pkt *rtp.Packet) {
 	if keyframe && len(s.params) > 0 && !s.hasParams(nalus) {
 		nalus = append(append([][]byte{}, s.params...), nalus...)
 	}
-	au := &AccessUnit{Seq: s.seq, NALUs: nalus, PTS: pts, RTPTs: pkt.Timestamp, Keyframe: keyframe}
+	au := &AccessUnit{Seq: s.seq, NALUs: nalus, PTS: pts, RTPTs: pkt.Timestamp, Keyframe: keyframe, Damaged: damaged}
 	s.seq++
+	if damaged {
+		s.stats.Damaged++
+	}
 	au.NTP, au.NTPValid = s.c.PacketNTP(s.medi, pkt)
 	if !au.NTPValid {
 		au.NTP = time.Time{}
@@ -333,6 +386,53 @@ func (s *Source) onPacket(pkt *rtp.Packet) {
 		s.deliver(h)
 	}
 	s.held = nil
+}
+
+// onPacketsLost is the client's report of a gap in the sequence numbers,
+// made just before it hands over the packet after the gap.
+func (s *Source) onPacketsLost(lost uint64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.started {
+		return
+	}
+	if s.stats.PacketsLost == 0 {
+		s.opts.Logf("source: RTP packets lost: %d; further losses are counted, not logged", lost)
+	}
+	s.stats.PacketsLost += lost
+	s.lossPending = true
+}
+
+// onDecodeError is the client's report of a packet it could not read. It
+// hands that packet over to no one, so a media packet's absence comes back
+// as a gap with the packet after it.
+func (s *Source) onDecodeError(err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.started {
+		return
+	}
+	s.stats.Errors++
+	if s.stats.Errors == 1 {
+		s.opts.Logf("source: %v; further errors are counted, not logged", err)
+	}
+}
+
+// normalDecodeError reports whether a depacketizer error is part of reading
+// a stream rather than a piece of it gone missing: a unit not complete yet,
+// or a stream joined in the middle of a fragmented unit.
+func normalDecodeError(err error) bool {
+	return errors.Is(err, rtph264.ErrMorePacketsNeeded) ||
+		errors.Is(err, rtph264.ErrNonStartingPacketAndNoPrevious) ||
+		errors.Is(err, rtph265.ErrMorePacketsNeeded) ||
+		errors.Is(err, rtph265.ErrNonStartingPacketAndNoPrevious)
+}
+
+// Stats is a snapshot of what went wrong so far.
+func (s *Source) Stats() Stats {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.stats
 }
 
 // deliver hands au to emit; the first error stops the source. Caller holds
