@@ -59,11 +59,19 @@ type Options struct {
 	Stderr io.Writer
 	// LogLevel is ffmpeg's -loglevel; "" means "error".
 	LogLevel string
+	// Threads is how many frames ffmpeg decodes at once. Each thread past
+	// the first holds a frame, so it adds a frame of delay; 0 or 1 is one
+	// thread, every frame out as soon as it can be.
+	Threads int
+	// Annotate, when set, adds to each record's header before it is
+	// written: the counts the decoder does not keep itself.
+	Annotate func(*record.Header)
 }
 
-// Stats counts what happened to the units and frames.
+// Stats counts what happened to the units and frames. Skipped is the units
+// ffmpeg gave no frame for (the header's skipped).
 type Stats struct {
-	Units, Frames, Unpaired, Dropped uint64
+	Units, Frames, Unpaired, Skipped uint64
 }
 
 // Decoder is one ffmpeg child and the pairing around it.
@@ -144,19 +152,7 @@ func New(ctx context.Context, out io.Writer, opts Options) (*Decoder, error) {
 		"pad=%d:%d:-1:-1,metadata=mode=add:key=r:value=1,"+
 		"metadata=mode=print:file=pipe\\\\:3:direct=1",
 		opts.Width, opts.Height, opts.Width, opts.Height)
-	// The probe ends with the second unit (`-analyzeduration 1`: 0 would
-	// mean the default five seconds); the first, a keyframe carrying its
-	// parameter sets, told ffmpeg what it needs, and the probe's packets
-	// are replayed, so nothing is lost to it (`-fflags nobuffer` would
-	// discard them). One decoding thread: frame threads each add a frame
-	// of delay.
-	d.cmd = exec.CommandContext(ctx, opts.FFmpeg,
-		"-nostdin", "-hide_banner", "-loglevel", opts.LogLevel,
-		"-flags", "low_delay", "-threads", "1",
-		"-analyzeduration", "1", "-probesize", "65536",
-		"-f", "mpegts", "-i", "pipe:0",
-		"-copyts", "-vf", filters, "-fps_mode", "passthrough",
-		"-f", "rawvideo", "-pix_fmt", "yuv420p", "-flush_packets", "1", "pipe:1")
+	d.cmd = exec.CommandContext(ctx, opts.FFmpeg, opts.args(filters)...)
 	d.cmd.Stderr = opts.Stderr
 	d.cmd.ExtraFiles = []*os.File{metaW}
 	stdin, err := d.cmd.StdinPipe()
@@ -188,6 +184,26 @@ func New(ctx context.Context, out io.Writer, opts Options) (*Decoder, error) {
 	return d, nil
 }
 
+// args is ffmpeg's command line. The probe ends with the second unit
+// (`-analyzeduration 1`: 0 would mean the default five seconds); the first,
+// a keyframe carrying its parameter sets, told ffmpeg what it needs, and the
+// probe's packets are replayed, so nothing is lost to it (`-fflags nobuffer`
+// would discard them). One decoding thread unless Threads says more: frame
+// threads each add a frame of delay, and libavcodec runs them only without
+// low_delay.
+func (o Options) args(filters string) []string {
+	threads := []string{"-flags", "low_delay", "-threads", "1"}
+	if o.Threads > 1 {
+		threads = []string{"-threads", strconv.Itoa(o.Threads), "-thread_type", "frame"}
+	}
+	args := append([]string{"-nostdin", "-hide_banner", "-loglevel", o.LogLevel}, threads...)
+	return append(args,
+		"-analyzeduration", "1", "-probesize", "65536",
+		"-f", "mpegts", "-i", "pipe:0",
+		"-copyts", "-vf", filters, "-fps_mode", "passthrough",
+		"-f", "rawvideo", "-pix_fmt", "yuv420p", "-flush_packets", "1", "pipe:1")
+}
+
 // Push hands a unit to ffmpeg.
 func (d *Decoder) Push(au *source.AccessUnit) error {
 	select {
@@ -210,7 +226,7 @@ func (d *Decoder) Push(au *source.AccessUnit) error {
 	d.stats.Units++
 	d.pending = append(d.pending, &pendingUnit{au: au, pts: pts})
 	if len(d.pending) > PendingCap {
-		d.stats.Dropped += uint64(len(d.pending) - PendingCap)
+		d.stats.Skipped += uint64(len(d.pending) - PendingCap)
 		d.pending = d.pending[len(d.pending)-PendingCap:]
 	}
 	d.mu.Unlock()
@@ -316,6 +332,7 @@ func (d *Decoder) readFrames(r io.Reader) {
 				h.Flags |= record.FlagKeyframe
 			}
 		}
+		d.annotate(&h)
 		h.Marshal(buf[:record.Size])
 		if au != nil {
 			if _, err := d.out.Write(buf); err != nil {
@@ -337,7 +354,7 @@ func (d *Decoder) pair(pts int64) *source.AccessUnit {
 	defer d.mu.Unlock()
 	for i, p := range d.pending {
 		if p.pts == pts {
-			d.stats.Dropped += uint64(i)
+			d.stats.Skipped += uint64(i)
 			d.pending = append(d.pending[:0], d.pending[i+1:]...)
 			return p.au
 		}
@@ -349,6 +366,18 @@ func (d *Decoder) pair(pts int64) *source.AccessUnit {
 	p := d.pending[0]
 	d.pending = append(d.pending[:0], d.pending[1:]...)
 	return p.au
+}
+
+// annotate adds the counts to a record's header: the decoder's own, then
+// the caller's (Options.Annotate).
+func (d *Decoder) annotate(h *record.Header) {
+	d.mu.Lock()
+	h.Skipped = record.Count32(d.stats.Skipped)
+	h.Pending = record.Count16(len(d.pending))
+	d.mu.Unlock()
+	if d.opts.Annotate != nil {
+		d.opts.Annotate(h)
+	}
 }
 
 func (d *Decoder) fail(err error) {

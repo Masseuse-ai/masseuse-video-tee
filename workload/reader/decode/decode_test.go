@@ -3,6 +3,9 @@ package decode
 import (
 	"bytes"
 	"context"
+	"fmt"
+	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -40,13 +43,21 @@ func records(t *testing.T, out []byte, width, height int) []record.Header {
 }
 
 func TestEveryUnitComesBackAsItsOwnFrame(t *testing.T) {
+	for _, threads := range []int{1, 2} {
+		t.Run(fmt.Sprintf("threads=%d", threads), func(t *testing.T) { everyUnitComesBack(t, threads) })
+	}
+}
+
+func everyUnitComesBack(t *testing.T, threads int) {
 	ffmpeg := testmedia.FFmpeg(t)
 	units := testmedia.H264Units(t, 45, 15)
 	var out bytes.Buffer
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
+	// The caller's counts ride on every header beside the decoder's own.
+	annotate := func(h *record.Header) { h.Lost, h.Dropped, h.Queued = 7, 5, 3 }
 	dec, err := New(ctx, &out, Options{FFmpeg: ffmpeg, Width: 160, Height: 120, Codec: source.H264,
-		Logf: t.Logf})
+		Logf: t.Logf, Threads: threads, Annotate: annotate})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -88,9 +99,18 @@ func TestEveryUnitComesBackAsItsOwnFrame(t *testing.T) {
 		if i >= 3 && h.NTPNs != base.Add(time.Duration(i)*time.Second/30).UnixNano() {
 			t.Fatalf("record %d ntp %d", i, h.NTPNs)
 		}
+		if h.Lost != 7 || h.Dropped != 5 || h.Queued != 3 || h.Errors != 0 || h.Skipped != 0 {
+			t.Fatalf("record %d counts %+v", i, h)
+		}
+		if int(h.Pending) > len(units)-i-1 {
+			t.Fatalf("record %d: %d units pending with %d to come", i, h.Pending, len(units)-i-1)
+		}
+	}
+	if last := headers[len(headers)-1]; last.Pending != 0 {
+		t.Fatalf("the last record says %d units pending", last.Pending)
 	}
 	st := dec.Stats()
-	if st.Units != 45 || st.Frames != 45 || st.Unpaired != 0 || st.Dropped != 0 {
+	if st.Units != 45 || st.Frames != 45 || st.Unpaired != 0 || st.Skipped != 0 {
 		t.Fatalf("stats %+v", st)
 	}
 }
@@ -104,16 +124,24 @@ func TestEveryUnitComesBackAsItsOwnFrame(t *testing.T) {
 const PipelineDelay = 3
 
 func TestFramesArriveAsUnitsArePushed(t *testing.T) {
+	for _, threads := range []int{1, 2} {
+		t.Run(fmt.Sprintf("threads=%d", threads), func(t *testing.T) { framesArriveAsPushed(t, threads) })
+	}
+}
+
+func framesArriveAsPushed(t *testing.T, threads int) {
 	// Live use: units come one at a time, a frame apart, and frames must
 	// keep up rather than gather in a buffer. With the last unit pushed
-	// and nothing flushed, every frame but the last PipelineDelay is out;
-	// the flush brings those.
+	// and nothing flushed, every frame but the last PipelineDelay is out,
+	// and one more for each decoding thread past the first; the flush
+	// brings those.
 	ffmpeg := testmedia.FFmpeg(t)
 	units := testmedia.H264Units(t, 30, 10)
 	r, w := newPipe()
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	dec, err := New(ctx, w, Options{FFmpeg: ffmpeg, Width: 160, Height: 120, Codec: source.H264, Logf: t.Logf})
+	dec, err := New(ctx, w, Options{FFmpeg: ffmpeg, Width: 160, Height: 120, Codec: source.H264, Logf: t.Logf,
+		Threads: threads})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -129,7 +157,7 @@ func TestFramesArriveAsUnitsArePushed(t *testing.T) {
 	}
 	var got []uint32
 	deadline := time.After(2 * time.Second)
-	for len(got) < len(units)-PipelineDelay {
+	for len(got) < len(units)-PipelineDelay-(threads-1) {
 		select {
 		case rec := <-recs:
 			h, err := record.Unmarshal(rec)
@@ -217,8 +245,34 @@ func TestAPictureThatTurnsKeepsItsFramesComing(t *testing.T) {
 			t.Fatalf("frames out of order or mispaired: %v", got)
 		}
 	}
-	if st := dec.Stats(); st.Unpaired != 0 || st.Dropped != 0 {
+	if st := dec.Stats(); st.Unpaired != 0 || st.Skipped != 0 {
 		t.Fatalf("stats %+v", st)
+	}
+}
+
+func TestThreadsChangeOnlyTheThreadingArguments(t *testing.T) {
+	one := Options{LogLevel: "error"}.args("F")
+	if !slices.Equal(one, Options{LogLevel: "error", Threads: 1}.args("F")) {
+		t.Fatalf("zero and one thread differ: %v", one)
+	}
+	at := slices.Index(one, "-flags")
+	if at < 0 || !slices.Equal(one[at:at+4], []string{"-flags", "low_delay", "-threads", "1"}) {
+		t.Fatalf("one thread: %v", one)
+	}
+	two := Options{LogLevel: "error", Threads: 2}.args("F")
+	if slices.Contains(two, "low_delay") {
+		t.Fatalf("frame threads with low_delay, which turns them off: %v", two)
+	}
+	at2 := slices.Index(two, "-threads")
+	if at2 != at || !slices.Equal(two[at2:at2+4], []string{"-threads", "2", "-thread_type", "frame"}) {
+		t.Fatalf("two threads: %v", two)
+	}
+	// Everything else is the same command.
+	cut := func(args []string, at int) string {
+		return strings.Join(slices.Delete(slices.Clone(args), at, at+4), " ")
+	}
+	if a, b := cut(one, at), cut(two, at2); a != b {
+		t.Fatalf("%q\n%q", a, b)
 	}
 }
 
@@ -245,8 +299,8 @@ func TestPairingDropsWhatTheDecoderSkipped(t *testing.T) {
 	if au := d.pair(6000); au == nil || au.Seq != 2 {
 		t.Fatalf("paired %+v", au)
 	}
-	if d.stats.Dropped != 2 || len(d.pending) != 2 {
-		t.Fatalf("dropped %d, pending %d", d.stats.Dropped, len(d.pending))
+	if d.stats.Skipped != 2 || len(d.pending) != 2 {
+		t.Fatalf("skipped %d, pending %d", d.stats.Skipped, len(d.pending))
 	}
 	// An unknown timestamp takes the oldest pending unit and is counted.
 	if au := d.pair(99); au == nil || au.Seq != 3 || d.stats.Unpaired != 1 {

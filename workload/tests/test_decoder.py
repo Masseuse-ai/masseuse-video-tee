@@ -414,16 +414,21 @@ T0 = 1_757_500_000.0  # a sender's clock, unix seconds
 RTP0 = 4_000_000_000  # an RTP timestamp near the top of its range
 
 
-def _record(*, seq=0, ntp_s=None, rtp=RTP0, keyframe=False):
+def _record(*, seq=0, ntp_s=None, rtp=RTP0, keyframe=False,
+            counts=(0, 0, 0, 0), depths=(0, 0), version=None):
     """One record as stream-reader writes it, in the two reads the decoder
     makes of it: the header, then the frame. `ntp_s` None leaves the
-    sender's time out (the flag clear)."""
-    from producer import RECORD, RECORD_KEYFRAME, RECORD_MAGIC, RECORD_NTP_VALID
+    sender's time out (the flag clear). `counts` are the reader's running
+    counts (packets lost, errors, units left out, units skipped), `depths`
+    the units queued for and inside its decoder."""
+    from producer import (RECORD, RECORD_KEYFRAME, RECORD_MAGIC,
+                          RECORD_NTP_VALID, RECORD_VERSION)
     flags = (RECORD_NTP_VALID if ntp_s is not None else 0) | (
         RECORD_KEYFRAME if keyframe else 0)
-    header = RECORD.pack(RECORD_MAGIC, 1, flags, 1, 0, seq,
+    header = RECORD.pack(RECORD_MAGIC, RECORD_VERSION if version is None else version,
+                         flags, 1, 0, seq,
                          int(round((ntp_s or 0.0) * 1e9)), rtp & 0xFFFFFFFF,
-                         WIDTH, HEIGHT, len(FRAME))
+                         WIDTH, HEIGHT, len(FRAME), *counts, *depths)
     return [header, FRAME]
 
 
@@ -432,7 +437,7 @@ def _frame_of(k):
     return bytes([k] * (WIDTH * HEIGHT * 3 // 2))
 
 
-def _reader_decoder(spawns, *, stopping=None, wall_start=T0 + 0.3):
+def _reader_decoder(spawns, *, stopping=None, wall_start=T0 + 0.3, view=""):
     """A Decoder reading records through a stub stream-reader. The host's
     clock starts 300 ms after the sender's first frame: a real path's
     latency, well within CLOCK_SKEW_MAX_S."""
@@ -441,7 +446,7 @@ def _reader_decoder(spawns, *, stopping=None, wall_start=T0 + 0.3):
     wall.now = wall_start
     decoder = Decoder("rtsp://127.0.0.1:8554/cam", Telemetry(),
                       stopping=stopping, clock=clock, sleep=clock.sleep,
-                      reader_bin=sys.executable, wall=wall)
+                      reader_bin=sys.executable, wall=wall, view=view)
     assert decoder.use_reader and decoder.timing == "ntp"
     decoder.size = (WIDTH, HEIGHT)
     queue = [list(reads) for reads in spawns]
@@ -456,11 +461,12 @@ def _reader_decoder(spawns, *, stopping=None, wall_start=T0 + 0.3):
 
 
 def _records(*specs):
-    """Reads for a spawn: one record per (seq, ntp_s, rtp) spec, its frame
-    bytes naming its seq."""
+    """Reads for a spawn: one record per (seq, ntp_s, rtp[, counts[,
+    depths]]) spec, its frame bytes naming its seq."""
     reads = []
-    for seq, ntp_s, rtp in specs:
-        header, _frame = _record(seq=seq, ntp_s=ntp_s, rtp=rtp)
+    for seq, ntp_s, rtp, *rest in specs:
+        header, _frame = _record(seq=seq, ntp_s=ntp_s, rtp=rtp,
+                                 **dict(zip(("counts", "depths"), rest)))
         reads += [header, _frame_of(seq)]
     return reads
 
@@ -485,8 +491,14 @@ def test_reader_records_are_laid_on_the_grid_by_the_senders_time():
     assert out == [(0, 0.0, 0), (1, round(1 / 30, 4), 1), (2, round(2 / 30, 4), 2)]
     assert decoder.timing == "ntp"
     assert decoder.epoch == T0
-    counters = decoder.telemetry.snapshot()["counters"]
+    snap = decoder.telemetry.snapshot()
+    counters = snap["counters"]
     assert "frameEarly" not in counters and "frameGap" not in counters
+    # A clean stream: nothing lost or left out, nothing waiting.
+    assert not set(counters) & {"readerPacketsLost", "readerErrors",
+                                "readerUnitsDropped", "readerUnitsSkipped"}
+    assert snap["gauges"]["readerQueued"] == 0
+    assert snap["gauges"]["readerPending"] == 0
 
 
 def test_the_reader_is_asked_for_the_pinned_size():
@@ -496,6 +508,73 @@ def test_the_reader_is_asked_for_the_pinned_size():
     assert argv[argv.index("-url") + 1] == "rtsp://127.0.0.1:8554/cam"
     assert argv[argv.index("-width") + 1] == str(WIDTH)
     assert argv[argv.index("-height") + 1] == str(HEIGHT)
+    # One decoding thread and the reader's own queue: frames out as soon
+    # as they can be.
+    assert "-threads" not in argv and "-queue" not in argv
+
+
+def test_the_readers_counts_become_the_views_telemetry():
+    stopping = threading.Event()
+    decoder, _wall = _reader_decoder([_records(
+        (0, T0, RTP0, (0, 0, 0, 0), (0, 1)),
+        (1, T0 + 1 / 30, RTP0 + 3000, (2, 1, 0, 0), (3, 2)),
+        # Six units left out up to a keyframe: seq jumps past them.
+        (8, T0 + 8 / 30, RTP0 + 24000, (2, 1, 6, 1), (0, 1)))],
+        stopping=stopping)
+    out = _collect(decoder, stopping, 1)
+    assert out[-1] == (8, round(8 / 30, 4), 8)
+    snap = decoder.telemetry.snapshot()
+    counters = snap["counters"]
+    assert counters["readerPacketsLost"] == 2
+    assert counters["readerErrors"] == 1
+    assert counters["readerUnitsDropped"] == 6
+    assert counters["readerUnitsSkipped"] == 1
+    assert snap["gauges"]["readerQueued"] == 0
+    assert snap["gauges"]["readerPending"] == 1
+
+
+def test_a_second_views_reader_counts_carry_its_name():
+    stopping = threading.Event()
+    decoder, _wall = _reader_decoder([_records(
+        (0, T0, RTP0),
+        (1, T0 + 1 / 30, RTP0 + 3000, (1, 0, 3, 0), (2, 0)))],
+        stopping=stopping, view="face")
+    _collect(decoder, stopping, 1)
+    snap = decoder.telemetry.snapshot()
+    assert snap["counters"]["faceReaderPacketsLost"] == 1
+    assert snap["counters"]["faceReaderUnitsDropped"] == 3
+    assert snap["gauges"]["faceReaderQueued"] == 2
+    assert not any(name.startswith("reader") for name in snap["gauges"])
+    assert "readerPacketsLost" not in snap["counters"]
+
+
+def test_the_counts_start_over_with_each_reader():
+    stopping = threading.Event()
+    decoder, _wall = _reader_decoder([
+        _records((0, T0, RTP0, (3, 0, 4, 0)),
+                 (1, T0 + 1 / 30, RTP0 + 3000, (3, 0, 4, 0))),
+        # A new reader counts from nothing again: all it reports is new.
+        _records((0, T0 + 2.0, 12345, (1, 0, 0, 0)),
+                 (1, T0 + 2.0 + 1 / 30, 12345 + 3000, (2, 0, 1, 0))),
+    ], stopping=stopping)
+    _collect(decoder, stopping, 2)
+    counters = decoder.telemetry.snapshot()["counters"]
+    assert counters["readerPacketsLost"] == 5
+    assert counters["readerUnitsDropped"] == 5
+    assert "readerErrors" not in counters
+
+
+def test_a_record_of_another_version_restarts_the_reader():
+    stopping = threading.Event()
+    old_header, _frame = _record(seq=1, ntp_s=T0 + 1 / 30, version=1)
+    decoder, _wall = _reader_decoder([
+        _records((0, T0, RTP0)) + [old_header, _frame_of(1)],
+        _records((0, T0 + 1 / 30, RTP0 + 3000)),
+    ], stopping=stopping)
+    out = _collect(decoder, stopping, 2)
+    assert [(i, tag) for i, _at, tag in out] == [(0, 0), (1, 0)]
+    counters = decoder.telemetry.snapshot()["counters"]
+    assert counters["readerDesync"] == 1 and counters["reconnects"] == 1
 
 
 def test_without_the_binary_a_live_stream_is_decoded_by_ffmpeg_as_before():
