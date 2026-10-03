@@ -1,6 +1,6 @@
 # The Confidential Space slot image: the base image plus the three binaries
-# that would otherwise be sidecars, the audio classifier, the analysis lock,
-# and one entrypoint.
+# that would otherwise be sidecars, the two audio taggers, the analysis
+# lock, and one entrypoint.
 #
 # Confidential Space runs exactly one container per VM and attests its
 # digest, so the relay (MediaMTX), the TLS terminator (Caddy) and the
@@ -9,7 +9,9 @@
 # pinned upstream images (the digests are the multi-arch indexes on Docker
 # Hub); the gateway is reproduced from its signed release (see its stage
 # below); the audio classifier's library is built from a pinned commit and
-# its weights fetched by pinned revision and SHA-256 (the `ced` stage).
+# its weights fetched by pinned revision and SHA-256 (the `ced` stage), and
+# the second tagger's checkpoint likewise (the `beats` stage; its model code
+# is vendored under workload/audio/vendor).
 # BASE is the image built by workload/Dockerfile from the same
 # tree, so the enclave runs the very code the tests here exercise. It is
 # built on ubuntu:24.04 with the torch set in five layers and every layer
@@ -139,6 +141,26 @@ RUN mkdir -p /out \
       -o "/out/${CED_MODEL_FILE}" \
  && echo "${CED_MODEL_SHA256}  /out/${CED_MODEL_FILE}" | sha256sum -c -
 
+# The second audio tagger (workload/audio/beats.py): Microsoft's BEATs
+# checkpoint fine-tuned on AudioSet (microsoft/unilm, MIT; the model code is
+# vendored under workload/audio/vendor). The official download links need a
+# sign-in, so the file is fetched from a byte-identical Hugging Face upload
+# at a pinned revision and checked against its SHA-256. It lives in the image
+# for the same reason CED does - the attested digest then covers exactly
+# which weights heard the audio - at the cost of 363 MB more for the
+# launcher's pull on every boot.
+FROM ubuntu:24.04 AS beats
+ARG BEATS_REVISION=6e898b79eed92c81c4bb43a21f52fc39f4f849f0
+ARG BEATS_MODEL_FILE=BEATs_iter3_plus_AS2M_finetuned_on_AS2M_cpt2.pt
+ARG BEATS_MODEL_SHA256=e5815275a04b6885e7b8af63d120b29bffae2cd2225cf4915e1ec6d819d3022c
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl \
+    && rm -rf /var/lib/apt/lists/*
+RUN mkdir -p /out \
+ && curl -fL --retry 3 \
+      "https://huggingface.co/camenduru/beats/resolve/${BEATS_REVISION}/${BEATS_MODEL_FILE}" \
+      -o "/out/${BEATS_MODEL_FILE}" \
+ && echo "${BEATS_MODEL_SHA256}  /out/${BEATS_MODEL_FILE}" | sha256sum -c -
+
 FROM ${BASE}
 
 COPY --from=mediamtx /mediamtx /usr/local/bin/mediamtx
@@ -148,6 +170,8 @@ COPY --from=ced /src/ced.cpp/build/libced.so /opt/ced/libced.so
 COPY --from=ced /out/ced-small-f16.gguf /opt/ced/ced-small-f16.gguf
 COPY --from=ced /src/ced.cpp/LICENSE /opt/ced/LICENSE.ced.cpp
 COPY --from=ced /src/ced.cpp/third_party/ggml/LICENSE /opt/ced/LICENSE.ggml
+COPY --from=beats /out/BEATs_iter3_plus_AS2M_finetuned_on_AS2M_cpt2.pt \
+     /opt/beats/BEATs_iter3_plus_AS2M_finetuned_on_AS2M_cpt2.pt
 
 # Ed25519 evidence signatures and the TLS leaf's SPKI (tee_mode.py). The
 # system trust store the ACME client and GCS need comes with the base
@@ -201,9 +225,12 @@ ENV HF_HOME=/models/hf-bf16 \
     POSE_FLIP_TTA=0 \
     POSE_CUDA_GRAPHS=1 \
     POSE_PREFETCH=0
-# The audio classifier (workload/audio/ced.py), as the `ced` stage left it.
+# The audio classifier (workload/audio/ced.py), as the `ced` stage left it,
+# and the second tagger's checkpoint (workload/audio/beats.py), as the
+# `beats` stage did.
 ENV CED_LIBRARY_PATH=/opt/ced/libced.so \
-    CED_MODEL_PATH=/opt/ced/ced-small-f16.gguf
+    CED_MODEL_PATH=/opt/ced/ced-small-f16.gguf \
+    BEATS_MODEL_PATH=/opt/beats/BEATs_iter3_plus_AS2M_finetuned_on_AS2M_cpt2.pt
 # Caddy's storage and the TLS leaf tee_mode.py reads back, all on tmpfs.
 ENV TEE_TLS_CERT_DIR=/run/tee/caddy/certificates \
     XDG_DATA_HOME=/run/tee \
@@ -226,15 +253,15 @@ LABEL org.opencontainers.image.version="${TEE_IMAGE_VERSION}" \
 
 LABEL "tee.launch_policy.log_redirect"="debugonly"
 LABEL "tee.launch_policy.allow_cmd_override"="false"
-# POSE_GRAPH_BENCH and POSE_LOAD_BENCH are debug-slot measurement knobs
-# (pixel/pose_bench.py, pixel/pose_load.py): no ENV default here, so they
-# are inert unless set as tee-env metadata by hand; the Terraform for either
-# mode never sets them.
+# POSE_GRAPH_BENCH, POSE_LOAD_BENCH and AUDIO_LOAD_BENCH are debug-slot
+# measurement knobs (pixel/pose_bench.py, pixel/pose_load.py,
+# audio/audio_bench.py): no ENV default here, so they are inert unless set
+# as tee-env metadata by hand; the Terraform for either mode never sets them.
 # TEE_CAPTURE_BUCKET is the bucket a leased session's record is written to
 # (producer/record.py); the trainer's policy pins its value and refuses a
 # slot attesting another (masseuse-trainer tee-attestation.js
 # expectedCaptureBucket), so the metadata cannot point a slot elsewhere.
-LABEL "tee.launch_policy.allow_env_override"="TEE_PUBLIC_HOST,TEE_PUBLIC_IP,SLOT_NAME,TRAINER_URL,TRAINER_INVOKER_SERVICE_ACCOUNT,TEE_ALLOWED_ORIGINS,MODELS_BUCKET,WIF_AUDIENCE,GOOGLE_CLOUD_PROJECT,ACME_DIRECTORY_URL,ACME_CONTACT_EMAIL,ACME_EAB_IMPERSONATE,TEE_IDLE_EXIT_S,TEE_BOOT_IDLE_S,TEE_CAPTURE_BUCKET,POSE_GRAPH_BENCH,POSE_LOAD_BENCH"
+LABEL "tee.launch_policy.allow_env_override"="TEE_PUBLIC_HOST,TEE_PUBLIC_IP,SLOT_NAME,TRAINER_URL,TRAINER_INVOKER_SERVICE_ACCOUNT,TEE_ALLOWED_ORIGINS,MODELS_BUCKET,WIF_AUDIENCE,GOOGLE_CLOUD_PROJECT,ACME_DIRECTORY_URL,ACME_CONTACT_EMAIL,ACME_EAB_IMPERSONATE,TEE_IDLE_EXIT_S,TEE_BOOT_IDLE_S,TEE_CAPTURE_BUCKET,POSE_GRAPH_BENCH,POSE_LOAD_BENCH,AUDIO_LOAD_BENCH"
 LABEL "tee.launch_policy.allow_mount_destinations"="/models:/run/tee"
 LABEL "tee.launch_policy.hardened_monitoring"="none"
 LABEL "tee.launch_policy.debug_monitoring"="memoryonly"

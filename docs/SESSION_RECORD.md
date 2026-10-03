@@ -20,7 +20,7 @@ gs://<TEE_CAPTURE_BUCKET>/<account uuid>/estim_sessions/<session uuid>/enclave/
     poses/part-20260915T051230Z.parquet
     faces/part-20260915T051230Z.parquet
     frames/part-20260915T051230Z.jsonl.gz
-    audio/…      segments/…    vocal/…
+    audio/…      beats/…       segments/…    vocal/…
     onsets/…     events/…      payloads/…    posts/…
     telemetry/…  log/…
 ```
@@ -121,6 +121,7 @@ One JSON object per line, `wallS` first. The rows are the messages of
 | --- | --- | --- |
 | `frames/` | decoded frame with a final pose decision (30 fps) | `frame`, `atS`, `keypoints` (the 21 body points by name, `[x, y, score]`, interpolated across the pose cadence; null where the person was absent), `fast`, `slow` (the regional motion descriptors, protocol.md `frame`) |
 | `audio/` | half second of the audio track | `atS`, `streamS` and the measurements of protocol.md `audio`: the classifier's scores per target label over the trailing window, `all` (its score for every one of its 527 classes, four decimals, in the order `hello.json`'s `audioLabels` gives; about 3 KB a row, so an hour of audio is some 20 MB before gzip), `pitch` (pitch in Hz with its confidence, voiced share, loudness in dBFS), `frames` (a level and a pitch per 16 ms frame of the hop) |
+| `beats/` | second of the audio track, when the second tagger runs | `atS` (the trailing window's end), `streamS`, `lagS`, `hopS`, `windowS`, `computeMs` and the measurements of protocol.md `beats`: `scores`, the tagger's per-window class scores for the 527 AudioSet classes (three significant digits, in the order `hello.json`'s `beatsClassIds` gives), and `embedding`, a mean-pooled summary of the window (768 values, three decimals) from which its samples and words cannot be recovered; about 9 KB a row, so an hour of audio is some 34 MB before gzip |
 | `segments/` | span the analysis asked to have typed | `id`, `fromS`, `toS`, the span's scores (target labels and the whole table), level, pitch, spectral shape and duration, or `error` (`expired`, `span`, `empty`, `closed`, `no-audio`) |
 | `vocal/` | judgement of the analysis's vocal side | `kind` (`activation`, `decision`, `segment_error`, `baseline`), `atS`, and the numbers it judged on (protocol.md `vocal`) |
 | `onsets/` | onset the analysis found | `atS` |
@@ -151,7 +152,7 @@ One per production run, written once its analysis process has answered
 | --- | --- |
 | `sessionId`, `runId`, `run`, `startedWallS` | the record's session, the run's id (its start, UTC), the trainer's name for the run, and its start |
 | `producer` | the image's release stamp and the slot, as in `hello.json` |
-| `hello` | what the producer told the analysis: `fps`, `poseFps`, `facePoseFps`, `views`, `audio`, `audioModel`, `audioLabels` (the classifier's 527 class names, the order of the `all` vectors in `audio/` and `segments/`), `postIntervalS` |
+| `hello` | what the producer told the analysis: `fps`, `poseFps`, `facePoseFps`, `views`, `audio`, `audioModel`, `audioLabels` (the classifier's 527 class names, the order of the `all` vectors in `audio/` and `segments/`), `beats`, `beatsModel`, `beatsClassIds` (the second tagger's 527 classes by AudioSet ontology id, the order of the `scores` in `beats/`), `beatsWindowS`, `beatsHopS`, `beatsEmbeddingSize`, `postIntervalS` |
 | `ready` | the analysis's answer: `protocol`, `version` (the bundle in `analysis.lock`), `modelVersion`, `vocal` (the constants its `vocal` rows are judged against) |
 | `sources` | which picture each view is (`poses`, `faces`, `audio`): the view's path on the enclave's own loopback relay (`rtsp://127.0.0.1:8554/…`, so a reader can tell the phone's camera from an external one) and the pose cadence; never a camera's address or link |
 
@@ -196,4 +197,5 @@ trainer's half, from the voice service, never the enclave's, which runs no
 speech recognition); no camera credential (an external camera's link
 never leaves the process that dials it). The keypoints are coordinates,
 the descriptors statistics of motion, the audio rows scores and a level
-and pitch track: numbers about the sound, not the sound.
+and pitch track, the `beats` rows class scores and a mean-pooled summary
+of each two-second window: numbers about the sound, not the sound.

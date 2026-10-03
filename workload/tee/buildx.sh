@@ -51,10 +51,11 @@ buildx_last_digest() {
 # The tests that need torch and transformers (the CPU-only CI skips them):
 # the graph wrapper's contract, the packed post-processing against the
 # processor's own (batch of one and batched), the batch bench's contract,
-# the detector's host-side selection, and the pose step and parity check
-# around stub models. Run in the smoke stage, where the libraries are the
-# versions the enclave ships.
-SMOKE_TESTS="tests/test_gpu_graph.py tests/test_pose_post.py tests/test_pose_bench.py tests/test_detector_post.py tests/test_live_pose.py"
+# the detector's host-side selection, the pose step and parity check
+# around stub models, and the second audio tagger on its real checkpoint.
+# Run in the smoke stage, where the libraries are the versions the enclave
+# ships.
+SMOKE_TESTS="tests/test_gpu_graph.py tests/test_pose_post.py tests/test_pose_bench.py tests/test_detector_post.py tests/test_live_pose.py tests/test_beats_engine.py"
 
 # buildx_smoke <TEE image ref>: every import the enclave makes, on the
 # built image, CPU only, run by BuildKit (the daemon's own image store may
@@ -75,13 +76,16 @@ RUN /venv/bin/pip install --no-cache-dir pytest \\
 RUN python3 -c "import sys; sys.path[:0] = ['/app/workload/audio', '/app/workload/pixel', '/app/workload/producer']; \\
 import torch, torchvision, torchvision.ops, transformers, cv2, scipy, numpy, PIL, yaml, cryptography, google.cloud.storage; \\
 import pose_track, live_pose, motion, tee_mode, tee_models, tee_eab, relay_proxy, analysis_link, camlink_gateway, external_source, share, egress, overlay, sinks; \\
-import audio_stage, audio_features, pitch, ced; \\
+import audio_stage, audio_features, audio_bench, pitch, ced, beats; \\
 engine = ced.CedEngine(); scores = engine.classify(numpy.zeros(16000, dtype=numpy.float32)); \\
 assert set(scores) == set(ced.TARGET_LABELS), scores; \\
 table = engine.classify_all(numpy.zeros(16000, dtype=numpy.float32)); \\
 assert len(table) == len(engine.labels) == engine.class_count, len(table); \\
 assert engine.target_scores(table) == scores, 'table and target scores disagree'; \\
 print('ced', engine.version, len(engine.labels), 'labels'); \\
+tagger = beats.BeatsEngine(threads=None); tagged, embedded = tagger.tag(numpy.zeros(tagger.window_samples, dtype=numpy.float32)); \\
+assert tagged.shape == (tagger.class_count,) == (527,) and embedded.shape == (tagger.embedding_size,) == (768,), (tagged.shape, embedded.shape); \\
+print('beats', tagger.version, tagger.class_count, 'classes', tagger.embedding_size, 'embedding'); \\
 print('torch', torch.__version__, 'torchvision', torchvision.__version__, 'transformers', transformers.__version__, 'cuda', torch.version.cuda)" \\
  && python3 /app/workload/producer/producer.py --help > /dev/null \\
  && python3 /app/workload/producer/tee_models.py --help > /dev/null \\

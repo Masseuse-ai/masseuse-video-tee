@@ -489,6 +489,12 @@ class GpuPose:
                         busy fraction, reported as gauges too (pose_load).
                         The same kind of knob: admitted, never set in
                         production, nothing of it survives the boot.
+      AUDIO_LOAD_BENCH=cpu  with POSE_LOAD_BENCH, the audio stage on a
+                        synthetic stream for the same seconds - the
+                        classifier alone (off) or with the second tagger
+                        on cpu or cuda - printed as one `audioLoad` line
+                        and gauges (audio/audio_bench.py). Admitted, never
+                        set in production.
 
     Each frame is uploaded once as a CHW uint8 tensor; the detector's
     resize, the pose crop, both forwards and their post-processing run on
@@ -655,6 +661,18 @@ class GpuPose:
         plan = pose_load.parse_spec(spec)
         if plan is None:
             return None
+        # AUDIO_LOAD_BENCH, when set, runs the audio stage on a synthetic
+        # stream for the same seconds (audio/audio_bench.py), so the two
+        # loads are measured under each other.
+        audio = None
+        audio_spec = os.environ.get("AUDIO_LOAD_BENCH")
+        if audio_spec:
+            try:
+                import audio_bench
+
+                audio = audio_bench.start(audio_spec, plan.seconds, telemetry=self.telemetry)
+            except Exception as error:  # noqa: BLE001 - a bench, not the service
+                print(f"audioLoad: failed: {error!r}", flush=True)
         try:
             return pose_load.run(self.load_stepper(), plan, lock=self._lock,
                                  telemetry=self.telemetry)
@@ -664,6 +682,11 @@ class GpuPose:
                 self.telemetry.count("poseLoadFailed")
             return None
         finally:
+            if audio is not None:
+                try:
+                    audio.finish()
+                except Exception as error:  # noqa: BLE001 - a bench, not the service
+                    print(f"audioLoad: failed: {error!r}", flush=True)
             self.reset_session_state()
 
     def load_stepper(self, size: tuple[int, int] = (720, 1280)):
