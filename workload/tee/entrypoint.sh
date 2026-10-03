@@ -43,6 +43,13 @@
 #                                      ("9,9,120") for the boot-time pose load
 #                                      bench (pixel/pose_load.py); the same
 #                                      kind of knob
+#   AUDIO_LOAD_BENCH                   optional, unset: "off", "cpu" or "cuda"
+#                                      (optionally ",threads") to run the audio
+#                                      stage on a synthetic stream beside the
+#                                      pose load bench - the classifier alone,
+#                                      or with the second tagger on that device
+#                                      (audio/audio_bench.py); the same kind
+#                                      of knob, read only with POSE_LOAD_BENCH
 set -euo pipefail
 
 log() { printf 'entrypoint: %s\n' "$*"; }
@@ -204,6 +211,7 @@ python3 /app/workload/producer/producer.py \
     --post-interval-s 1.0 \
     --face-frame-interval-s 0.2 \
     --audio \
+    --beats \
     --analysis-socket "$ANALYSIS_SOCKET" \
     --sink-dir /run/tee/capture \
     --capture-bucket "" \

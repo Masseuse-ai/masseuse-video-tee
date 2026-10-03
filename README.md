@@ -81,6 +81,13 @@ Inside the enclave, in code that is in this repository:
   and pitch go with the scores. No speech recognition or transcription
   runs; a class score is not a word or a voice, and nothing identifies the
   voice.
+- Every second, the trailing two-second window is also scored by a second
+  AudioSet tagger, BEATs (Microsoft's, from microsoft/unilm), against the
+  same 527 classes. The same pass yields a mean-pooled summary of the
+  window: 768 numbers, the average of the model's last layer over the
+  window, from which the window's samples and words cannot be recovered.
+  Both go to the analysis module and into the session record, beside the
+  first tagger's scores.
 - Frames and audio are then discarded. Nothing of them is written to disk;
   the VM has no persistent storage and nobody at masseuse.ai can read its
   memory.
@@ -313,6 +320,7 @@ What the enclave writes (`workload/producer/record.py`):
 | `poses/`, `faces/` | Every keypoint-model result of the body and face views: all 308 keypoints with scores, the person box, the frame size, the flags (`dropped`, `error`, `identityUnresolved`); one row per pose step, keypoint-less rows where a step had none | Parquet (zstd), one file per window |
 | `frames/` | The assembler's 21-point rows at the frame rate with the regional motion descriptors (the `frame` message of `analysis/protocol.md`) | gzipped JSONL |
 | `audio/`, `segments/` | The audio stage's half-second measurements (the classifier's scores for all its classes, level, pitch) and the spans the analysis asked it to type | gzipped JSONL |
+| `beats/` | The second tagger's rows, one a second: its scores for the 527 classes and the window's mean-pooled summary (the `beats` message of `analysis/protocol.md`) | gzipped JSONL |
 | `vocal/` | The analysis module's vocalization judgements, one row each | gzipped JSONL |
 | `onsets/`, `events/`, `payloads/`, `posts/` | What the analysis decided, and the readings it posted | gzipped JSONL |
 | `telemetry/` | The process's counters and gauges once a second | gzipped JSONL |
@@ -358,7 +366,7 @@ report a check that should hold and does not.
 | Path | What |
 | --- | --- |
 | `workload/pixel/` | Everything that reads frames: decode geometry and stream handling (`live_pose.py`), RT-DETRv4 person detection (`vendor/rtdetrv4/`, `pose_track.py`), Sapiens2-1B keypoints (`pose_post.py`, `pose_rows.py`, `keypoints.py`), the captured CUDA graphs both forwards replay (`gpu_graph.py`) and the debug-slot bench of the pose graph over batches of crops (`pose_bench.py`), regional motion descriptors (`motion.py`) |
-| `workload/audio/` | Everything that reads sound: the audio track decoded to 16 kHz PCM (`audio_stage.py`), the CED non-speech vocalization classifier binding (`ced.py`; the library and weights are built into the image, `Dockerfile.tee`), level and pitch (`pitch.py`, `audio_features.py`) |
+| `workload/audio/` | Everything that reads sound: the audio track decoded to 16 kHz PCM (`audio_stage.py`), the CED non-speech vocalization classifier binding (`ced.py`; the library and weights are built into the image, `Dockerfile.tee`), the second AudioSet tagger (`beats.py`; its model code and filterbank vendored under `vendor/`, the checkpoint built into the image), level and pitch (`pitch.py`, `audio_features.py`), and the debug-slot audio load bench (`audio_bench.py`) |
 | `workload/producer/` | The session shell (`producer.py`), the overlay drawn back to the phone, the WHIP/WHEP relay proxy with the capability and evidence checks, the external-camera and connector ingest, the two views' clocks (`sync.py`), the enclave's boot helpers (attestation, ACME, weights and analysis bundle fetch), the socket client to the analysis module, the session record's parts and uploader (`record.py`) |
 | `workload/reader/` | `stream-reader` (Go): reads a live stream's video track off the relay and hands the producer each decoded frame with the time its sender gave it, so two cameras' views line up on their senders' clocks; a frame that arrives damaged is left out, with the frames that refer to it, up to the next whole keyframe (`gate/`), never decoded with pieces missing; the frame record it writes is documented in `record/record.go` |
 | `workload/tee/` | The image: `Dockerfile` (base: Python, torch, ffmpeg, `stream-reader`), `Dockerfile.tee` (MediaMTX, Caddy, the connector gateway, the launch policy), `entrypoint.sh`, `Caddyfile`, `mediamtx.tee.yml` |

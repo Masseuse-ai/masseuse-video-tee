@@ -236,8 +236,11 @@ From `v0.1.0` on, every image is built by GitHub Actions from a tagged
 commit of this repository ([`.github/workflows/release.yml`](.github/workflows/release.yml)):
 two Dockerfiles (an `ubuntu:24.04` base with Python, the pinned torch
 2.14.0+cu130 set split into five layers and the model code; then the TEE
-layer with Caddy and MediaMTX by digest, the ACME and attestation tooling,
-the release stamp and the launch-policy labels), built with BuildKit
+layer with Caddy and MediaMTX by digest, the two audio taggers - ced.cpp
+built at a pinned commit with its weights, and the BEATs checkpoint, each
+file fetched at a pinned revision and checked against its SHA-256 - the
+ACME and attestation tooling, the release stamp and the launch-policy
+labels), built with BuildKit
 through `buildx` so every layer is zstd and the push is a single OCI
 manifest, which is what a digest names. The workflow pushes to
 `ghcr.io/masseuse-ai/masseuse-video-tee`, signs the digest keyless with cosign

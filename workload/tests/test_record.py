@@ -355,6 +355,7 @@ def test_the_record_routes_every_stream_to_parts_under_the_prefix(tmp_path):
     # the analysis's records, the vocal rows, both views' keypoints.
     record.outbound({"kind": "frame", "frame": 1, "atS": 0.033, "keypoints": {}, "fast": None})
     record.outbound({"kind": "audio", "atS": 0.1, "rms": -30.0})
+    record.outbound({"kind": "beats", "atS": 1.0, "scores": [0.25], "embedding": [0.5]})
     record.outbound({"kind": "segment", "id": 1, "error": "no-audio"})
     record.outbound({"kind": "pose", "frame": 1})  # not a kept kind
     record.append("onsets", {"atS": 1.5})
@@ -412,9 +413,11 @@ def test_the_record_routes_every_stream_to_parts_under_the_prefix(tmp_path):
     assert result["drained"] is True and result["closed"] is True
     names = sorted(gcs.objects)
     part = "part-20260915T051230Z"
-    for stream in ("frames", "audio", "segments", "onsets", "events", "payloads", "posts",
+    for stream in ("frames", "audio", "beats", "segments", "onsets", "events", "payloads", "posts",
                    "vocal", "telemetry", "log"):
         assert f"{PREFIX}/{stream}/{part}.jsonl.gz" in names, stream
+    assert rows_of(gcs, f"{PREFIX}/beats/{part}.jsonl.gz") == [
+        {"wallS": T0, "atS": 1.0, "scores": [0.25], "embedding": [0.5]}]
     assert f"{PREFIX}/poses/{part}.parquet" in names and f"{PREFIX}/faces/{part}.parquet" in names
     assert f"{PREFIX}/summary.json" in names
     log_rows = rows_of(gcs, f"{PREFIX}/log/{part}.jsonl.gz")
@@ -458,7 +461,7 @@ def test_the_record_routes_every_stream_to_parts_under_the_prefix(tmp_path):
     assert record.close({"again": True})["drained"] is True and len(gcs.objects) == count
     assert record.append("onsets", {"atS": 9.0}) is False
     assert record.hello() is False
-    assert telemetry.snapshot()["counters"]["recordPartsUploaded"] == 16  # the log stream is one more part
+    assert telemetry.snapshot()["counters"]["recordPartsUploaded"] == 17  # the log and beats streams are one more part each
     assert not any(p.is_file() for p in (tmp_path / "rec").rglob("*")), "uploaded parts are gone"
 
 

@@ -17,7 +17,9 @@ posted to the trainer. With --audio a second ffmpeg reads the same
 stream's audio track as 16 kHz mono PCM for the audio stage
 (workload/audio/audio_stage.py), which classifies it into non-speech
 vocalization labels with level and pitch and sends those numbers over the
-same socket. Frames go no further than this file and the overlay renderer,
+same socket; with --beats as well a second AudioSet tagger's class scores
+and window embedding, once a second (workload/audio/beats.py). Frames go
+no further than this file and the overlay renderer,
 which draws the view returned to the same user's phone (the picture, with
 the keypoints when the phone asks); samples go no further than the audio
 stage.
@@ -840,6 +842,42 @@ def acquire_audio_classifier(telemetry: Telemetry):
         return classifier
 
 
+# The second audio tagger (workload/audio/beats.py): one BEATs checkpoint per
+# process, loaded once - by the boot's prewarm on a slot, else by the first
+# session - and shared by every session the way the classifier above is;
+# only a session's tagger thread calls it. A tagger that fails to load is
+# said aloud and counted (`beatsLoadFailed`), once, and the sessions run
+# without it: the classifier and everything else are unaffected.
+_BEATS_LOCK = threading.Lock()
+_BEATS: dict = {"engine": None, "failed": None}
+
+
+def acquire_beats_engine(args, telemetry: Telemetry):
+    with _BEATS_LOCK:
+        engine = _BEATS["engine"]
+        if engine is None and _BEATS["failed"] is None:
+            started = time.monotonic()
+            try:
+                from beats import BeatsEngine  # noqa: PLC0415 - torch, only when asked for
+                engine = BeatsEngine(window_s=args.beats_window_s,
+                                     device=args.beats_device,
+                                     threads=args.beats_threads or None,
+                                     telemetry=telemetry)
+                engine.tag(np.zeros(engine.window_samples, dtype=np.float32))
+            except Exception as error:  # noqa: BLE001 - said aloud, sessions go on
+                _BEATS["failed"] = repr(error)
+                telemetry.count("beatsLoadFailed")
+                print(f"audio: second tagger unavailable: {error!r}", flush=True)
+                return None
+            telemetry.boot_phase("beatsReady", started)
+            print(f"audio: {engine.version} on {engine.device}"
+                  f"{' as a graph' if engine.graphed else ''}"
+                  f"{f', {engine.threads} threads' if engine.threads else ''}",
+                  flush=True)
+            _BEATS["engine"] = engine
+        return engine
+
+
 class BootKeepalive:
     """Keeps a /produce SSE response alive while Session() waits for the boot.
 
@@ -1065,6 +1103,10 @@ class Session:
         self.face_view_decoder: Decoder | None = None
         self.audio_classifier = (acquire_audio_classifier(telemetry)
                                  if getattr(args, "audio", False) else None)
+        # The second tagger rides on the audio stage (--beats with --audio).
+        self.beats_engine = (acquire_beats_engine(args, telemetry)
+                             if self.audio_classifier is not None
+                             and getattr(args, "beats", False) else None)
         self.audio: AudioStage | None = None
         # The analysis process (analysis/protocol.md). Keypoints,
         # descriptors and audio measurements go out; readings, records, HUD
@@ -1090,6 +1132,19 @@ class Session:
             # `all` vectors of the audio and segment messages follow.
             audioLabels=(list(getattr(self.audio_classifier, "labels", ()))
                          if self.audio_classifier is not None else None),
+            # The second tagger, when it runs: its classes once, by AudioSet
+            # ontology id in the order its `beats` messages' scores follow,
+            # and the windows it reads.
+            beats=self.beats_engine is not None,
+            beatsModel=(self.beats_engine.version
+                        if self.beats_engine is not None else None),
+            beatsClassIds=(list(self.beats_engine.class_ids)
+                           if self.beats_engine is not None else None),
+            beatsWindowS=(self.beats_engine.window_samples / 16_000
+                          if self.beats_engine is not None else None),
+            beatsHopS=(args.beats_hop_s if self.beats_engine is not None else None),
+            beatsEmbeddingSize=(self.beats_engine.embedding_size
+                                if self.beats_engine is not None else None),
             views=(["body", "face"] if self.face_stream else ["body"]),
             facePoseFps=(self.face_pose_fps if self.face_stream else None),
             faceView=(("connector" if self.face_view_stream else "phone")
@@ -1128,15 +1183,22 @@ class Session:
                 sources=self._record_sources())
             self.record.telemetry_from(telemetry)
         if self.audio_classifier is not None:
+            beats = self.beats_engine
             self.audio = AudioStage(
                 AudioSource(self.audio_stream, telemetry,
                             realtime=args.pose == "gpu", stopping=self.stopping),
                 self.audio_classifier, self._to_analysis, telemetry,
-                stream_clock=lambda: self.stream_at_s)
+                stream_clock=lambda: self.stream_at_s,
+                tagger=beats,
+                tagger_hop_s=args.beats_hop_s if beats is not None else 1.0,
+                tagger_window_s=(beats.window_samples / 16_000
+                                 if beats is not None else 2.0))
 
     def _to_analysis(self, message: dict) -> None:
         """A message to the analysis process, and to the record when it is
-        one of the kinds the record keeps (frame, audio, segment)."""
+        one of the kinds the record keeps (frame, audio, beats, segment).
+        Called from the decode thread, the audio stage and its tagger
+        thread; the link and the record each serialise their writes."""
         self.analysis.send(message)
         capture = getattr(self, "capture", None)
         if capture is not None:
@@ -2170,9 +2232,18 @@ def build_server(args, telemetry: Telemetry,
                     warmup["error"] = repr(error)
                     print(f"warmup failed: {error!r}", flush=True)
 
+        def warm_beats() -> None:
+            # The second tagger loads beside the pose boot (CPU and the
+            # image's disk against the GPU and the weights tmpfs), so the
+            # first session does not wait for it.
+            with teardown.working():
+                acquire_beats_engine(args, telemetry)
+
         thread = threading.Thread(target=warm, daemon=True)
         warmup["thread"] = thread
         thread.start()
+        if getattr(args, "audio", False) and getattr(args, "beats", False):
+            threading.Thread(target=warm_beats, daemon=True, name="warm-beats").start()
         return True
 
     # WHEP signalling for the live overlay rides this port (relay_proxy.py);
@@ -3404,6 +3475,22 @@ def build_parser() -> argparse.ArgumentParser:
                         help="the stream whose audio track --audio reads; "
                              "default --stream's (the phone's, in TEE mode, "
                              "when both cameras are present)")
+    parser.add_argument("--beats", action="store_true",
+                        help="with --audio, also run the second AudioSet "
+                             "tagger (workload/audio/beats.py) every "
+                             "--beats-hop-s of audio over the trailing "
+                             "--beats-window-s and send its class scores and "
+                             "the window's embedding (`beats` messages); "
+                             "needs torch and BEATS_MODEL_PATH")
+    parser.add_argument("--beats-window-s", type=float, default=2.0,
+                        help="the second tagger's trailing window, seconds")
+    parser.add_argument("--beats-hop-s", type=float, default=1.0,
+                        help="one window every this many seconds of audio")
+    parser.add_argument("--beats-device", default="cpu",
+                        help="cpu, or cuda (the network as one captured graph)")
+    parser.add_argument("--beats-threads", type=int, default=4,
+                        help="the CPU path's torch threads (process-wide; "
+                             "0 = torch's default)")
     parser.add_argument("--duration", type=float, default=0.0)
     parser.add_argument("--input-lost-after", type=float, default=0.0,
                         help="end the session once the stream has delivered "

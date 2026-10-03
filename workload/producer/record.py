@@ -23,6 +23,8 @@ What goes in (analysis/protocol.md names the messages):
                        descriptors
     audio/, segments/  the audio stage's measurements and the classified
                        spans it was asked for
+    beats/             the second tagger's rows, one a window: class scores
+                       and the window's embedding (audio_stage.TaggerWorker)
     vocal/             the analysis's `vocal` rows, one per judgement
     onsets/, events/,  what the analysis decided, as the flat capture has
     payloads/, posts/  always kept them
@@ -86,7 +88,7 @@ UUID = r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
 RECORD_PREFIX = re.compile(rf"^{UUID}/estim_sessions/{UUID}/enclave$")
 BUCKET_NAME = re.compile(r"^[a-z0-9][a-z0-9._-]{1,220}[a-z0-9]$")
 
-JSONL_STREAMS = ("frames", "audio", "segments", "vocal", "onsets", "events",
+JSONL_STREAMS = ("frames", "audio", "beats", "segments", "vocal", "onsets", "events",
                  "payloads", "posts", "telemetry", "log")
 KEYPOINT_STREAMS = {"body": "poses", "face": "faces"}
 
@@ -664,10 +666,12 @@ class Record:
                          wall_s=row.get("wallS"))
 
     def outbound(self, message: dict) -> None:
-        """A message on its way to the analysis process: the `frame`, `audio`
-        and `segment` kinds are the record's frames/, audio/ and segments/."""
+        """A message on its way to the analysis process: the `frame`, `audio`,
+        `beats` and `segment` kinds are the record's frames/, audio/, beats/
+        and segments/."""
         kind = message.get("kind")
-        stream = {"frame": "frames", "audio": "audio", "segment": "segments"}.get(kind)
+        stream = {"frame": "frames", "audio": "audio", "beats": "beats",
+                  "segment": "segments"}.get(kind)
         if stream is None:
             return
         row = {key: value for key, value in message.items() if key != "kind"}

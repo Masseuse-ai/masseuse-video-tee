@@ -512,6 +512,26 @@ posture.
   views' grids aligned, so on every shared slot one step queues behind the
   other view's whole step (56 ms with a detect) plus jitter; `9,6,120`,
   where fewer slots coincide, measured 56.5 ms and `busy=0.765`.
+- The audio load bench (`workload/audio/audio_bench.py`): with the pose
+  load bench only, `tee-env-AUDIO_LOAD_BENCH=off|cpu|cuda[,threads]` runs
+  the audio stage for the same seconds on a synthetic stream paced in real
+  time - the classifier alone (`off`), or with the second tagger on the
+  CPU (`threads` torch threads, 4 when unnamed) or on the GPU as a captured
+  graph - and prints one line: `audioLoad mode=cpu seconds=120.0 hops=240
+  hopMs=p50/p95 misses=0 lagP95S=... cpuPerS=... tagger=windows/dropped
+  taggerMs=p50/p95 taggerLagS=p50/p95 threads=4 graphed=no`, also as
+  `audioLoad*` gauges on `/statz`. Compare three boots of `9,9,120`: `off`,
+  `cpu` and `cuda`. The stage holds with the tagger when `misses` is 0,
+  `hopMs` p95 stays under half the 0.5 s hop, `lagP95S` under 0.5 s, the
+  tagger drops nothing and its `taggerLagS` p95 stays under its 1 s hop,
+  and the pose bench's own gate above still passes (`drops=0/0`, `busy` at
+  or under 0.90) against the `off` boot. `cpuPerS` against the `off` run
+  is the tagger's CPU cost. The bench does not load a session's CPU side
+  (the decode, the descriptors, the annotated view, the analysis
+  process), which a CPU tagger competes with: after a roll, the first
+  session's `/statz` (`audioErrors`, hop timings, `beatsDropped`,
+  `beatsLagS`, the pose drops and the annotated view's frame rate) is the
+  test of that, against a session on the release before.
 
 ## Image signing (`terraform/signing.tf`)
 

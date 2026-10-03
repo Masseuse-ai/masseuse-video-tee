@@ -7,8 +7,9 @@ user's media:
   runs person detection and keypoint detection, computes regional motion
   descriptors, draws the view returned to the user, and, when the stream has an audio
   track, classifies it into non-speech vocalization labels with level and
-  pitch (`workload/audio/`). Every line that reads a frame or an audio
-  sample is in this repository.
+  pitch, and scores it once a second with a second AudioSet tagger
+  (`workload/audio/`). Every line that reads a frame or an audio sample is
+  in this repository.
 - the **analysis** process: receives keypoints, descriptors and audio
   measurements from the producer over a local Unix socket and turns them
   into the readings the trainer consumes. Its code is not published (it is
@@ -53,7 +54,10 @@ not cross it.
 {"kind": "hello", "protocol": 1, "fps": 30.0, "poseFps": 9.0,
  "postIntervalS": 1.0, "run": null, "sessionId": "4ce25466-...",
  "audio": true, "audioModel": "ced.cpp-abi1:ced-small-f16.gguf",
- "audioLabels": ["Speech", "Male speech, man speaking", "..."]}
+ "audioLabels": ["Speech", "Male speech, man speaking", "..."],
+ "beats": true, "beatsModel": "unilm-beats:BEATs_iter3_plus_AS2M_finetuned_on_AS2M_cpt2.pt",
+ "beatsClassIds": ["/m/078jl", "/m/07rjwbb", "..."], "beatsWindowS": 2.0,
+ "beatsHopS": 1.0, "beatsEmbeddingSize": 768}
 ```
 
 - `fps`: the decode cadence the `frame` messages arrive at.
@@ -84,6 +88,13 @@ not cross it.
   `audioLabels` (absent in older producers) is the classifier's whole
   label table, the 527 AudioSet class names in the model's own order: the
   order the `all` vectors in `audio` and `segment` messages follow.
+- `beats` (absent in older producers, then `false`): whether the second
+  tagger runs (`beats` messages may follow). `beatsModel` names its code
+  and checkpoint; `beatsClassIds` its 527 classes by AudioSet ontology id,
+  in the order its `scores` follow (the model's own, which is not the
+  classifier's); `beatsWindowS` and `beatsHopS` the trailing window it
+  reads and how often; `beatsEmbeddingSize` the length of its `embedding`.
+  All `null` when it does not run.
 - `views` (absent in older producers, then `["body"]`): the camera views
   the session reads. `["body"]` is one camera. `["body", "face"]` is a
   fixed camera behind the user as the body view - everything below that
@@ -222,6 +233,39 @@ Sent only when the stream has an audio track (`workload/audio/audio_stage.py`).
 
 Nothing in an `audio` message can be turned back into sound: a level and a
 pitch per 16 ms is not a waveform, and the labels are class scores.
+
+### `beats`, every second of the audio track
+
+```json
+{"kind": "beats", "atS": 13.0, "streamS": 13.214, "lagS": 0.214, "hopS": 1.0,
+ "windowS": 2.0, "computeMs": 48.3,
+ "scores": [0.00121, 3.4e-06, 0.0331, "..."],
+ "embedding": [0.412, -0.087, 1.203, "..."]}
+```
+
+Sent only when the stream has an audio track and `hello.beats` is true
+(`workload/audio/beats.py`: BEATs, an AudioSet tagger from microsoft/unilm,
+run by the audio stage on a thread of its own). One message per `hopS` of
+audio, each over the trailing `windowS` window ending exactly at `atS`; the
+stream's first window is zero-padded on the left. Because the tagger has
+its own thread, a `beats` message can arrive after the `audio` messages of
+later hops, and a window is skipped rather than queued when the tagger
+falls behind (the producer counts it, `beatsDropped`).
+
+- `atS`: the window's end on the audio clock, a multiple of `hopS`;
+  `streamS`: the producer's frame clock when the message was sent; `lagS`:
+  their difference, the window's whole delay (the decode, the wait for the
+  tagger, its compute); `computeMs`: the tagger's compute for this window.
+- `scores`: per-window class scores, the tagger's score for each of the
+  527 AudioSet classes over the window, to three significant digits (most
+  classes score far under a thousandth; a fixed number of decimals would
+  flatten them), in the order of `hello.beatsClassIds`. Each is a
+  probability-like number in [0, 1]; no class is a word, a voice or a
+  sample.
+- `embedding`: 768 numbers rounded to three decimals, a mean-pooled summary
+  of the window: the average, over the window's time-frequency patches, of
+  the tagger's last encoder layer, of which its class scores are a linear
+  read-out. The window's samples and words cannot be recovered from it.
 
 ### `segment`, in reply to `classify`
 
@@ -365,7 +409,8 @@ onsets; `null` before, and the count may read 0 in the reading that carries
 the instant and fill in the next. Besides the readings, a leased session's
 record (`workload/producer/record.py`, described in the README under
 "Session records") is the other path out of the enclave: the keypoints,
-descriptors, audio measurements and the analysis's rows, written to the
+descriptors, audio measurements (the second tagger's `beats` rows among
+them) and the analysis's rows, written to the
 attested capture bucket under the prefix the trainer's lease named. Frames
 and samples are on neither path.
 
@@ -506,7 +551,9 @@ Between the producer and the analysis process travel keypoints (named
 points in pixel coordinates), the descriptors above (per-window statistics
 of brightness and optical flow in a body-carried frame), the audio
 measurements above (class scores, a level and a pitch per frame, and the
-same over spans the analysis asks about), and the analysis's own numbers
+same over spans the analysis asks about; the second tagger's class scores
+and its mean-pooled summary of each window, once a second), and the
+analysis's own numbers
 coming back. The analysis bundle can be shown to be the one the lock names
 (its SHA-256 is checked before it starts, and the lock is inside the
 attested image) even though its source is not published.
