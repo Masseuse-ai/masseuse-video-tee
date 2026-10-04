@@ -5,6 +5,6 @@
 # This file is copied into the image, so the attested image digest fixes
 # which bundle may run. The bundle's source is not published; its bytes are
 # pinned here and its inputs and outputs are the protocol document's.
-version=2026.09.29-1
-object=analysis/analysis-2026.09.29-1.tar.zst
-sha256=c3829a83f966e538e6885143d0f5fb15cdf058dd9235bd71cf26bfc40a65d982
+version=2026.10.04-1
+object=analysis/analysis-2026.10.04-1.tar.zst
+sha256=ba45cf527d7df673d34ba7906851bf12891248266b763a4371f1e4010816326a
