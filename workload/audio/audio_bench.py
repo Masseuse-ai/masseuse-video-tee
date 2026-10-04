@@ -14,7 +14,10 @@ admits, never set in production. The value is `mode[,threads]`:
     off    the classifier alone (ced.py), the stage as v0.12 ran it
     cpu    the classifier and the second tagger (beats.py) on the CPU,
            with `threads` torch threads (beats.DEFAULT_THREADS when unnamed)
-    cuda   the classifier and the second tagger as one CUDA graph
+    cuda   the classifier and the second tagger as CUDA graphs
+
+The tagger reads the windows a session's does (audio_stage.TAGGER_WINDOWS_S),
+one engine each.
 
 The stream is synthetic and paced in real time: seeded noise, tones and
 silence in 0.5 s chunks, the hop the stage takes from ffmpeg. It is no
@@ -25,7 +28,8 @@ and dropped. The report is one `audioLoad` line and `audioLoad*` gauges:
     misses             hops whose work took longer than the hop itself
     lagS p95           how far the stage's audio clock fell behind the
                        stream's (the decode a session has is not here)
-    tagger windows / dropped, ms p50/p95, lagS p50/p95, graphed
+    tagger windows / dropped, ms p50/p95, lagS p50/p95 (every window's
+                       message, of every length), graphed
     cpuPerS            the process's CPU seconds per wall second over the
                        run, the pose bench's host work included (compare a
                        run with the tagger to an `off` run)
@@ -44,7 +48,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from audio_stage import HOP_S, SAMPLE_RATE, TAGGER_WINDOW_S, AudioStage
+from audio_stage import HOP_S, SAMPLE_RATE, TAGGER_WINDOW_S, TAGGER_WINDOWS_S, AudioStage
 
 MODES = ("off", "cpu", "cuda")
 
@@ -161,7 +165,8 @@ class AudioBench:
     """A running bench: `finish()` stops it and returns the report."""
 
     def __init__(self, spec: AudioLoadSpec, seconds: float, telemetry=None,
-                 classifier=None, tagger=None, source: SyntheticSource | None = None):
+                 classifier=None, tagger=None, source: SyntheticSource | None = None,
+                 taggers=None):
         self.spec = spec
         self.telemetry = telemetry
         self.recorder = _Recorder()
@@ -176,15 +181,19 @@ class AudioBench:
 
             classifier = CedEngine()
             classifier.classify(np.zeros(SAMPLE_RATE, dtype=np.float32))
-        if tagger is None and spec.mode in ("cpu", "cuda"):
+        if tagger is not None:
+            taggers = [(TAGGER_WINDOW_S, tagger)]
+        elif taggers is None and spec.mode in ("cpu", "cuda"):
             from beats import DEFAULT_THREADS, BeatsEngine  # noqa: PLC0415
 
-            tagger = BeatsEngine(window_s=TAGGER_WINDOW_S, device=spec.mode,
-                                 threads=spec.threads or DEFAULT_THREADS,
-                                 telemetry=telemetry)
-        self.tagger = tagger
+            taggers = [(window_s, BeatsEngine(window_s=window_s, device=spec.mode,
+                                              threads=spec.threads or DEFAULT_THREADS,
+                                              telemetry=telemetry))
+                       for window_s in TAGGER_WINDOWS_S]
+        self.taggers = list(taggers or [])
+        self.tagger = self.taggers[0][1] if self.taggers else None
         self.stage = AudioStage(self.source, classifier, self._emit, self.recorder,
-                                stream_clock=self.source.stream_s, tagger=tagger)
+                                stream_clock=self.source.stream_s, taggers=self.taggers or None)
         self._cpu0 = sum(os.times()[:2])
         self._wall0 = time.monotonic()
         self.stage.start()
@@ -222,6 +231,7 @@ class AudioBench:
             "misses": sum(1 for ms in hops if ms > hop_ms),
             "lagP95S": _percentile(self.audio_lag, 0.95),
             "errors": self.recorder.counters.get("audioErrors", 0),
+            "taggerWindowsS": [window_s for window_s, _ in self.taggers],
             "taggerWindows": self.messages["beats"],
             "taggerDropped": self.recorder.counters.get("beatsDropped", 0),
             "taggerErrors": self.recorder.counters.get("beatsErrors", 0),
@@ -268,7 +278,9 @@ def _format(report: dict) -> str:
              f"misses={report['misses']}", f"lagP95S={_ms(report['lagP95S'])}",
              f"cpuPerS={report['cpuPerS']:.2f}"]
     if report["mode"] != "off":
-        parts += [f"tagger={report['taggerWindows']}/{report['taggerDropped']}",
+        windows = "/".join(f"{window_s:g}" for window_s in report["taggerWindowsS"])
+        parts += [f"windowsS={windows}",
+                  f"tagger={report['taggerWindows']}/{report['taggerDropped']}",
                   f"taggerMs={_ms(report['taggerP50Ms'])}/{_ms(report['taggerP95Ms'])}",
                   f"taggerLagS={_ms(report['taggerLagP50S'])}/{_ms(report['taggerLagP95S'])}",
                   f"threads={report['threads']}", f"graphed={'yes' if report['graphed'] else 'no'}"]

@@ -11,14 +11,16 @@ from __future__ import annotations
 
 from collections.abc import Callable
 
-from keypoints import ALL_NAMES, BODY, FACE, LOWER_BODY, MIN_KEYPOINT_SCORE
+from keypoints import ALL_NAMES, BODY, LOWER_BODY, MIN_KEYPOINT_SCORE
 
 # What a row names: the body view its 21 body points; a face view (the
-# phone pointed at the face) those plus the face block, 238 landmarks the
-# analysis reads for the expression's measures. The record carries every
-# view's full result regardless (record.py); this is what travels live.
+# phone pointed at the face) every point of the result, as the record
+# carries it: the body, both hands (how near a hand is to the face), the
+# arms' and neck's points and the face block, 238 landmarks the analysis
+# reads for the expression's measures. The record carries every view's full
+# result regardless (record.py); this is what travels live.
 BODY_POINTS = tuple(BODY)
-FACE_VIEW_POINTS = tuple(BODY) + tuple(FACE)
+FACE_VIEW_POINTS = tuple(range(len(ALL_NAMES)))
 
 # On prone frames RT-DETRv4-X sometimes emits the torso as the high-confidence
 # person and the legs as an overlapping low-confidence person query. The latter

@@ -516,22 +516,34 @@ posture.
   load bench only, `tee-env-AUDIO_LOAD_BENCH=off|cpu|cuda[,threads]` runs
   the audio stage for the same seconds on a synthetic stream paced in real
   time - the classifier alone (`off`), or with the second tagger on the
-  CPU (`threads` torch threads, 4 when unnamed) or on the GPU as a captured
-  graph - and prints one line: `audioLoad mode=cpu seconds=120.0 hops=240
-  hopMs=p50/p95 misses=0 lagP95S=... cpuPerS=... tagger=windows/dropped
-  taggerMs=p50/p95 taggerLagS=p50/p95 threads=4 graphed=no`, also as
-  `audioLoad*` gauges on `/statz`. Compare three boots of `9,9,120`: `off`,
-  `cpu` and `cuda`. The stage holds with the tagger when `misses` is 0,
-  `hopMs` p95 stays under half the 0.5 s hop, `lagP95S` under 0.5 s, the
-  tagger drops nothing and its `taggerLagS` p95 stays under its 1 s hop,
-  and the pose bench's own gate above still passes (`drops=0/0`, `busy` at
-  or under 0.90) against the `off` boot. `cpuPerS` against the `off` run
-  is the tagger's CPU cost. The bench does not load a session's CPU side
-  (the decode, the descriptors, the annotated view, the analysis
-  process), which a CPU tagger competes with: after a roll, the first
-  session's `/statz` (`audioErrors`, hop timings, `beatsDropped`,
-  `beatsLagS`, the pose drops and the annotated view's frame rate) is the
-  test of that, against a session on the release before.
+  CPU (`threads` torch threads, 4 when unnamed) or on the GPU as captured
+  graphs - and prints one line: `audioLoad mode=cpu seconds=120.0 hops=240
+  hopMs=p50/p95 misses=0 lagP95S=... cpuPerS=... windowsS=2/3
+  tagger=windows/dropped taggerMs=p50/p95 taggerLagS=p50/p95 threads=4
+  graphed=no`, also as `audioLoad*` gauges on `/statz`. Compare three
+  boots of `9,9,120`: `off`, `cpu` and `cuda`. The stage holds with the
+  tagger when `misses` is 0, `hopMs` p95 stays under half the 0.5 s hop,
+  `lagP95S` under 0.5 s, the tagger drops nothing and its `taggerLagS` p95
+  stays under its 1 s hop, and the pose bench's own gate above still
+  passes (`drops=0/0`, `busy` at or under 0.90) against the `off` boot.
+  `cpuPerS` against the `off` run is the tagger's CPU cost. The tagger
+  reads the windows a session's does (`--beats-windows-s`, 2 s and 3 s in
+  `tee/entrypoint.sh`): each second it tags the 2 s window, then the 3 s
+  one, on the same thread with the same torch threads, one engine each, so
+  its compute each second is the two windows' together, the 3 s window's
+  the larger part, and the process holds the checkpoint once per window
+  (the boot's `beatsReady` loads both). `taggerMs` mixes the two windows;
+  `taggerLagS` is mostly the 3 s window's, whose wait includes the 2 s
+  window's compute; `tagger` counts windows of both lengths. The hop's
+  own cost grows by one FFT of a second on every other hop (the
+  `audioSpectral` stage), small beside the classifier. The bench does not
+  load a session's CPU side (the decode, the descriptors, the annotated
+  view, the analysis process), which a CPU tagger competes with: after a
+  roll, the first session's `/statz` (`audioErrors`, hop timings,
+  `beatsDropped`, `beatsLagS` and the 3 s window's `beatsW3LagS`, the
+  `beats` and `beatsW3` stages, the pose drops and the annotated view's
+  frame rate) is the test of that, against a session on the release
+  before.
 
 ## Image signing (`terraform/signing.tf`)
 

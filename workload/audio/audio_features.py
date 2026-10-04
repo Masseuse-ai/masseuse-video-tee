@@ -1,10 +1,11 @@
-"""Per-segment acoustic measurements of a short span of audio.
+"""Acoustic measurements of a short span of audio.
 
 These summarise a segment the analysis process asked about (a sound it
 proposed from the frame levels it was streamed, see `audio_stage.py`) into
 a handful of numbers: an F0 summary, a loudness summary and four spectral
-shape statistics. They are computed here, in the process that holds the
-samples, and only the numbers cross the socket.
+shape statistics; and each whole second of the stream into four more (its
+spectral shape and level, `second_spectral`). They are computed here, in
+the process that holds the samples, and only the numbers cross the socket.
 """
 
 from __future__ import annotations
@@ -109,4 +110,43 @@ def spectral_stats(segment: np.ndarray) -> dict:
         "rolloff85Hz": round(rolloff, 1),
         "flatness": round(flatness, 4),
         "lowShare300": round(low_share, 4),
+    }
+
+
+# One second's spectrum (`second_spectral`): a Hann window over the whole
+# second, in float32 as the analysis's per-second channels were computed
+# with it, and the bins under LOW_BAND_HZ.
+SECOND_SAMPLES = SAMPLE_RATE
+_SECOND_WINDOW = np.hanning(SECOND_SAMPLES).astype(np.float32)
+_SECOND_FREQS = np.fft.rfftfreq(SECOND_SAMPLES, 1.0 / SAMPLE_RATE)
+_SECOND_LOW = _SECOND_FREQS < LOW_BAND_HZ
+
+
+def second_spectral(second: np.ndarray) -> dict:
+    """The spectral shape and level of one second of audio, from one FFT
+    of it: the power spectrum's centroid, its flatness (the geometric mean
+    of the power over its arithmetic mean) and its share under
+    LOW_BAND_HZ, and the RMS level in dBFS. At most `SECOND_SAMPLES`
+    samples, zero-padded to that; fewer than half of them measure nothing,
+    and a second without power (digital silence) has a level and no shape.
+
+    Not `spectral_stats` under other names: that one's centroid weighs the
+    magnitude spectrum, and its flatness floor is another. The values are
+    unrounded: the analysis reads them as float32, and a coarser rounding
+    would move them off the values its channels were defined on."""
+    if second.size < SECOND_SAMPLES // 2:
+        return {"centroidHz": None, "flatness": None, "lowShare": None, "rmsDbfs": None}
+    chunk = np.pad(second, (0, SECOND_SAMPLES - second.size))
+    level = rms_dbfs(chunk)
+    spectrum = np.abs(np.fft.rfft(chunk.astype(np.float64) * _SECOND_WINDOW))
+    power = spectrum ** 2
+    total = float(power.sum())
+    if total <= 1e-12:
+        return {"centroidHz": None, "flatness": None, "lowShare": None, "rmsDbfs": level}
+    geometric = float(np.exp(np.mean(np.log(power + 1e-12))))
+    return {
+        "centroidHz": float((_SECOND_FREQS * power).sum() / total),
+        "flatness": geometric / (total / len(power)),
+        "lowShare": float(power[_SECOND_LOW].sum() / total),
+        "rmsDbfs": level,
     }
