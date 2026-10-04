@@ -414,6 +414,16 @@ the row states, the angles' senses and the pose correction. Its `hazard` is
 a model fitted on readings measured this way, named in the constants as
 before. The fields from before keep their names and meanings; their values
 are measured on the fitted head.
+From 2026.10.04-2 the `face` object also carries `headDeg` (`yaw`, `pitch`
+and `roll`: the head's turn from the baseline minute's pose in degrees, from
+the newest row whether fitted or predicted, at most 90 either way, in the
+senses the constants' `wire.headDeg` names), so a head turned past the head
+channels' thirty degrees, where they read 100, is still said for the user's
+display; `null` while no face is present or before the baseline. The
+display's head channels in `wire` follow the newest row too, and while that
+row is predicted `wire` holds the last fitted rows' face where it was
+`null`. `channels` and everything read from them, `hazard` among them, are
+as before.
 
 ### `post`, at the post cadence
 
@@ -476,7 +486,8 @@ path segment `face` in place of `readings`: it is not appended to the
 capture or the record (the record's `posts` stream has the `face` object
 once a second) and not emitted on the session's event stream. A frame that
 is still unsent when the next arrives is replaced by it, and a frame never
-displaces a reading.
+displaces a reading. From 2026.10.04-2 a frame also carries `headDeg`, the
+reading's (above), and its head channels are the newest row's.
 
 ### `onset`, `event`, `payload`
 
