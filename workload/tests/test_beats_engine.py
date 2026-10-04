@@ -8,7 +8,8 @@ classes by AudioSet id and a 768-value embedding; the vendored filterbank
 gives silence its closed form (every log energy at the float floor, one
 value after the fine-tuning's normalisation); tagging is deterministic,
 bounded and tells a tone from silence; a window of the wrong length is
-refused rather than padded behind the stage's back.
+refused rather than padded behind the stage's back; and a session's second
+window, 3 s, is an engine of its own with the same contract.
 """
 
 from __future__ import annotations
@@ -68,3 +69,21 @@ def test_tagging_is_deterministic_bounded_and_hears_a_tone(engine):
 def test_a_window_of_the_wrong_length_is_refused(engine):
     with pytest.raises(ValueError):
         engine.tag(np.zeros(16_000, dtype=np.float32))
+
+
+def test_the_three_second_window_is_an_engine_of_its_own(engine):
+    three = BeatsEngine(MODEL, window_s=3.0, device="cpu", threads=None)
+    assert three.window_samples == 48_000 and three.class_ids == engine.class_ids
+    assert three.embedding_size == 768 and three.version == engine.version
+    fbank = three.features(np.zeros(three.window_samples, dtype=np.float32))
+    assert tuple(fbank.shape) == (1, 1, 298, 128)
+    t = np.arange(three.window_samples, dtype=np.float32) / 16_000
+    tone = (0.2 * np.sin(2 * np.pi * 440.0 * t)).astype(np.float32)
+    scores, embedding = three.tag(tone)
+    again_scores, again_embedding = three.tag(tone)
+    assert scores.shape == (527,) and embedding.shape == (768,)
+    assert np.all((scores >= 0.0) & (scores <= 1.0)) and np.all(np.isfinite(embedding))
+    np.testing.assert_array_equal(scores, again_scores)
+    np.testing.assert_array_equal(embedding, again_embedding)
+    with pytest.raises(ValueError):
+        three.tag(np.zeros(engine.window_samples, dtype=np.float32))

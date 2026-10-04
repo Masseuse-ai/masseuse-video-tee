@@ -15,7 +15,7 @@ import pytest
 import gpu_graph
 import live_pose
 import pose_rows
-from keypoints import BODY, KEYPOINT_NAMES
+from keypoints import ALL_NAMES, BODY, KEYPOINT_NAMES, LEFT_HAND, RIGHT_HAND
 from telemetry import Telemetry
 
 WIDTH, HEIGHT = 640, 360
@@ -202,14 +202,17 @@ def test_a_face_views_row_names_the_face_block_and_the_bodys_does_not(monkeypatc
     face_row = pose.step(rgb, 0, 0.0, view="face")
     # The body view's row is the 21 body points its consumers know.
     assert set(body_row["keypoints"]) == {KEYPOINT_NAMES[i] for i in BODY}
-    # The face view's row names the body points and the whole face block,
-    # by the definition's names, with the model's coordinates and scores.
-    assert len(face_row["keypoints"]) == len(pose_rows.FACE_VIEW_POINTS) == 21 + 238
+    # The face view's row names every point of the result (the body, both
+    # hands, the arms' and neck's points, the face block), by the
+    # definition's names, with the model's coordinates and scores.
+    assert len(face_row["keypoints"]) == len(pose_rows.FACE_VIEW_POINTS) == len(ALL_NAMES) == 308
     assert set(body_row["keypoints"]) <= set(face_row["keypoints"])
     assert face_row["keypoints"]["tip_of_nose"] == [178.0, 356.0, 0.8]
     assert face_row["keypoints"]["l_center_of_iris"] == [272.0, 544.0, 0.8]
     assert face_row["keypoints"]["r_border_of_pupil_midpoint_2"] == [307.0, 614.0, 0.8]
-    assert "right_wrist" not in face_row["keypoints"]  # the hands stay out of both
+    assert {ALL_NAMES[i] for i in RIGHT_HAND + LEFT_HAND} <= set(face_row["keypoints"])
+    assert face_row["keypoints"]["neck"] == [69.0, 138.0, 0.8]
+    assert "right_wrist" not in body_row["keypoints"]  # the hands stay out of the body view's
 
 
 def test_the_body_views_state_keeps_its_old_names(monkeypatch):

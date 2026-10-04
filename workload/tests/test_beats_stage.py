@@ -2,26 +2,36 @@
 
 A stand-in tagger records the windows it is given and returns fixed-size
 vectors, so what is checked is the stage's side of the contract
-(analysis/protocol.md, `beats`): one window per hop of audio, each the
-trailing window ending exactly on a multiple of the hop and zero-padded on
-the left at the start; one message per window of numbers only, of a
-bounded size; a slow tagger never holding up the hop's `audio` message; a
-failing tagger counted and survived; and the boot-time bench around it.
+(analysis/protocol.md, `beats`): one window per hop of audio and window
+length, each the trailing window ending exactly on a multiple of the hop
+and zero-padded on the left at the start; one message per window of
+numbers only, of a bounded size; a session's two windows tagged in order,
+the first exactly as when it was the only one; a slow tagger never holding
+up the hop's `audio` message; a failing tagger counted and survived; the
+boot-time bench around it; and the producer's side: both windows by
+default, one engine each, named in `hello`.
 """
 
 from __future__ import annotations
 
+import argparse
+import collections
 import json
 import threading
 import time
+from pathlib import Path
 
 import numpy as np
+import pytest
 
 import audio_bench
+import beats
+import producer
 from audio_stage import (SAMPLE_RATE, TAGGER_EMBEDDING_DECIMALS,
-                         TAGGER_SCORE_DIGITS, AudioStage)
+                         TAGGER_SCORE_DIGITS, TAGGER_WINDOWS_S, AudioStage)
 from ced import TARGET_LABELS
 from telemetry import Telemetry
+from test_session_views import BODY_URL, FakeLink, StubPose
 
 CLASSES = 527
 EMBEDDING = 768
@@ -242,3 +252,234 @@ def test_bench_runs_the_stage_on_a_paced_synthetic_stream():
     assert gauges["audioLoadHops"] == 8 and "audioLoadCpuPerS" in gauges
     # The synthetic stream is silence, then noise with and without tones.
     assert np.all(source.chunk(0) == 0.0) and np.std(source.chunk(5)) > 0.01
+
+
+# -- a session's windows: two lengths, one engine each -------------------------
+
+def two_window_stage(*, synchronous=True, stream_clock=lambda: 9.5, **options):
+    two, three = Tagger(**options.pop("two", {})), Tagger(**options.pop("three", {}))
+    sent: list[dict] = []
+    telemetry = Telemetry()
+    stage = AudioStage(ListSource([]), Classifier(), sent.append, telemetry,
+                       stream_clock=stream_clock, taggers=[(2.0, two), (3.0, three)],
+                       tagger_synchronous=synchronous, **options)
+    return stage, sent, telemetry, two, three
+
+
+def test_each_hop_tags_both_windows_the_first_as_when_it_was_alone():
+    """At every whole second a 2 s and a 3 s window, each its own engine
+    and its own message, the 2 s one first; the 2 s messages are those of
+    a stage that reads the 2 s window alone, field for field."""
+    stage, sent, telemetry, two, three = two_window_stage()
+    alone_tagger = Tagger()
+    alone, alone_sent, _ = stage_with(alone_tagger, stream_clock=lambda: 9.5)
+    pcm = ramp(5.0)
+    for chunk in chunks_of(pcm, 0.5):
+        stage.feed(chunk)
+        alone.feed(chunk)
+    beats_sent = [m for m in sent if m["kind"] == "beats"]
+    assert [(m["atS"], m["windowS"]) for m in beats_sent] == [
+        (at_s, window_s) for at_s in (1.0, 2.0, 3.0, 4.0, 5.0) for window_s in (2.0, 3.0)]
+    assert [m["kind"] for m in sent][:5] == ["audio", "audio", "beats", "beats", "audio"]
+
+    def untimed(message):
+        return {key: value for key, value in message.items() if key != "computeMs"}
+
+    assert [untimed(m) for m in beats_sent if m["windowS"] == 2.0] == [
+        untimed(m) for m in alone_sent if m["kind"] == "beats"]
+    assert [list(m) for m in beats_sent if m["windowS"] == 2.0] == [
+        list(m) for m in alone_sent if m["kind"] == "beats"]
+    for got, want in zip(two.windows, alone_tagger.windows, strict=True):
+        np.testing.assert_array_equal(got, want)
+    # The 3 s windows: two seconds of zeros, then one; then exactly the
+    # three seconds ending on their atS.
+    window = 3 * SAMPLE_RATE
+    assert len(three.windows) == 5 and all(w.shape == (window,) for w in three.windows)
+    assert np.all(three.windows[0][:2 * SAMPLE_RATE] == 0.0)
+    np.testing.assert_array_equal(three.windows[0][2 * SAMPLE_RATE:], pcm[:SAMPLE_RATE])
+    assert np.all(three.windows[1][:SAMPLE_RATE] == 0.0)
+    np.testing.assert_array_equal(three.windows[1][SAMPLE_RATE:], pcm[:2 * SAMPLE_RATE])
+    for message, got in zip([m for m in beats_sent if m["windowS"] == 3.0][2:], three.windows[2:]):
+        end = int(message["atS"] * SAMPLE_RATE)
+        np.testing.assert_array_equal(got, pcm[end - window:end])
+    # The first window keeps its telemetry's names; the second carries its length.
+    snapshot = telemetry.snapshot()
+    assert snapshot["counters"]["beatsWindows"] == 10
+    assert {"beats", "beatsW3"} <= set(snapshot["stagesMs"])
+    assert {"beatsMs", "beatsLagS", "beatsW3Ms", "beatsW3LagS"} <= set(snapshot["gauges"])
+    assert stage.tagger.windows_s == (2.0, 3.0) == TAGGER_WINDOWS_S
+
+
+def test_the_history_holds_the_longest_window():
+    stage, _, _, _, three = two_window_stage(history_s=1.0)
+    assert stage.history_samples == 3 * SAMPLE_RATE
+    pcm = ramp(6.0)
+    for chunk in chunks_of(pcm, 0.5):
+        stage.feed(chunk)
+    np.testing.assert_array_equal(three.windows[-1], pcm[-3 * SAMPLE_RATE:])
+
+
+def test_a_slow_tagger_drops_whole_hops():
+    """A hop replaced while it waited loses both its windows, counted as
+    two; a hop the tagger took is tagged whole, even when the session
+    stops under it."""
+    stage, sent, telemetry, _, _ = two_window_stage(
+        synchronous=False, two={"delay_s": 0.15}, three={"delay_s": 0.15})
+    stage.tagger.start()
+    for chunk in chunks_of(ramp(6.0), 0.5):
+        stage.feed(chunk)
+    assert len([m for m in sent if m["kind"] == "audio"]) == 12
+    stage.tagger.stop()
+    assert not stage.tagger.is_alive()
+    per_hop = collections.Counter(m["atS"] for m in sent if m["kind"] == "beats")
+    assert per_hop and set(per_hop.values()) == {2}
+    dropped = telemetry.snapshot()["counters"].get("beatsDropped", 0)
+    assert dropped >= 2 and dropped % 2 == 0 and stage.tagger.dropped == dropped
+    assert stage.tagger.windows + stage.tagger.dropped <= 12
+
+
+def test_a_failing_window_is_counted_and_the_other_goes_on():
+    stage, sent, telemetry, _, _ = two_window_stage(three={"fail_at": {1}})
+    for chunk in chunks_of(ramp(4.0), 0.5):
+        stage.feed(chunk)
+    assert [(m["atS"], m["windowS"]) for m in sent if m["kind"] == "beats"] == [
+        (1.0, 2.0), (1.0, 3.0), (2.0, 2.0), (3.0, 2.0), (3.0, 3.0), (4.0, 2.0), (4.0, 3.0)]
+    assert telemetry.snapshot()["counters"]["beatsErrors"] == 1
+
+
+def test_one_form_of_the_taggers_at_a_time():
+    with pytest.raises(ValueError):
+        AudioStage(ListSource([]), Classifier(), lambda m: None, Telemetry(),
+                   tagger=Tagger(), taggers=[(3.0, Tagger())])
+
+
+def test_bench_tags_a_sessions_windows():
+    clock = FakeClock()
+    source = audio_bench.SyntheticSource(4.0, clock=clock, sleep=clock.sleep)
+    bench = audio_bench.AudioBench(audio_bench.AudioLoadSpec("cpu"), 4.0, telemetry=Telemetry(),
+                                   classifier=Classifier(), source=source,
+                                   taggers=[(2.0, Tagger()), (3.0, Tagger())])
+    report = bench.finish()
+    assert report["taggerWindowsS"] == [2.0, 3.0]
+    assert report["taggerWindows"] % 2 == 0 and report["taggerDropped"] % 2 == 0
+    assert report["taggerWindows"] + report["taggerDropped"] <= 8
+    assert "windowsS=2/3" in audio_bench._format(report)
+
+
+# -- the producer's side: the windows from its arguments, and `hello` ---------
+
+class FakeEngine:
+    """beats.BeatsEngine as the producer builds and calls it."""
+
+    made: list["FakeEngine"] = []
+    fail_window_s: float | None = None
+    version = "unilm-beats:stand-in.pt"
+    class_ids = tuple(f"/m/{index:05d}" for index in range(CLASSES))
+    embedding_size = EMBEDDING
+    graphed = False
+
+    def __init__(self, model_path=None, *, window_s=2.0, device="cpu", threads=None,
+                 telemetry=None):
+        if window_s == FakeEngine.fail_window_s:
+            raise RuntimeError("stand-in load failure")
+        self.window_s = window_s
+        self.window_samples = int(round(window_s * SAMPLE_RATE))
+        self.device = device
+        self.threads = threads
+        FakeEngine.made.append(self)
+
+    def tag(self, window):
+        assert window.shape == (self.window_samples,)
+        return (np.full(CLASSES, 0.5, dtype=np.float32),
+                np.full(EMBEDDING, self.window_s, dtype=np.float32))
+
+
+@pytest.fixture
+def stand_in_engines(monkeypatch):
+    """The producer's engines unloaded, and built from the stand-in."""
+    FakeEngine.made = []
+    FakeEngine.fail_window_s = None
+    monkeypatch.setattr(beats, "BeatsEngine", FakeEngine)
+    monkeypatch.setitem(producer._BEATS, "engines", None)
+    monkeypatch.setitem(producer._BEATS, "failed", None)
+    return FakeEngine
+
+
+def audio_session(monkeypatch, tmp_path, *argv):
+    """A Session built from the producer's own parser with --audio and
+    the given arguments; the pose, the classifier and the link stand-ins."""
+    links: list[FakeLink] = []
+
+    def open_link(path, on_message, on_error, **fields):
+        links.append(FakeLink(fields))
+        return links[-1]
+
+    monkeypatch.setattr(producer, "acquire_gpu_pose", lambda args, telemetry: StubPose())
+    monkeypatch.setattr(producer, "acquire_audio_classifier", lambda telemetry: Classifier())
+    monkeypatch.setattr(producer, "open_link", open_link)
+    args = producer.build_parser().parse_args(
+        ["--stream", BODY_URL, "--analysis-socket", "", "--sink-dir", str(tmp_path),
+         "--audio", *argv])
+    telemetry = Telemetry()
+    return producer.Session(args, telemetry), links[0], telemetry
+
+
+def test_a_session_tags_both_windows_by_default_and_hello_names_them(
+        monkeypatch, tmp_path, stand_in_engines):
+    session, link, _ = audio_session(monkeypatch, tmp_path, "--beats")
+    assert [(e.window_samples, e.device, e.threads) for e in FakeEngine.made] == [
+        (32_000, "cpu", 4), (48_000, "cpu", 4)]
+    fields = link.fields
+    assert fields["beats"] is True and fields["beatsModel"] == FakeEngine.version
+    assert fields["beatsClassIds"] == list(FakeEngine.class_ids)
+    # beatsWindowS stays the first window, as when it was the only one.
+    assert fields["beatsWindowS"] == 2.0 and fields["beatsWindowsS"] == [2.0, 3.0]
+    assert fields["beatsHopS"] == 1.0 and fields["beatsEmbeddingSize"] == EMBEDDING
+    tagger = session.audio.tagger
+    assert tagger.windows_s == (2.0, 3.0)
+    assert [engine for _, engine in tagger.taggers] == FakeEngine.made
+    # The session's own path to the analysis: each hop's audio message,
+    # then its windows' messages, the 2 s first.
+    tagger.synchronous = True
+    for chunk in chunks_of(ramp(3.0), 0.5):
+        session.audio.feed(chunk)
+    beats_sent = [m for m in link.sent if m["kind"] == "beats"]
+    assert [(m["atS"], m["windowS"]) for m in beats_sent] == [
+        (1.0, 2.0), (1.0, 3.0), (2.0, 2.0), (2.0, 3.0), (3.0, 2.0), (3.0, 3.0)]
+    assert {m["embedding"][0] for m in beats_sent if m["windowS"] == 3.0} == {3.0}
+    assert [m["atS"] for m in link.sent if m["kind"] == "audio" and "spectral" in m] == [
+        1.0, 2.0, 3.0]
+    # The engines are the process's: a second session loads nothing.
+    audio_session(monkeypatch, tmp_path, "--beats")
+    assert len(FakeEngine.made) == 2
+
+
+def test_one_window_when_asked_and_none_without_the_tagger(monkeypatch, tmp_path, stand_in_engines):
+    _, link, _ = audio_session(monkeypatch, tmp_path, "--beats", "--beats-window-s", "2")
+    assert link.fields["beatsWindowS"] == 2.0 and link.fields["beatsWindowsS"] == [2.0]
+    session, link, _ = audio_session(monkeypatch, tmp_path)
+    assert link.fields["beats"] is False and session.audio.tagger is None
+    assert link.fields["beatsWindowS"] is None and link.fields["beatsWindowsS"] is None
+
+
+def test_a_window_that_fails_to_load_leaves_the_tagger_out(monkeypatch, tmp_path, stand_in_engines):
+    FakeEngine.fail_window_s = 3.0
+    session, link, telemetry = audio_session(monkeypatch, tmp_path, "--beats")
+    assert telemetry.snapshot()["counters"]["beatsLoadFailed"] == 1
+    assert link.fields["beats"] is False and link.fields["beatsWindowsS"] is None
+    assert session.audio is not None and session.audio.tagger is None
+
+
+def test_the_windows_argument_and_the_enclaves_command_line():
+    parser = producer.build_parser()
+    base = ["--analysis-socket", ""]
+    assert parser.parse_args(base).beats_windows_s == TAGGER_WINDOWS_S == (2.0, 3.0)
+    assert parser.parse_args([*base, "--beats-windows-s", "3, 2,3"]).beats_windows_s == (3.0, 2.0)
+    assert parser.parse_args([*base, "--beats-window-s", "2"]).beats_windows_s == (2.0,)
+    for bad in ("0", "-1", "x", "", "nan", "inf"):
+        with pytest.raises(SystemExit):
+            parser.parse_args([*base, "--beats-windows-s", bad])
+    with pytest.raises(argparse.ArgumentTypeError):
+        producer.parse_beats_windows(",")
+    entrypoint = (Path(__file__).resolve().parents[1] / "tee" / "entrypoint.sh").read_text()
+    assert "    --audio \\\n    --beats \\\n    --beats-windows-s 2,3 \\\n" in entrypoint

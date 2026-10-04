@@ -78,16 +78,18 @@ Inside the enclave, in code that is in this repository:
   "speech" so that talk can be told apart and set aside, and the room's
   own sounds (music, a fan, rain, a machine's hum) so that a person's sound
   over a background can be told from the background. The window's level
-  and pitch go with the scores. No speech recognition or transcription
-  runs; a class score is not a word or a voice, and nothing identifies the
-  voice.
-- Every second, the trailing two-second window is also scored by a second
-  AudioSet tagger, BEATs (Microsoft's, from microsoft/unilm), against the
-  same 527 classes. The same pass yields a mean-pooled summary of the
-  window: 768 numbers, the average of the model's last layer over the
-  window, from which the window's samples and words cannot be recovered.
-  Both go to the analysis module and into the session record, beside the
-  first tagger's scores.
+  and pitch go with the scores, and once a second four numbers about the
+  second just heard: its spectrum's centroid and flatness, the share of
+  its power under 300 Hz, and its level. No speech recognition or
+  transcription runs; a class score is not a word or a voice, and nothing
+  identifies the voice.
+- Every second, the trailing two-second and three-second windows are each
+  also scored by a second AudioSet tagger, BEATs (Microsoft's, from
+  microsoft/unilm), against the same 527 classes. Each pass yields a
+  mean-pooled summary of its window: 768 numbers, the average of the
+  model's last layer over the window, from which the window's samples and
+  words cannot be recovered. Both go to the analysis module and into the
+  session record, beside the first tagger's scores.
 - Frames and audio are then discarded. Nothing of them is written to disk;
   the VM has no persistent storage and nobody at masseuse.ai can read its
   memory.
@@ -319,8 +321,8 @@ What the enclave writes (`workload/producer/record.py`):
 | --- | --- | --- |
 | `poses/`, `faces/` | Every keypoint-model result of the body and face views: all 308 keypoints with scores, the person box, the frame size, the flags (`dropped`, `error`, `identityUnresolved`); one row per pose step, keypoint-less rows where a step had none | Parquet (zstd), one file per window |
 | `frames/` | The assembler's 21-point rows at the frame rate with the regional motion descriptors (the `frame` message of `analysis/protocol.md`) | gzipped JSONL |
-| `audio/`, `segments/` | The audio stage's half-second measurements (the classifier's scores for all its classes, level, pitch) and the spans the analysis asked it to type | gzipped JSONL |
-| `beats/` | The second tagger's rows, one a second: its scores for the 527 classes and the window's mean-pooled summary (the `beats` message of `analysis/protocol.md`) | gzipped JSONL |
+| `audio/`, `segments/` | The audio stage's half-second measurements (the classifier's scores for all its classes, level, pitch, and on each whole second that second's spectral shape) and the spans the analysis asked it to type | gzipped JSONL |
+| `beats/` | The second tagger's rows, two a second, one per window (two and three seconds): its scores for the 527 classes and the window's mean-pooled summary (the `beats` message of `analysis/protocol.md`) | gzipped JSONL |
 | `vocal/` | The analysis module's vocalization judgements, one row each | gzipped JSONL |
 | `onsets/`, `events/`, `payloads/`, `posts/` | What the analysis decided, and the readings it posted | gzipped JSONL |
 | `telemetry/` | The process's counters and gauges once a second | gzipped JSONL |

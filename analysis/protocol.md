@@ -7,7 +7,8 @@ user's media:
   runs person detection and keypoint detection, computes regional motion
   descriptors, draws the view returned to the user, and, when the stream has an audio
   track, classifies it into non-speech vocalization labels with level and
-  pitch, and scores it once a second with a second AudioSet tagger
+  pitch, measures the spectral shape of each second, and scores it once a
+  second with a second AudioSet tagger over two trailing windows
   (`workload/audio/`). Every line that reads a frame or an audio sample is
   in this repository.
 - the **analysis** process: receives keypoints, descriptors and audio
@@ -57,7 +58,7 @@ not cross it.
  "audioLabels": ["Speech", "Male speech, man speaking", "..."],
  "beats": true, "beatsModel": "unilm-beats:BEATs_iter3_plus_AS2M_finetuned_on_AS2M_cpt2.pt",
  "beatsClassIds": ["/m/078jl", "/m/07rjwbb", "..."], "beatsWindowS": 2.0,
- "beatsHopS": 1.0, "beatsEmbeddingSize": 768}
+ "beatsWindowsS": [2.0, 3.0], "beatsHopS": 1.0, "beatsEmbeddingSize": 768}
 ```
 
 - `fps`: the decode cadence the `frame` messages arrive at.
@@ -92,9 +93,13 @@ not cross it.
   tagger runs (`beats` messages may follow). `beatsModel` names its code
   and checkpoint; `beatsClassIds` its 527 classes by AudioSet ontology id,
   in the order its `scores` follow (the model's own, which is not the
-  classifier's); `beatsWindowS` and `beatsHopS` the trailing window it
-  reads and how often; `beatsEmbeddingSize` the length of its `embedding`.
-  All `null` when it does not run.
+  classifier's); `beatsWindowsS` (absent in older producers, then
+  `[beatsWindowS]`) the trailing windows it reads, in seconds, in the
+  order each hop's messages follow (`[2.0, 3.0]` in the enclave: the same
+  checkpoint, one engine per window); `beatsWindowS` the first of them,
+  the one it read alone before; `beatsHopS` how often it reads them;
+  `beatsEmbeddingSize` the length of its `embedding`. All `null` when it
+  does not run.
 - `views` (absent in older producers, then `["body"]`): the camera views
   the session reads. `["body"]` is one camera. `["body", "face"]` is a
   fixed camera behind the user as the body view - everything below that
@@ -150,7 +155,11 @@ Only in a session whose `hello` listed a `face` view.
   (`workload/pixel/keypoints.py`, `FACE`, indices 70-307: midline,
   eyebrows, eyelids, nose, lips, ears, iris, pupil) beside the 21 body
   points, so the analysis can measure the expression; a body row names the
-  body points only.
+  body points only. From v0.14.0 a face row names every point of the
+  result (indices 0-307), as the record carries it: both hands
+  (`RIGHT_HAND`, `LEFT_HAND`, 21-62) and the arms' and neck's points
+  (63-69) as well, so the analysis can tell how near a hand is to the face
+  and how the shoulders and neck move.
 
 Face rows carry no descriptors: the regional motion descriptors are the
 body view's alone.
@@ -196,12 +205,14 @@ the frame; none of them can be inverted into an image.
 ### `audio`, every half second of the audio track
 
 ```json
-{"kind": "audio", "atS": 12.5, "streamS": 12.63, "hopS": 0.5, "windowS": 2.0,
+{"kind": "audio", "atS": 13.0, "streamS": 13.13, "hopS": 0.5, "windowS": 2.0,
  "scores": {"Wail, moan": 0.0021, "Groan": 0.0007, "Breathing": 0.31, "...": "..."},
  "all": [0.0142, 0.0003, "..."],
  "pitch": {"pitchHz": 142.3, "pitchConfidence": 0.61, "voicedFramePct": 38.2,
            "loudnessDbfs": -31.4},
- "frames": [[12.032, -47.2, null], [12.048, -41.9, 139.8], "..."]}
+ "spectral": {"centroidHz": 1184.0731526407372, "flatness": 0.021374905114062,
+              "lowShare": 0.15420877950668417, "rmsDbfs": -31.86203384399414},
+ "frames": [[12.532, -47.2, null], [12.548, -41.9, 139.8], "..."]}
 ```
 
 Sent only when the stream has an audio track (`workload/audio/audio_stage.py`).
@@ -226,13 +237,27 @@ Sent only when the stream has an audio track (`workload/audio/audio_stage.py`).
   the frames that had one (`null` if none did), the median periodicity
   confidence of those frames, the percentage of frames that had a pitch,
   and the RMS level in dBFS.
+- `spectral` (absent in older producers, and on a hop that does not end
+  on a whole second: every other hop): the shape and level of the second
+  that ends at `atS`, [`atS` - 1, `atS`), from one Hann-windowed FFT of
+  its 16,000 samples (`workload/audio/audio_features.py`,
+  `second_spectral`): `centroidHz`, the power spectrum's centroid;
+  `flatness`, its spectral flatness, the geometric mean of the power
+  (floored at 1e-12) over its arithmetic mean, near 0 for a pure tone and
+  high for noise; `lowShare`, the share of the power under 300 Hz, where a
+  machine's hum sits; `rmsDbfs`, the second's RMS level. Unrounded, as
+  computed; `null` where a second has nothing to measure (the shape of
+  digital silence). These are not the `segment` statistics of similar
+  names: the centroid here weighs the power spectrum, the `segment`'s the
+  magnitude spectrum, and those are rounded.
 - `frames`: the contour of the new samples, one entry per 16 ms frame
   (64 ms window): `[time on the audio clock, level in dBFS, pitch in Hz or
   null]`. Every frame is sent exactly once. A frame is about 40 bytes; a
   second of audio becomes about 60 frames.
 
 Nothing in an `audio` message can be turned back into sound: a level and a
-pitch per 16 ms is not a waveform, and the labels are class scores.
+pitch per 16 ms is not a waveform, four statistics of a second's spectrum
+are not that spectrum, and the labels are class scores.
 
 ### `beats`, every second of the audio track
 
@@ -246,16 +271,22 @@ pitch per 16 ms is not a waveform, and the labels are class scores.
 Sent only when the stream has an audio track and `hello.beats` is true
 (`workload/audio/beats.py`: BEATs, an AudioSet tagger from microsoft/unilm,
 run by the audio stage on a thread of its own). One message per `hopS` of
-audio, each over the trailing `windowS` window ending exactly at `atS`; the
-stream's first window is zero-padded on the left. Because the tagger has
+audio and window length in `hello.beatsWindowsS`, each over the trailing
+`windowS` window ending exactly at `atS`, a hop's in that order; the
+stream's first windows are zero-padded on the left. Because the tagger has
 its own thread, a `beats` message can arrive after the `audio` messages of
-later hops, and a window is skipped rather than queued when the tagger
-falls behind (the producer counts it, `beatsDropped`).
+later hops, and a hop's windows are skipped rather than queued when the
+tagger falls behind (the producer counts each, `beatsDropped`). The
+enclave's producer reads a 3 s window beside the 2 s one (older producers
+read the 2 s alone): the same model and hop, its own engine, its messages
+told apart by `windowS`; the 2 s window's messages are as they were.
 
 - `atS`: the window's end on the audio clock, a multiple of `hopS`;
   `streamS`: the producer's frame clock when the message was sent; `lagS`:
   their difference, the window's whole delay (the decode, the wait for the
-  tagger, its compute); `computeMs`: the tagger's compute for this window.
+  tagger, its compute; a 3 s window's includes the 2 s window's compute
+  before it); `windowS`: the window's length; `computeMs`: the tagger's
+  compute for this window.
 - `scores`: per-window class scores, the tagger's score for each of the
   527 AudioSet classes over the window, to three significant digits (most
   classes score far under a thousandth; a fixed number of decimals would
@@ -424,6 +455,11 @@ display's head channels in `wire` follow the newest row too, and while that
 row is predicted `wire` holds the last fitted rows' face where it was
 `null`. `channels` and everything read from them, `hazard` among them, are
 as before.
+`events`, when present (a bundle from 2026.10.04-3 on), is the same for the
+reading's `events` block (`post`, below): for each of its two detectors,
+`onsetEnd` and `peak`, the model's version and SHA-256, the operating rate
+it is set at, in false calls an hour, and the threshold that rate gives;
+numbers and names, kept in `hello.json` the same way.
 
 ### `post`, at the post cadence
 
@@ -440,7 +476,24 @@ on its first 45 s of descriptors: `readyAtS`, the stream instant it did,
 and `onsets`, how many contractions it decoded in that span, which it holds
 until its channel is final and never counts into the reading's recent
 onsets; `null` before, and the count may read 0 in the reading that carries
-the instant and fill in the next. Besides the readings, a leased session's
+the instant and fill in the next.
+From bundle 2026.10.04-3 the body also carries `events` (`modelVersion`
+`events/v1`): two detectors over the reading's per-second channels, one
+that calls the start and the end of a response, the other a single peak.
+`onsetEnd` is the first's state at the reading: `p`, the detector's
+smoothed probability for the second; `threshold`, the operating level it
+calls at; `open`, whether an event is open; `active`, whether an onset has
+been called and its end not yet; `onsetAtS`, the open event's start once
+it is called, and `calledAtS`, when that onset was called; `endAtS` and
+`endCalledAtS`, the last event's end and when it was called. `peak` is the
+second detector's: `p` and `threshold` likewise, `calledAtS` its last call
+and `peakAtS` the peak's time. `calls` lists the last eight calls of both,
+oldest first, each with its `kind` (`onset`, `end` or `peak`), `atS` (when
+it was called), `eventAtS` (the instant it names) and `score`; the list is
+repeated in every reading, so a reading superseded before it was read loses
+no call. Every time is on the reading's clock (`atS`); the detectors'
+constants are `ready.events` (above).
+Besides the readings, a leased session's
 record (`workload/producer/record.py`, described in the README under
 "Session records") is the other path out of the enclave: the keypoints,
 descriptors, audio measurements (the second tagger's `beats` rows among
@@ -585,9 +638,10 @@ Frames and audio samples exist in the producer process and nowhere else.
 Between the producer and the analysis process travel keypoints (named
 points in pixel coordinates), the descriptors above (per-window statistics
 of brightness and optical flow in a body-carried frame), the audio
-measurements above (class scores, a level and a pitch per frame, and the
-same over spans the analysis asks about; the second tagger's class scores
-and its mean-pooled summary of each window, once a second), and the
+measurements above (class scores, a level and a pitch per frame, four
+statistics of each second's spectrum, and the same over spans the
+analysis asks about; the second tagger's class scores and its mean-pooled
+summary of each of its windows, once a second), and the
 analysis's own numbers
 coming back. The analysis bundle can be shown to be the one the lock names
 (its SHA-256 is checked before it starts, and the lock is inside the

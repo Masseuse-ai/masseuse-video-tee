@@ -212,6 +212,7 @@ python3 /app/workload/producer/producer.py \
     --face-frame-interval-s 0.2 \
     --audio \
     --beats \
+    --beats-windows-s 2,3 \
     --analysis-socket "$ANALYSIS_SOCKET" \
     --sink-dir /run/tee/capture \
     --capture-bucket "" \

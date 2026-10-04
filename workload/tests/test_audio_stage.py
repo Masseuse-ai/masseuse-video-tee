@@ -3,8 +3,10 @@
 A scripted classifier stands in for CED and a list of chunks for the
 source. What is checked is the shape of every outgoing message against
 analysis/protocol.md, that samples are never among them, that the frame
-contour is sent exactly once, and how `classify` requests are answered
-against the rolling history.
+contour is sent exactly once, how `classify` requests are answered
+against the rolling history, and that each whole second's spectral
+statistics are the per-second definition the analysis reads, over the
+second the hop ends.
 """
 
 from __future__ import annotations
@@ -17,7 +19,8 @@ import subprocess
 import numpy as np
 import pytest
 
-from audio_features import loudness_stats, pitch_stats, spectral_stats
+from audio_features import (SECOND_SAMPLES, loudness_stats, pitch_stats,
+                            second_spectral, spectral_stats)
 from audio_stage import (HISTORY_S, SAMPLE_RATE, AudioSource, AudioStage,
                          WINDOW_S)
 from ced import TARGET_LABELS
@@ -126,6 +129,10 @@ def test_every_hop_emits_one_audio_message_of_numbers_only():
     assert set(first["pitch"]) == {"pitchHz", "pitchConfidence",
                                    "voicedFramePct", "loudnessDbfs"}
     assert first["streamS"] == 12.25
+    # The hops that end on a whole second also carry that second's spectrum.
+    assert [m["atS"] for m in audio if "spectral" in m] == [1.0, 2.0, 3.0]
+    assert set(audio[1]) == set(first) | {"spectral"}
+    assert set(audio[1]["spectral"]) == {"centroidHz", "flatness", "lowShare", "rmsDbfs"}
     # Serialisable, and nothing sample-sized in it: a hop of audio is 8000
     # numbers, a hop of contour is ~31 frames of three.
     text = json.dumps(sent)
@@ -449,3 +456,134 @@ def test_segment_features_on_a_breath_and_a_tone():
     assert spectral_stats(np.zeros(100, dtype=np.float32)) == {
         "centroidHz": None, "rolloff85Hz": None, "flatness": None, "lowShare300": None}
     assert spectral_stats(np.zeros(4000, dtype=np.float32))["flatness"] is None
+
+
+# -- each whole second's spectral statistics ----------------------------------
+
+def _reference_rms_dbfs(wav):
+    if wav.size == 0:
+        return -90.0
+    rms = float(np.sqrt(np.mean(np.square(wav, dtype=np.float64))))
+    return max(-90.0, 20.0 * math.log10(max(rms, 10 ** (-90.0 / 20.0))))
+
+
+def reference_per_second(wav, seconds):
+    """The per-second definition the analysis's channels were computed
+    with, as that computation wrote it: row T is the second [T - 1, T)
+    (row 0 repeats row 1), float32, NaN where nothing was measured."""
+    sr = SAMPLE_RATE
+    centroid = np.full(seconds, np.nan, dtype=np.float32)
+    flatness = np.full(seconds, np.nan, dtype=np.float32)
+    low_share = np.full(seconds, np.nan, dtype=np.float32)
+    rms = np.full(seconds, np.nan, dtype=np.float32)
+    freqs = np.fft.rfftfreq(sr, 1.0 / sr)
+    low = freqs < 300.0
+    window = np.hanning(sr).astype(np.float32)
+    for second in range(seconds):
+        lo = (second - 1) * sr if second > 0 else 0
+        hi = min(len(wav), lo + sr)
+        chunk = wav[lo:hi]
+        if chunk.size < sr // 2:
+            continue
+        chunk = np.pad(chunk, (0, sr - chunk.size))
+        rms[second] = _reference_rms_dbfs(chunk)
+        spectrum = np.abs(np.fft.rfft(chunk.astype(np.float64) * window))
+        power = spectrum ** 2
+        total = float(power.sum())
+        if total <= 1e-12:
+            continue
+        centroid[second] = float((freqs * power).sum() / total)
+        low_share[second] = float(power[low].sum() / total)
+        geometric = float(np.exp(np.mean(np.log(power + 1e-12))))
+        flatness[second] = geometric / (total / len(power))
+    return {"centroidHz": centroid, "flatness": flatness, "lowShare": low_share, "rmsDbfs": rms}
+
+
+def assert_is_reference_row(measured, reference, second):
+    """`measured` (second_spectral's, float64 or None) is row `second` of
+    `reference` to the float32 the reference keeps: the same bits."""
+    assert set(measured) == {"centroidHz", "flatness", "lowShare", "rmsDbfs"}
+    for key, column in reference.items():
+        want = column[second]
+        if np.isnan(want):
+            assert measured[key] is None, (key, second, measured[key])
+        else:
+            assert isinstance(measured[key], float), (key, second)
+            assert np.float32(measured[key]) == want, (key, second, measured[key], want)
+
+
+def noise(seconds, amplitude=0.1, seed=3):
+    rng = np.random.default_rng(seed)
+    return (amplitude * rng.standard_normal(int(SAMPLE_RATE * seconds))).astype(np.float32)
+
+
+def test_second_spectral_is_the_per_second_definition():
+    """Tone, noise and silence, and a stream's last part second: each the
+    reference's row to the float32 bit, and the numbers say what they
+    are (a tone is all at its frequency and not flat, noise is flat,
+    silence has a level and no shape)."""
+    for wav in (tone(3.0, hz=440.0), tone(3.0, hz=150.0, amplitude=0.05),
+                noise(3.0), silence(3.0),
+                np.concatenate([tone(1.0, hz=1000.0), silence(1.0), noise(1.0, amplitude=0.01)])):
+        reference = reference_per_second(wav, 4)
+        for second in (1, 2, 3):
+            measured = second_spectral(wav[(second - 1) * SAMPLE_RATE:second * SAMPLE_RATE])
+            assert_is_reference_row(measured, reference, second)
+    # A last part second: zero-padded from half a second on, nothing below.
+    for seconds_long, measured_tail in ((2.6, True), (2.5, True), (2.3, False)):
+        wav = noise(seconds_long)
+        reference = reference_per_second(wav, 4)
+        tail = second_spectral(wav[2 * SAMPLE_RATE:])
+        assert_is_reference_row(tail, reference, 3)
+        assert (tail["rmsDbfs"] is not None) is measured_tail
+    pure = second_spectral(tone(1.0, hz=1000.0))
+    assert abs(pure["centroidHz"] - 1000.0) < 5.0 and pure["lowShare"] < 0.01
+    assert pure["flatness"] < 0.01 < second_spectral(noise(1.0))["flatness"]
+    assert second_spectral(tone(1.0, hz=150.0))["lowShare"] > 0.99
+    assert second_spectral(tone(1.0, hz=200.0, amplitude=0.1))["rmsDbfs"] == pytest.approx(-23.0, abs=0.1)
+    assert second_spectral(silence(1.0)) == {"centroidHz": None, "flatness": None,
+                                             "lowShare": None, "rmsDbfs": -90.0}
+    assert second_spectral(silence(0.4)) == {"centroidHz": None, "flatness": None,
+                                             "lowShare": None, "rmsDbfs": None}
+    assert SECOND_SAMPLES == SAMPLE_RATE
+
+
+def test_spectral_rides_on_the_hops_that_end_on_a_whole_second():
+    """Every other 0.5 s hop ends on a whole second T, and its `audio`
+    message carries the statistics of [T - 1, T): row T of the reference
+    over the stream's samples. Each second here is a different sound, so
+    a window a hop off would read the wrong one."""
+    pcm = np.concatenate([silence(1.0), tone(1.0, hz=200.0), noise(1.0),
+                          tone(1.0, hz=1000.0), noise(0.5, amplitude=0.02)])
+    _, sent, _, _ = run_stage(hops(pcm))
+    audio = [m for m in sent if m["kind"] == "audio"]
+    assert [m["atS"] for m in audio] == [0.5 * k for k in range(1, 10)]
+    measured = {m["atS"]: m["spectral"] for m in audio if "spectral" in m}
+    assert sorted(measured) == [1.0, 2.0, 3.0, 4.0]
+    reference = reference_per_second(pcm, 5)
+    for at_s, spectral in measured.items():
+        assert_is_reference_row(spectral, reference, int(at_s))
+        second = pcm[int(at_s - 1) * SAMPLE_RATE:int(at_s) * SAMPLE_RATE]
+        assert spectral == second_spectral(second)
+    assert measured[1.0] == {"centroidHz": None, "flatness": None, "lowShare": None, "rmsDbfs": -90.0}
+    assert measured[2.0]["lowShare"] > 0.99 and measured[2.0]["flatness"] < 0.01
+    assert measured[3.0]["flatness"] > 0.3
+    assert abs(measured[4.0]["centroidHz"] - 1000.0) < 5.0
+    # Numbers only, unrounded floats beside the hop's other fields.
+    json.dumps(sent, allow_nan=False)
+    assert all(isinstance(v, float) for v in measured[3.0].values())
+
+
+def test_spectral_follows_the_whole_seconds_whatever_the_chunk_size():
+    """Chunks of another size: a hop that ends on a whole second carries
+    that second, one that only spans it does not."""
+    pcm = np.concatenate([noise(1.0, seed=5), tone(1.0, hz=300.0), noise(1.2, seed=6)])
+    reference = reference_per_second(pcm, 4)
+    _, quarter, _, _ = run_stage(hops(pcm, hop_s=0.25))
+    measured = {m["atS"]: m["spectral"] for m in quarter if "spectral" in m}
+    assert sorted(measured) == [1.0, 2.0, 3.0]
+    for at_s, spectral in measured.items():
+        assert_is_reference_row(spectral, reference, int(at_s))
+    _, odd, _, _ = run_stage(hops(pcm, hop_s=0.3))
+    assert [m["atS"] for m in odd if "spectral" in m] == [3.0]
+    assert_is_reference_row(next(m["spectral"] for m in odd if "spectral" in m), reference, 3)

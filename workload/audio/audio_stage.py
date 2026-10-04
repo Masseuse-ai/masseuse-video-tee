@@ -11,17 +11,20 @@ it into numbers for the analysis process (analysis/protocol.md):
   `WINDOW_S` window, the whole class table over the same window (`all`, one
   score per class in the model's order, so the analysis can read the room:
   music, a fan, rain, a machine's hum), a pitch and level summary of the
-  window, and the per-frame level and pitch contour of the new samples;
+  window, the per-frame level and pitch contour of the new samples, and,
+  on a hop that ends on a whole second, the spectral shape and level of
+  that second (`spectral`, audio_features.second_spectral);
 - on request (`classify`, from the analysis), a `segment` message: the
   same measurements over one short span the analysis names, taken from the
   history, so that a sound it proposed from the frame contour can be typed
   and measured as a whole;
-- with a second tagger (beats.py), every `TAGGER_HOP_S` of audio a `beats`
-  message: that model's scores for the 527 AudioSet classes over the
-  trailing `TAGGER_WINDOW_S` window, and its 768-value summary of the same
-  window (the mean of its encoder's last layer over the window's patches).
-  The tagger runs on its own thread (`TaggerWorker`), so a slow window
-  never delays the hop's `audio` message.
+- with a second tagger (beats.py), every `TAGGER_HOP_S` of audio one
+  `beats` message per window it reads (a session's are `TAGGER_WINDOWS_S`,
+  one engine each): that model's scores for the 527 AudioSet classes over
+  the trailing window, and its 768-value summary of the same window (the
+  mean of its encoder's last layer over the window's patches). The tagger
+  runs on its own thread (`TaggerWorker`), so a slow window never delays
+  the hop's `audio` message.
 
 Samples never leave this process: the history is discarded as it ages out
 and when the session ends, and no sample is recorded. What crosses the
@@ -43,7 +46,7 @@ from typing import Callable, Iterable
 import numpy as np
 
 from audio_features import (CED_MIN_CONTEXT_S, loudness_stats, pitch_stats,
-                            spectral_stats)
+                            second_spectral, spectral_stats)
 from ced import TARGET_LABELS
 from pitch import estimate_pitch, pitch_frames
 
@@ -75,6 +78,11 @@ NO_TRACK_RETRY_S = 5.0
 # (atS 1.0, 2.0, ...), zeros on the left before the stream has that much.
 TAGGER_HOP_S = 1.0
 TAGGER_WINDOW_S = 2.0
+# A session's tagger reads one window of each of these lengths at every
+# hop, in this order. The first is the window it read alone before, the
+# one `hello.beatsWindowS` names: its messages and its telemetry's names
+# are unchanged.
+TAGGER_WINDOWS_S = (2.0, 3.0)
 # Its 527 scores to three significant digits rather than a fixed number of
 # decimals: most of a window's classes score far below a thousandth, and
 # what tells them apart is their relative size, which four decimals erase;
@@ -241,55 +249,71 @@ def classify_scores(classifier, wav: np.ndarray) -> tuple[dict[str, float], list
 
 
 class TaggerWorker(threading.Thread):
-    """The second tagger's windows, one at a time, off the stage thread.
+    """The second tagger's windows, one hop at a time, off the stage thread.
 
-    `offer` hands over a window and returns at once. A window offered while
-    the previous one is still being tagged waits; a newer one replaces a
-    waiting one (counted, `beatsDropped`), so the tagger never holds up the
-    stage and never falls more than one window behind. Each tagged window
-    is one `beats` message: its end on the audio clock (`atS`), the stream
-    clock when it was sent (`streamS`, and `lagS`, their difference: the
-    window's whole delay, decode and wait and compute), the compute time
-    (`computeMs`), the scores and the embedding.
+    `taggers` pairs each window length with what tags windows of that
+    length (one beats.BeatsEngine each, or a stand-in). A hop has one
+    window of each, tagged in that order, so a later window never delays
+    the first's message. `offer` hands over a hop's windows and returns at
+    once. A hop offered while the previous one is still being tagged
+    waits; a newer one replaces a waiting one (its windows counted,
+    `beatsDropped`), so the tagger never holds up the stage and never
+    falls more than one hop behind. Each tagged window is one `beats`
+    message: its end on the audio clock (`atS`), the stream clock when it
+    was sent (`streamS`, and `lagS`, their difference: the window's whole
+    delay, decode and wait and compute), its length (`windowS`), the
+    compute time (`computeMs`), the scores and the embedding. The first
+    window's compute is the `beats` stage and its `beatsMs` and
+    `beatsLagS` gauges; a later window's carry its length (`beatsW3`,
+    `beatsW3Ms`, `beatsW3LagS`). `beatsWindows`, `beatsDropped` and
+    `beatsErrors` count windows of every length.
 
-    `synchronous` tags each window inside `offer` instead, on the caller's
-    thread: every window, in order, none dropped. That is the offline
-    replay's mode and the tests'; a session never uses it.
+    `synchronous` tags each hop's windows inside `offer` instead, on the
+    caller's thread: every window, in order, none dropped. That is the
+    offline replay's mode and the tests'; a session never uses it.
     """
 
-    def __init__(self, tagger, emit: Callable[[dict], None], telemetry,
+    def __init__(self, taggers, emit: Callable[[dict], None], telemetry,
                  stream_clock: Callable[[], float | None],
-                 hop_s: float = TAGGER_HOP_S, window_s: float = TAGGER_WINDOW_S,
-                 synchronous: bool = False):
+                 hop_s: float = TAGGER_HOP_S, synchronous: bool = False):
         super().__init__(daemon=True, name="audio-tagger")
-        self.tagger = tagger
+        self.taggers = tuple((float(window_s), tagger) for window_s, tagger in taggers)
+        if not self.taggers:
+            raise ValueError("a tagger worker needs a tagger")
+        self.names = tuple("beats" if index == 0 else f"beatsW{window_s:g}"
+                           for index, (window_s, _) in enumerate(self.taggers))
         self.emit = emit
         self.telemetry = telemetry
         self.stream_clock = stream_clock
         self.hop_s = hop_s
-        self.window_s = window_s
         self.synchronous = synchronous
         self._ready = threading.Condition()
-        self._pending: tuple[float, np.ndarray] | None = None
+        self._pending: tuple[float, list[np.ndarray]] | None = None
         self._stopping = False
         self.windows = 0
         self.dropped = 0
+
+    @property
+    def windows_s(self) -> tuple[float, ...]:
+        return tuple(window_s for window_s, _ in self.taggers)
 
     def start(self) -> None:
         if not self.synchronous:
             super().start()
 
-    def offer(self, at_s: float, window: np.ndarray) -> None:
+    def offer(self, at_s: float, windows: list[np.ndarray]) -> None:
+        """One hop's windows, one per tagger in `taggers`' order."""
         if self.synchronous:
-            self._tag_or_count(at_s, window)
+            self._tag_hop(at_s, windows)
             return
         with self._ready:
             if self._stopping:
                 return
             if self._pending is not None:
-                self.dropped += 1
-                self.telemetry.count("beatsDropped")
-            self._pending = (at_s, window)
+                replaced = len(self._pending[1])
+                self.dropped += replaced
+                self.telemetry.count("beatsDropped", replaced)
+            self._pending = (at_s, windows)
             self._ready.notify()
 
     def run(self) -> None:
@@ -299,19 +323,21 @@ class TaggerWorker(threading.Thread):
                     self._ready.wait()
                 if self._stopping:
                     return
-                at_s, window = self._pending
+                at_s, windows = self._pending
                 self._pending = None
-            self._tag_or_count(at_s, window)
+            self._tag_hop(at_s, windows)
 
-    def _tag_or_count(self, at_s: float, window: np.ndarray) -> None:
-        try:
-            self._tag(at_s, window)
-        except Exception as error:  # noqa: BLE001 - said aloud, survived
-            self.telemetry.count("beatsErrors")
-            print(f"audio: tagger failed at {at_s:.1f}s: {error!r}", flush=True)
+    def _tag_hop(self, at_s: float, windows: list[np.ndarray]) -> None:
+        for index, window in enumerate(windows):
+            try:
+                self._tag(index, at_s, window)
+            except Exception as error:  # noqa: BLE001 - said aloud, survived
+                self.telemetry.count("beatsErrors")
+                print(f"audio: tagger failed at {at_s:.1f}s "
+                      f"({self.taggers[index][0]:g} s window): {error!r}", flush=True)
 
     def stop(self, timeout_s: float = 5.0) -> None:
-        """No more windows: the one waiting is dropped, the one being tagged
+        """No more windows: the hop waiting is dropped, the one being tagged
         finishes, and the thread ends."""
         with self._ready:
             self._stopping = True
@@ -320,25 +346,27 @@ class TaggerWorker(threading.Thread):
         if self.is_alive():
             self.join(timeout=timeout_s)
 
-    def _tag(self, at_s: float, window: np.ndarray) -> None:
+    def _tag(self, index: int, at_s: float, window: np.ndarray) -> None:
+        window_s, tagger = self.taggers[index]
+        name = self.names[index]
         started = time.monotonic()
-        with self.telemetry.time_stage("beats"):
-            scores, embedding = self.tagger.tag(window)
+        with self.telemetry.time_stage(name):
+            scores, embedding = tagger.tag(window)
         compute_ms = (time.monotonic() - started) * 1000.0
         stream_s = self.stream_clock()
         lag_s = float(stream_s) - at_s if stream_s is not None else None
         self.windows += 1
         self.telemetry.count("beatsWindows")
-        self.telemetry.gauge("beatsMs", round(compute_ms, 1))
+        self.telemetry.gauge(f"{name}Ms", round(compute_ms, 1))
         if lag_s is not None:
-            self.telemetry.gauge("beatsLagS", round(lag_s, 3))
+            self.telemetry.gauge(f"{name}LagS", round(lag_s, 3))
         self.emit({
             "kind": "beats",
             "atS": round(at_s, 3),
             "streamS": round(float(stream_s), 3) if stream_s is not None else None,
             "lagS": round(lag_s, 3) if lag_s is not None else None,
             "hopS": self.hop_s,
-            "windowS": self.window_s,
+            "windowS": window_s,
             "computeMs": round(compute_ms, 1),
             "scores": [_significant(float(value), TAGGER_SCORE_DIGITS) for value in scores],
             "embedding": [round(float(value), TAGGER_EMBEDDING_DECIMALS) for value in embedding],
@@ -352,10 +380,11 @@ class AudioStage(threading.Thread):
     stand-in) and, when it can, `classify_all(wav)` for the whole class
     table; `emit` receives every outgoing message; `stream_clock` returns
     the producer's current stream time so the analysis can line the audio
-    clock up with the frames. `tagger`, when given, has
-    `tag(window) -> (scores, summary)` over windows of
-    `tagger_window_s` (beats.BeatsEngine, or a stand-in), run every
-    `tagger_hop_s` of audio on a `TaggerWorker`.
+    clock up with the frames. `taggers`, when given, pairs window lengths
+    with what has `tag(window) -> (scores, summary)` over windows of that
+    length (beats.BeatsEngine, or a stand-in), each run every
+    `tagger_hop_s` of audio on one `TaggerWorker`; `tagger` with
+    `tagger_window_s` is the same for one window.
     """
 
     def __init__(self, source, classifier, emit: Callable[[dict], None],
@@ -364,8 +393,16 @@ class AudioStage(threading.Thread):
                  window_s: float = WINDOW_S, history_s: float = HISTORY_S,
                  tagger=None, tagger_hop_s: float = TAGGER_HOP_S,
                  tagger_window_s: float = TAGGER_WINDOW_S,
-                 tagger_synchronous: bool = False):
+                 tagger_synchronous: bool = False, taggers=None):
         super().__init__(daemon=True, name="audio")
+        if tagger is not None and taggers:
+            raise ValueError("tagger or taggers, not both")
+        if taggers:
+            taggers = tuple((float(length_s), engine) for length_s, engine in taggers)
+        elif tagger is not None:
+            taggers = ((float(tagger_window_s), tagger),)
+        else:
+            taggers = ()
         self.source = source
         self.classifier = classifier
         self.emit = emit
@@ -374,10 +411,10 @@ class AudioStage(threading.Thread):
         self.pitch_estimator = pitch_estimator
         self.hop_s = hop_s
         self.window_samples = int(window_s * SAMPLE_RATE)
-        # The history must hold the tagger's window as well as the
+        # The history must hold the tagger's longest window as well as the
         # classifier's and the `classify` spans'.
-        self.history_samples = int((max(history_s, tagger_window_s) if tagger is not None
-                                    else history_s) * SAMPLE_RATE)
+        longest_s = max((length_s for length_s, _ in taggers), default=0.0)
+        self.history_samples = int(max(history_s, longest_s) * SAMPLE_RATE)
         self.history = np.empty(0, dtype=np.float32)
         self.total_samples = 0
         self.last_frame_time_s = -1.0
@@ -385,11 +422,11 @@ class AudioStage(threading.Thread):
         self.requests: queue.Queue = queue.Queue(maxsize=REQUEST_QUEUE_DEPTH)
         self.stopping = threading.Event()
         self.tagger_hop_samples = max(1, int(round(tagger_hop_s * SAMPLE_RATE)))
-        self.tagger_window_samples = int(round(tagger_window_s * SAMPLE_RATE))
-        self.tagger = (TaggerWorker(tagger, emit, telemetry, stream_clock,
-                                    hop_s=tagger_hop_s, window_s=tagger_window_s,
-                                    synchronous=tagger_synchronous)
-                       if tagger is not None else None)
+        self.tagger_window_samples = tuple(int(round(length_s * SAMPLE_RATE))
+                                           for length_s, _ in taggers)
+        self.tagger = (TaggerWorker(taggers, emit, telemetry, stream_clock,
+                                    hop_s=tagger_hop_s, synchronous=tagger_synchronous)
+                       if taggers else None)
 
     # -- the thread ---------------------------------------------------------
 
@@ -403,7 +440,7 @@ class AudioStage(threading.Thread):
                 self.feed(pcm)
         finally:
             # The session is over: pending requests are told so, and the
-            # samples go with it (the tagger's waiting window too).
+            # samples go with it (the tagger's waiting windows too).
             self._serve(drain=True)
             if self.tagger is not None:
                 self.tagger.stop()
@@ -441,11 +478,13 @@ class AudioStage(threading.Thread):
         end_s = self.end_s
         self.history = np.concatenate((self.history, pcm))[-self.history_samples:]
         window = self.history[-self.window_samples:]
-        # The hop's three costs, each its own stage beside the whole: the
+        # The hop's costs, each its own stage beside the whole: the
         # classifier over the window, the pitch summary over the window,
-        # the contour of the new samples. 2026-09-16 the whole read 750 ms
-        # (p50) per 0.5 s hop and nothing said which part; the stage fell
-        # to half real time and the pre-current baseline minute took two.
+        # the contour of the new samples, and on a whole second the
+        # second's spectrum. 2026-09-16 the whole read 750 ms (p50) per
+        # 0.5 s hop and nothing said which part; the stage fell to half
+        # real time and the pre-current baseline minute took two.
+        spectral = None
         with self.telemetry.time_stage("audio"):
             with self.telemetry.time_stage("audioClassify"):
                 scores, table = classify_scores(self.classifier, window)
@@ -453,6 +492,11 @@ class AudioStage(threading.Thread):
                 pitch = self.pitch_estimator(window, SAMPLE_RATE)
             with self.telemetry.time_stage("audioFrames"):
                 frames = self._fresh_frames(start_s, end_s)
+            if len(pcm) and self.total_samples % SAMPLE_RATE == 0:
+                # The second [end_s - 1, end_s), on the hop that ends on it:
+                # every other hop of the reader's.
+                with self.telemetry.time_stage("audioSpectral"):
+                    spectral = second_spectral(self.history[-SAMPLE_RATE:])
         self.hops += 1
         self.telemetry.count("audioHops")
         self.telemetry.gauge("audioS", end_s)
@@ -479,22 +523,27 @@ class AudioStage(threading.Thread):
         }
         if table is not None:
             message["all"] = table
+        if spectral is not None:
+            message["spectral"] = spectral
         self.emit(message)
 
     def _offer_tagger_windows(self, start_samples: int) -> None:
-        """The tagger's windows that end inside this hop: one per multiple of
-        its hop, each the trailing window ending exactly on that multiple,
-        zero-padded on the left before the stream has that much audio."""
+        """The tagger's windows that end inside this hop: at each multiple of
+        its hop, one of each of its lengths, each the trailing window ending
+        exactly on that multiple, zero-padded on the left before the stream
+        has that much audio."""
         hop = self.tagger_hop_samples
-        size = self.tagger_window_samples
         history_start = self.total_samples - len(self.history)
         end = (start_samples // hop + 1) * hop
         while end <= self.total_samples:
-            lo = end - size
-            window = self.history[max(0, lo - history_start):end - history_start]
-            if len(window) < size:
-                window = np.concatenate((np.zeros(size - len(window), dtype=np.float32), window))
-            self.tagger.offer(end / SAMPLE_RATE, np.array(window, dtype=np.float32))
+            windows = []
+            for size in self.tagger_window_samples:
+                lo = end - size
+                window = self.history[max(0, lo - history_start):end - history_start]
+                if len(window) < size:
+                    window = np.concatenate((np.zeros(size - len(window), dtype=np.float32), window))
+                windows.append(np.array(window, dtype=np.float32))
+            self.tagger.offer(end / SAMPLE_RATE, windows)
             end += hop
 
     def _fresh_frames(self, start_s: float, end_s: float) -> list[list]:
