@@ -390,6 +390,30 @@ the head's speed) by a fixed model whose identity the `face` constants name
 while the face is not present or its baseline is not ready. The passage of
 time is not in it: the analysis does not know how long a session has run,
 and the reader adds that. The fields from before are computed as before.
+From 2026.10.04-1 (`face/v6`) the face view's keypoints are fitted, row by
+row, to a model of the head in three dimensions, and the face's measures
+are read on that head as if it faced the camera: a face turned, tipped or
+tilted reads as it would front-on, each measure with the head's own effect
+on it taken off, and no row is set aside for its pose. The reading's `face`
+object also carries `pose3d` (the head's `yawDeg`, `pitchDeg` and
+`rollDeg`, its `distanceMm` from the camera and `distanceRel` against the
+baseline's, and the newest row's `state`: `fitted`, `predicted` from the
+head's motion for at most a second while a row cannot be fitted, or
+`absent`), `eyes` (per eye, `L` and `R`, its `closure` against the
+baseline, its `ratio`, whether it is `measured` and how far it is turned
+from the camera, `facingDeg`; and `measuredCount`), `mouth` (`opening` and
+`openingRel`, with `openingSd` and `openingCarried`, the share of the last
+rows whose opening was held from earlier rows rather than seen; `jawDrop`,
+`stretch`, `jawDropCoef` and `measured`), `motion3d` (`angularSpeedDegS`,
+`linearSpeedMmS`, `thrashDegS`, `swayRangeDeg`, `swayReversals`,
+`approachPerS`, `tremorDegS`) and `fit` (the newest row's `state`,
+`residualMm`, the points `measured` per face region, `rows1s` by state,
+`calibrated` and `focalScale`); the `face` constants name the head model
+(`head3d.rig`: its version and SHA-256), the camera, the fit's thresholds,
+the row states, the angles' senses and the pose correction. Its `hazard` is
+a model fitted on readings measured this way, named in the constants as
+before. The fields from before keep their names and meanings; their values
+are measured on the fitted head.
 
 ### `post`, at the post cadence
 
