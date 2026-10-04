@@ -209,7 +209,7 @@ python3 /app/workload/producer/producer.py \
     --teardown-drain-s "$TEE_IDLE_EXIT_S" \
     --post-url "${TRAINER_URL}/api/pose-signals/slot/${SLOT_NAME}/readings" \
     --post-interval-s 1.0 \
-    --face-frame-interval-s 0.2 \
+    --face-frame-interval-s 0.1 \
     --audio \
     --beats \
     --beats-windows-s 2,3 \

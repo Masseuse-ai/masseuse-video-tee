@@ -112,8 +112,9 @@ not cross it.
 - `faceFrameIntervalS` (absent in older producers, `null` when the
   producer has nowhere to send them; then none are sent): asks for `face`
   messages (below) after the face view's rows, at most this many seconds
-  of stream time apart. The enclave passes `0.2`. Only meaningful with a
-  `face` view; a bundle from before 2026.09.25-6 ignores it.
+  of stream time apart. The enclave passes `0.1` (`0.2` up to v0.14.1).
+  Only meaningful with a `face` view; a bundle from before 2026.09.25-6
+  ignores it.
 
 ### `pose`, every keypoint-model result, in order
 
@@ -540,7 +541,19 @@ capture or the record (the record's `posts` stream has the `face` object
 once a second) and not emitted on the session's event stream. A frame that
 is still unsent when the next arrives is replaced by it, and a frame never
 displaces a reading. From 2026.10.04-2 a frame also carries `headDeg`, the
-reading's (above), and its head channels are the newest row's.
+reading's (above), and its head channels are the newest row's. From
+2026.10.04-5 it carries `headAbsDeg` too (`yaw`, `pitch` and `roll`: the
+head as the camera sees it, the newest row's own angles against a face
+square to the camera, fitted or predicted, in `headDeg`'s senses; yaw and
+roll within 180, pitch within 90), from the first row in view and so
+before the baseline as well, `null` while no face is present; the user's
+display draws the head by it, so a head held tilted or on its side through
+the baseline minute is drawn as it is. The reading's `face` object does not
+carry it. And from that bundle the frame's eyes and mouth (the eyes'
+openings and lids, the jaw, the lips) are the newest row's rather than the
+median of the last three rows, so a blink of a row or two reaches the
+display; the reading's `wire` follows the frame, and its `channels`, which
+the `hazard` reads, keep the median.
 
 ### `onset`, `event`, `payload`
 
