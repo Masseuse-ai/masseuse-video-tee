@@ -127,8 +127,8 @@ def session_args(tmp_path, **overrides):
     return args
 
 
-def run_session(monkeypatch, tmp_path, scripts=None, epochs=None, **overrides):
-    pose = StubPose()
+def run_session(monkeypatch, tmp_path, scripts=None, epochs=None, pose=None, **overrides):
+    pose = pose or StubPose()
     links = []
 
     def open_link(path, on_message, on_error, **fields):
@@ -178,6 +178,8 @@ def test_two_views_are_decoded_posed_and_reported(monkeypatch, tmp_path):
     assert placed and all(row["bodyAtS"] == round(row["atS"] + 2.0, 4) for row in placed)
     assert face_rows[0]["keypoints"] == {"nose": [1.0, 2.0, 0.9]}
     assert face_rows[0]["frameSize"] == [WIDTH, HEIGHT]
+    # A row that does not say how many people it saw says so.
+    assert face_rows[0]["people"] is None and face_rows[0]["identityUnresolved"] is False
     assert any(m["kind"] == "pose" for m in link.sent)
     # /statz's views.
     views = session.views()
@@ -185,6 +187,26 @@ def test_two_views_are_decoded_posed_and_reported(monkeypatch, tmp_path):
     assert views["face"] == {"timing": "ntp", "epoch": 1_002.0, "url": FACE_URL}
     assert views["sync"] == {"timing": "ntp", "skewMs": 2000}
     assert session.telemetry.snapshot()["counters"]["faceFramesIn"] == 2
+
+
+class CountingPose(StubPose):
+    """The detector's count on the face view: one person at frame 0, two it
+    could not tell apart at frame 10."""
+
+    def step(self, rgb, index, at_s, view=None):
+        row = super().step(rgb, index, at_s, view)
+        if view == "face":
+            row.update({"people": 1 if index == 0 else 2, "identityUnresolved": index != 0})
+        return row
+
+
+def test_face_rows_say_how_many_people_the_detector_found_and_whether_it_told_them_apart(monkeypatch, tmp_path):
+    _session, _pose, link = run_session(monkeypatch, tmp_path, pose=CountingPose())
+    face_rows = {m["frame"]: m for m in link.sent if m["kind"] == "facePose"}
+    assert face_rows[0]["people"] == 1 and face_rows[0]["identityUnresolved"] is False
+    assert face_rows[10]["people"] == 2 and face_rows[10]["identityUnresolved"] is True
+    # The body view's rows are unchanged.
+    assert all("people" not in m for m in link.sent if m["kind"] == "pose")
 
 
 def test_the_face_view_takes_its_own_cadence_when_given(monkeypatch, tmp_path):

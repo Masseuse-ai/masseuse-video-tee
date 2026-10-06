@@ -140,7 +140,8 @@ Only in a session whose `hello` listed a `face` view.
 ```json
 {"kind": "facePose", "frame": 45, "atS": 1.5, "bodyAtS": 3.5,
  "keypoints": {"nose": [318.2, 411.7, 0.97], "...": "..."},
- "dropped": false, "error": false, "frameSize": [720, 1280]}
+ "dropped": false, "error": false, "frameSize": [720, 1280],
+ "people": 1, "identityUnresolved": false}
 ```
 
 - `frame`, `atS`: the face view's own decode frame index and stream time;
@@ -161,6 +162,11 @@ Only in a session whose `hello` listed a `face` view.
   (`RIGHT_HAND`, `LEFT_HAND`, 21-62) and the arms' and neck's points
   (63-69) as well, so the analysis can tell how near a hand is to the face
   and how the shoulders and neck move.
+- `people`, `identityUnresolved` (from v0.15.0): how many people the person
+  detector found in the face view's frame, and whether, finding more than
+  one, it could not tell which of them is the one the view follows, so the
+  analysis can leave out a row whose face may not be that person's; `null`
+  and `false` on a dropped or errored row.
 
 Face rows carry no descriptors: the regional motion descriptors are the
 body view's alone.
@@ -461,6 +467,13 @@ reading's `events` block (`post`, below): for each of its two detectors,
 `onsetEnd` and `peak`, the model's version and SHA-256, the operating rate
 it is set at, in false calls an hour, and the threshold that rate gives;
 numbers and names, kept in `hello.json` the same way.
+`wearer`, when present (a bundle from 2026.10.06-1 on, in a session with a
+face view), is the same for the reading's `wearer` block (`post`, below):
+the model's version (`wearer/v1`) and SHA-256, the seconds of the face it
+reads (`faceS`, 30), how many numbers it reads them as (`columns`), and its
+two cut-points on the probability it gives (`cutpoints`: `woman` at or
+above, `man` at or below); numbers and names, kept in `hello.json` the same
+way.
 
 ### `post`, at the post cadence
 
@@ -494,6 +507,20 @@ it was called), `eventAtS` (the instant it names) and `score`; the list is
 repeated in every reading, so a reading superseded before it was read loses
 no call. Every time is on the reading's clock (`atS`); the detectors'
 constants are `ready.events` (above).
+From bundle 2026.10.06-1 the body also carries `wearer` (`modelVersion`
+`wearer/v1`) in a session with a face view, and `null` in the others:
+whether the face in view reads as a woman's or a man's, read once a session
+from the face view's rows with one person in view and the identity
+resolved. `faceS` counts the whole seconds of the face view's clock that
+held a fitted face, up to 30; `closed` is true once those 30 seconds have
+been read, and then `decided` is `woman` or `man`, or `null` when the
+reading decides neither; `p` is the probability that the face reads as a
+woman's, `null` while open or when the face could not be read; `decidedAtS`
+is the reading's `atS` when it closed. The same values ride every reading
+after, to the end of the session. The masseuse reads `decided` to choose
+which of the two detectors in `events` it acts on (`onsetEnd` for a woman,
+`peak` otherwise) and keeps its default while `decided` is `null`; the
+block's constants are `ready.wearer` (above).
 Besides the readings, a leased session's
 record (`workload/producer/record.py`, described in the README under
 "Session records") is the other path out of the enclave: the keypoints,

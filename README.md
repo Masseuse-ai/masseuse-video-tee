@@ -103,7 +103,11 @@ no audio, and its logic is not published; its exact version is pinned by
 hash in this repository so the attested image says which one is running.
 The numbers, never frames or sound, are what leaves the enclave, over TLS to
 the masseuse's address that is itself part of the attestation; the one
-exception is the live stream the user opens, below.
+exception is the live stream the user opens, below. From v0.15.0 the
+analysis module also reports, once a session and after 30 seconds of the
+face in view, which of its two response detectors the masseuse should act
+on; that reading is kept with the session's other numbers
+(`analysis/protocol.md`, `post`).
 
 For a signed-in session the enclave also keeps the session's record: the
 keypoints of both views (all 308 the model emits, with their scores), the
