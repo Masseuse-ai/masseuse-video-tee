@@ -1408,8 +1408,11 @@ class Session:
     def _on_face_pose(self, row: dict, flags: dict,
                       frame_size: tuple[int, int] | None) -> None:
         """Every real face-view pose row, from the face pose worker: the
-        `facePose` message, with the body view's moment for it."""
+        `facePose` message, with the body view's moment for it, how many
+        people the detector found in the frame and whether it could tell
+        which of them is the one the view follows."""
         body_at_s = self.sync.body_at_s(row["atS"]) if self.sync else None
+        people = row.get("people")
         self.analysis.send({
             "kind": "facePose",
             "frame": row["frame"],
@@ -1419,6 +1422,8 @@ class Session:
             "dropped": bool(flags.get("dropped")),
             "error": bool(flags.get("error")),
             "frameSize": list(frame_size) if frame_size else None,
+            "people": int(people) if people is not None else None,
+            "identityUnresolved": bool(row.get("identityUnresolved")),
         })
 
     def _clock_view(self, clock, decoder: "Decoder", at_s: float) -> None:
