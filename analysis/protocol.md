@@ -506,7 +506,12 @@ oldest first, each with its `kind` (`onset`, `end` or `peak`), `atS` (when
 it was called), `eventAtS` (the instant it names) and `score`; the list is
 repeated in every reading, so a reading superseded before it was read loses
 no call. Every time is on the reading's clock (`atS`); the detectors'
-constants are `ready.events` (above).
+constants are `ready.events` (above). From bundle 2026.10.07-1 the first
+detector's onset is the first second its level reached half its height so
+far, and its event closes sooner the longer it has lasted, with no fixed
+length but 180 s; its `onset` and `end` calls then carry `eventId`, the
+event's number, the same on an event's two calls, and the `end` call also
+`onsetAtS`, the event's start as it closed.
 From bundle 2026.10.06-1 the body also carries `wearer` (`modelVersion`
 `wearer/v1`) in a session with a face view, and `null` in the others:
 whether the face in view reads as a woman's or a man's, read once a session
