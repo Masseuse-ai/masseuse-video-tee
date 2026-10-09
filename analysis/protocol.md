@@ -511,7 +511,10 @@ detector's onset is the first second its level reached half its height so
 far, and its event closes sooner the longer it has lasted, with no fixed
 length but 180 s; its `onset` and `end` calls then carry `eventId`, the
 event's number, the same on an event's two calls, and the `end` call also
-`onsetAtS`, the event's start as it closed.
+`onsetAtS`, the event's start as it closed. From bundle 2026.10.09-2 the
+second detector reads two sets of trees and moves from the first to the
+second as the stream's last ten minutes fill with speech (the classifier's
+speech score); its block, its calls and its constants are as before.
 From bundle 2026.10.06-1 the body also carries `wearer` (`modelVersion`
 `wearer/v1`) in a session with a face view, and `null` in the others:
 whether the face in view reads as a woman's or a man's, read once a session
