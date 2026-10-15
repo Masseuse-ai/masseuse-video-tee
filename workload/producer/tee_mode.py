@@ -33,7 +33,9 @@ Three pieces, all in memory, nothing on disk:
                 attested enclave. The attestation token itself takes 10-15 s
                 to mint, so it is fetched at boot and refreshed in the
                 background rather than per request; `/attestation?nonce=`
-                is the slow path for a verifier that wants freshness.
+                is the slow path for a verifier that wants freshness. The
+                caller's nonce goes last and never has the form of the
+                enclave's own two, so it cannot stand in for either key.
 
 Nothing here logs an SDP body, a capability, or a token: the stdout of the
 debug image reaches Cloud Logging.
@@ -64,6 +66,11 @@ TOKEN_REFRESH_S = 600.0
 # SHA-256 is 43 characters and every nonce this module mints is one.
 NONCE_MIN, NONCE_MAX = 10, 74
 CLIENT_NONCE = re.compile(r"^[A-Za-z0-9_.:-]{10,74}$")
+# The form of the enclave's own nonces (sha256_b64url). A caller's
+# /attestation?nonce= may not take it: a token is then never minted with
+# a hash of somebody else's key beside the enclave's, for a verifier to
+# take as the evidence key or the TLS key.
+OWN_NONCE = re.compile(r"^[A-Za-z0-9_-]{43}$")
 CAPABILITY_HASH = re.compile(r"^[0-9a-f]{64}$")
 CAPABILITY = re.compile(r"^[A-Za-z0-9_-]{43}$")  # base64url of 32 bytes, unpadded
 SESSION_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
@@ -318,7 +325,11 @@ class Attestation:
     Nonces: [sha256(evidence public key), sha256(TLS leaf SPKI)] - the
     second joins once Caddy has a certificate, which is also what triggers
     an early refresh. `live(nonce)` mints a fresh token with a caller's
-    nonce appended, for a verifier that wants freshness (10-15 s).
+    nonce appended, for a verifier that wants freshness (10-15 s). The
+    caller's nonce may not have the form of the first two (OWN_NONCE): a
+    verifier that finds sha256(key) in eat_nonce knows the enclave put it
+    there, and one that brings no nonce of its own accepts exactly the
+    boot token's list, in this order.
     """
 
     def __init__(self, config: TeeConfig, evidence: EvidenceKey,
@@ -380,6 +391,9 @@ class Attestation:
     def live(self, client_nonce: str) -> dict:
         if not CLIENT_NONCE.match(client_nonce):
             raise ValueError("nonce must be 10-74 characters of [A-Za-z0-9_.:-]")
+        if OWN_NONCE.match(client_nonce):
+            raise ValueError("nonce must not be 43 characters of [A-Za-z0-9_-], "
+                             "the form of the enclave's own key hashes")
         nonces = self.nonces(client_nonce)
         token = self.launcher.token(self.config.origin, nonces)
         return {"token": token, "nonces": nonces, "issuedAt": int(self.clock()),

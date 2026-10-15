@@ -484,13 +484,29 @@ func TestRefusesAStaleOrUnboundToken(t *testing.T) {
 		c["eat_nonce"] = []string{c["eat_nonce"].([]string)[0]}
 	})
 	r := runReport(t, fs.config())
-	for _, want := range []string{"nonce.fresh", "nonce.tls-spki"} {
+	for _, want := range []string{"nonce.fresh", "nonce.tls-spki", "nonce.exact"} {
 		if !contains(failed(r), want) {
 			t.Errorf("expected %s to fail; failed set %v", want, failed(r))
 		}
 	}
 	if contains(failed(r), "nonce.evidence-key") {
 		t.Errorf("evidence key nonce was present and should pass")
+	}
+}
+
+func TestRefusesATokenThatCarriesAnotherNonce(t *testing.T) {
+	// Every binding this run looks for is there, plus the hash of somebody
+	// else's key: not a token the enclave minted for this run alone.
+	stranger := sha256.Sum256([]byte("somebody else's key"))
+	fs := newFakeSlot(t, func(c jwt.MapClaims) {
+		c["eat_nonce"] = append(c["eat_nonce"].([]string), b64url(stranger[:]))
+	})
+	r := runReport(t, fs.config())
+	if got := failed(r); len(got) != 1 || got[0] != "nonce.exact" {
+		t.Fatalf("expected nonce.exact alone to fail, failed set %v", got)
+	}
+	if detail := checkNamed(t, r, "nonce.exact").Detail; !strings.Contains(detail, b64url(stranger[:])) {
+		t.Fatalf("nonce.exact should list the token's nonces: %s", detail)
 	}
 }
 

@@ -219,9 +219,9 @@ openssl s_client -connect $HOST:443 -servername $HOST </dev/null 2>/dev/null | o
 ```
 
 The last line is the TLS SPKI hash; it must equal the second entry of the
-attestation token's `eat_nonce`, and the first entry must equal
-`sha256(evidence-key.publicKey)`. `verifier/` automates all of it
-(`VERIFY.md`).
+attestation token's `eat_nonce`, the first entry must equal
+`sha256(evidence-key.publicKey)`, and the third and last is the nonce the
+command sent. `verifier/` automates all of it (`VERIFY.md`).
 
 Then the trainer: with the slot's origin in its slot list and its policy
 listing the digest, a phone session on masseuse.ai leases the slot,

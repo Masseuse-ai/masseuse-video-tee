@@ -121,6 +121,7 @@ Each check, and why it matters:
 | `nonce.fresh` | `eat_nonce` contains the random nonce this run sent: the token was minted now, not replayed. |
 | `nonce.evidence-key` | `eat_nonce` contains `sha256(evidence key)`: the Ed25519 key that signs DTLS fingerprints lives in this enclave. |
 | `nonce.tls-spki` | `eat_nonce` contains `sha256(SubjectPublicKeyInfo)` of the certificate this very TLS connection negotiated: the TLS endpoint is the enclave, not a proxy in front of it. |
+| `nonce.exact` | `eat_nonce` holds those three and nothing else (the detail lists it as the token has it). The enclave appends one caller's nonce to its own two and refuses a caller's nonce shaped like them (43 characters of base64url, a SHA-256), so a token can never name somebody else's key beside the enclave's. |
 | `cosign.verify` | (optional) cosign independently verifies the registry signature over the running digest with the published public key. |
 
 ## Do it by hand
@@ -134,12 +135,13 @@ openssl s_client -connect $HOST:443 -servername $HOST </dev/null 2>/dev/null \
   | openssl x509 -pubkey -noout | openssl pkey -pubin -outform DER | openssl dgst -sha256 -binary | base64 | tr '+/' '-_' | tr -d =
 ```
 
-The two hashes must both appear in the token's `eat_nonce`, alongside your
-`$NONCE`. Verify the token's RS256 signature against the JWKS URL above
-with any JWT library. In `submods.container`, `image_signatures[].key_id`
-must be the fingerprint below, and `env.TEE_IMAGE_VERSION` says which
-release is running; take that and `image_digest` to "How the image is
-built" below to tie them to this source.
+The token's `eat_nonce` must be exactly the two hashes and your `$NONCE`:
+the evidence key's first, the TLS key's second, yours last. Verify the
+token's RS256 signature against the JWKS URL above with any JWT library.
+In `submods.container`, `image_signatures[].key_id` must be the
+fingerprint below, and `env.TEE_IMAGE_VERSION` says which release is
+running; take that and `image_digest` to "How the image is built" below
+to tie them to this source.
 
 A slot exists only while a session needs it (it boots when a visitor taps
 Enable camera and stops a minute or two after the session), so a
@@ -155,12 +157,16 @@ against the policy the trainer publishes at
 `https://masseuse.ai/api/tee-policy` (the signing key it accepts, the
 minimum release once one is set, the source repository and public image
 repository the provenance must name, the debug and GPU posture), and the
-evidence-key binding. Then, on every WebRTC leg, it verifies the enclave's
-Ed25519 signature over the SDP answer's DTLS fingerprint, the session, the
-leg and its own nonce (`X-Masseuse-Evidence`), and refuses the connection
-if it does not hold. The browser cannot read the TLS certificate it
-negotiated, so the `nonce.tls-spki` check is the verifier's job; the
-browser's DTLS fingerprint check gives the media the same property.
+evidence-key binding. The browser asks for no nonce of its own, so it takes
+the slot's boot token only: `eat_nonce` must be the evidence key's hash,
+then the TLS key's once the slot has a certificate, and nothing else; a
+token minted for anyone's nonce is refused. Then, on every WebRTC leg, it
+verifies the enclave's Ed25519 signature over the SDP answer's DTLS
+fingerprint, the session, the leg and its own nonce
+(`X-Masseuse-Evidence`), and refuses the connection if it does not hold.
+The browser cannot read the TLS certificate it negotiated, so the
+`nonce.tls-spki` check is the verifier's job; the browser's DTLS
+fingerprint check gives the media the same property.
 
 The home-network connector (`masseuse-camlink`) runs the same checks
 before it dials a slot (`internal/attest` there is a port of `verifier/`)
