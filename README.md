@@ -304,7 +304,9 @@ but the WHEP leg to the same device.
 **Hardware-signed evidence.** Each session is gated on a Google Cloud
 Attestation OIDC token (TDX quote + GPU report → Google-signed JWT) whose
 `eat_nonce` binds the in-enclave Ed25519 evidence key and the TLS leaf's
-SPKI hash. The same kind of token is exchanged at STS for the only credential
+SPKI hash. A verifier's own nonce goes after them, and the enclave refuses
+one shaped like a key hash, so no token names anyone else's key beside the
+enclave's. The same kind of token is exchanged at STS for the only credential
 that can read the model weights; the VM's service account has no data
 access.
 

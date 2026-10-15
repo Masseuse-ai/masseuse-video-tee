@@ -406,6 +406,27 @@ def test_attestation_refresh_binds_the_evidence_key_and_serves_a_live_nonce():
         tee.attestation.live("bad nonce with spaces!")
 
 
+def test_a_live_nonce_cannot_pose_as_a_key_hash():
+    """A caller who asks for a token with the hash of a key of its own as
+    the nonce would hold a genuine token naming that key beside the
+    enclave's, and a verifier that looks for sha256(key) anywhere in
+    eat_nonce would take it for the evidence key (or the TLS key). Nonces
+    of the enclave's own form are refused; nothing reaches the launcher."""
+    tee = make_tee()
+    tee.attestation.refresh()
+    stranger = tee_mode.EvidenceKey()
+    calls = len(tee.attestation.launcher.calls)
+    for nonce in (stranger.nonce, tee.evidence.nonce,
+                  tee_mode.sha256_b64url(b"somebody's TLS key")):
+        with pytest.raises(ValueError, match="enclave's own key hashes"):
+            tee.attestation.live(nonce)
+    assert len(tee.attestation.launcher.calls) == calls
+    # One character more or less, or one base64url does not have, and it
+    # can be no SHA-256 a verifier computes: still a nonce.
+    for nonce in (stranger.nonce[:42], stranger.nonce + "A", "." + stranger.nonce[1:]):
+        assert tee.attestation.live(nonce)["nonces"] == [tee.evidence.nonce, nonce]
+
+
 def test_tls_spki_nonce_reads_the_newest_leaf_caddy_stored(tmp_path):
     from cryptography import x509
     from cryptography.hazmat.primitives import hashes, serialization
@@ -512,6 +533,9 @@ def test_attestation_and_evidence_key_are_public_and_cors_for_the_page():
         assert code == 200
         assert json.loads(body)["nonces"] == [slot.tee.evidence.nonce, "phone-fresh-nonce-1"]
         assert slot.request("GET", "/attestation?nonce=x")[0] == 400
+        code, _, body = slot.request(
+            "GET", f"/attestation?nonce={tee_mode.EvidenceKey().nonce}")
+        assert code == 400 and "enclave's own" in json.loads(body)["error"]
         code, headers, body = slot.request("GET", "/evidence-key",
                                            headers={"Origin": "https://evil.example"})
         assert code == 200 and json.loads(body) == slot.tee.evidence.describe()

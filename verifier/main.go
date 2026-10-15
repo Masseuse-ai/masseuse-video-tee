@@ -33,6 +33,9 @@
 //     certificate this very connection negotiated. The last one is what a
 //     browser cannot do, and it is what proves the TLS endpoint you are
 //     talking to terminates inside the enclave that minted the token.
+//     eat_nonce must hold those three and nothing else: the enclave
+//     appends one caller's nonce and refuses one shaped like its own key
+//     hashes, so no other party's key can sit in the token beside them.
 //  6. Optionally shells out to `slsa-verifier verify-image` for the digest
 //     the token names, in the public registry, against the source
 //     repository at the release the token names: the SLSA provenance
@@ -65,6 +68,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"slices"
 	"strings"
 	"time"
 
@@ -468,6 +472,13 @@ func run(ctx context.Context, cfg *config, r *report) error {
 		r.add("nonce.tls-spki", nonceMatches(claims.EatNonce, r.TLSSpki) && *doc.TLSSpkiNonce == r.TLSSpki,
 			"eat_nonce contains sha256(SPKI) of the certificate this connection negotiated")
 	}
+	want := []string{keyNonce, nonce}
+	if doc.TLSSpkiNonce != nil {
+		want = append(want, *doc.TLSSpkiNonce)
+	}
+	got := eatNonces(claims.EatNonce)
+	r.add("nonce.exact", sameNonces(got, want),
+		"eat_nonce holds the evidence key, the TLS key and this run's nonce, and nothing else: ["+strings.Join(got, ", ")+"]")
 
 	// Provenance: the public copy of the running digest, its SLSA
 	// provenance, the source repository at the release the token names.
@@ -736,18 +747,37 @@ func randomNonce(n int) (string, error) {
 
 func b64url(b []byte) string { return base64.RawURLEncoding.EncodeToString(b) }
 
-func nonceMatches(eatNonce any, expected string) bool {
+// eatNonces is eat_nonce as a list: the token carries a single nonce as a
+// string and several as an array.
+func eatNonces(eatNonce any) []string {
 	switch v := eatNonce.(type) {
 	case string:
-		return v == expected
+		return []string{v}
 	case []any:
+		out := make([]string, 0, len(v))
 		for _, e := range v {
-			if s, ok := e.(string); ok && s == expected {
-				return true
-			}
+			s, _ := e.(string)
+			out = append(out, s)
 		}
+		return out
 	}
-	return false
+	return nil
+}
+
+func nonceMatches(eatNonce any, expected string) bool {
+	return slices.Contains(eatNonces(eatNonce), expected)
+}
+
+// sameNonces reports whether got and want hold the same nonces, each as
+// often, in any order.
+func sameNonces(got, want []string) bool {
+	if len(got) != len(want) {
+		return false
+	}
+	g, w := slices.Clone(got), slices.Clone(want)
+	slices.Sort(g)
+	slices.Sort(w)
+	return slices.Equal(g, w)
 }
 
 func contains(list []string, s string) bool {
