@@ -102,10 +102,42 @@ def trainer_token(email: str = TRAINER_SA, aud: str = f"https://{HOST}",
     return json.dumps(claims)
 
 
-def make_tee(**overrides) -> tee_mode.TeeMode:
+def seal(seal_key: tee_mode.SealKey, cap: str, method: str, target: str,
+         body: bytes = b"", *, client_nonce: str = "", iat: int | None = None,
+         rid: str | None = None) -> tuple[str, bytes]:
+    """What the phone sends to an image that requires sealed requests (the
+    web app's teeSeal.ts): the X-Masseuse-Seal header and the wire body."""
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import ec
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+
+    ephemeral = ec.generate_private_key(ec.SECP256R1())
+    epk = ephemeral.public_key().public_bytes(
+        serialization.Encoding.X962, serialization.PublicFormat.UncompressedPoint)
+    shared = ephemeral.exchange(ec.ECDH(), ec.EllipticCurvePublicKey.from_encoded_point(
+        ec.SECP256R1(), seal_key.public_bytes))
+    aead = AESGCM(HKDF(algorithm=hashes.SHA256(), length=32, salt=tee_mode.SEAL_SALT,
+                       info=epk + seal_key.public_bytes).derive(shared))
+    claims = {"v": 1, "capability": cap, "method": method, "target": target,
+              "iat": int(time.time()) if iat is None else iat,
+              "rid": rid or tee_mode.b64url(os.urandom(16)),
+              "clientNonce": client_nonce, "body": bool(body)}
+    iv = os.urandom(12)
+    header = "v1." + ".".join(tee_mode.b64url(part) for part in (
+        epk, iv, aead.encrypt(iv, json.dumps(claims).encode(), b"claims")))
+    wire = b""
+    if body:
+        body_iv = os.urandom(12)
+        wire = body_iv + aead.encrypt(body_iv, body, b"body")
+    return header, wire
+
+
+def make_tee(require_seal: bool = False, **overrides) -> tee_mode.TeeMode:
     config = tee_mode.TeeConfig(
         public_host=HOST, trainer_invoker_service_accounts=(TRAINER_SA,),
-        allowed_origins=(ORIGIN,), tls_cert_dir="/nonexistent")
+        allowed_origins=(ORIGIN,), tls_cert_dir="/nonexistent",
+        require_seal=require_seal)
     launcher = FakeLauncher()
     evidence = tee_mode.EvidenceKey()
     attestation = tee_mode.Attestation(config, evidence, launcher=launcher,
@@ -204,10 +236,10 @@ class Slot:
     public address and finds a fixed certificate fingerprint without a
     network; `gateway_down` points it at a gateway that is not there."""
 
-    def __init__(self, gateway_down: bool = False):
+    def __init__(self, gateway_down: bool = False, sealed: bool = False):
         self.relay = StubRelay()
         self.gateway = FakeGateway()
-        self.tee = make_tee()
+        self.tee = make_tee(require_seal=sealed)
         self.probes: list[tuple] = []
 
         def probe(host, port, ip, timeout_s, **options):
@@ -312,6 +344,15 @@ class Slot:
         merged = {"Authorization": f"Bearer {cap}", "Origin": ORIGIN}
         merged.update(headers or {})
         return self.request(method, path, body, merged)
+
+    def as_sealed(self, cap: str, method, path, body=b"", headers=None, **claims):
+        """A request under the capability, sealed as the phone seals it."""
+        header, wire = seal(self.tee.seal_key, cap, method, path, body, **claims)
+        merged = {tee_mode.SEAL_HEADER: header, "Origin": ORIGIN}
+        if claims.get("client_nonce"):
+            merged["X-Masseuse-Client-Nonce"] = claims["client_nonce"]
+        merged.update(headers or {})
+        return self.request(method, path, wire, merged)
 
 
 # -- units ---------------------------------------------------------------------------
@@ -425,6 +466,135 @@ def test_a_live_nonce_cannot_pose_as_a_key_hash():
     # can be no SHA-256 a verifier computes: still a nonce.
     for nonce in (stranger.nonce[:42], stranger.nonce + "A", "." + stranger.nonce[1:]):
         assert tee.attestation.live(nonce)["nonces"] == [tee.evidence.nonce, nonce]
+
+
+def test_the_seal_key_is_vouched_for_by_the_evidence_key_and_published_when_required():
+    plain = make_tee()
+    plain.attestation.refresh()
+    assert plain.seal_key is None and plain.seals is None
+    assert "sealKey" not in plain.attestation_body(None)[1]
+
+    tee = make_tee(require_seal=True)
+    tee.attestation.refresh()
+    statement = tee_mode.verify_evidence(tee.evidence.public_bytes, tee.seal_key.statement)
+    assert statement == {"v": 1, "role": "seal", "alg": "ECDH-P256",
+                         "publicKey": tee.seal_key.public_b64url}
+    assert len(tee.seal_key.public_bytes) == 65 and tee.seal_key.public_bytes[0] == 4
+    code, body = tee.attestation_body(None)
+    assert code == 200 and body["sealKey"] == tee.seal_key.describe()
+    code, body = tee.attestation_body("verifier-nonce-42")
+    assert code == 200 and body["sealKey"]["statement"] == tee.seal_key.statement
+    assert tee.snapshot()["sealedRequests"] is True
+    assert tee_mode.TeeConfig.from_env({
+        "TEE_PUBLIC_HOST": HOST, "TRAINER_INVOKER_SERVICE_ACCOUNT": TRAINER_SA,
+        "TEE_REQUEST_SEAL": "v1"}).require_seal is True
+    assert tee_mode.TeeConfig.from_env({
+        "TEE_PUBLIC_HOST": HOST, "TRAINER_INVOKER_SERVICE_ACCOUNT": TRAINER_SA}).require_seal is False
+
+
+def test_a_seal_opens_for_its_own_request_once_and_within_its_time():
+    now = 1_800_000_000
+    key = tee_mode.SealKey(tee_mode.EvidenceKey())
+    seals = tee_mode.Seals(key, clock=lambda: now)
+    cap, _ = capability()
+
+    def opens(header, wire=b"", method="PUT", target="/ingest/source", client_nonce=""):
+        return seals.open(header, method=method, target=target, body=wire,
+                          client_nonce=client_nonce)
+
+    def refused(why, header, wire=b"", **request):
+        with pytest.raises(tee_mode.SealError, match=why):
+            opens(header, wire, **request)
+
+    link = b'{"url": "rtsps://viewer:s3cret@cam.example:7441/back"}'
+    header, wire = seal(key, cap, "PUT", "/ingest/source", link, iat=now)
+    assert link not in wire and cap.encode() not in header.encode()
+    opened = opens(header, wire)
+    assert opened == tee_mode.Opened(capability=cap, body=link)
+    # Once: the same request again is a replay.
+    refused("already used", header, wire)
+
+    # For the request it names, and no other.
+    header, wire = seal(key, cap, "PUT", "/ingest/source", link, iat=now)
+    refused("another request", header, wire, method="POST")
+    refused("another request", header, wire, target="/ingest/egress")
+    refused("another client nonce", header, wire, client_nonce="phone-nonce-0001")
+    header, wire = seal(key, cap, "POST", "/ingest/whip", b"v=0", client_nonce="phone-nonce-0001", iat=now)
+    assert opens(header, wire, method="POST", target="/ingest/whip",
+                 client_nonce="phone-nonce-0001").body == b"v=0"
+
+    # Within its time, either way.
+    refused("stale", *seal(key, cap, "GET", "/ingest/source", iat=now - 121), method="GET")
+    refused("stale", *seal(key, cap, "GET", "/ingest/source", iat=now + 121), method="GET")
+    assert opens(*seal(key, cap, "GET", "/ingest/source", iat=now - 120), method="GET").body == b""
+
+    # Its body is the one it was sealed with, or none when it names none.
+    header, wire = seal(key, cap, "PUT", "/ingest/source", link, iat=now)
+    refused("body is missing", header)
+    refused("body does not open", header, wire[:-1] + bytes([wire[-1] ^ 1]))
+    other_header, other_wire = seal(key, cap, "PUT", "/ingest/source", link, iat=now)
+    refused("body does not open", header, other_wire)
+    header, _ = seal(key, cap, "DELETE", "/ingest/source", iat=now)
+    refused("names no body", header, b"x" * 40, method="DELETE")
+
+    # Only the enclave's key opens it, and only whole.
+    stranger = tee_mode.SealKey(tee_mode.EvidenceKey())
+    refused("does not open", *seal(stranger, cap, "GET", "/ingest/source", iat=now), method="GET")
+    header, _ = seal(key, cap, "GET", "/ingest/source", iat=now)
+    version, epk, iv, sealed = header.split(".")
+    tampered = tee_mode.b64url(bytes([tee_mode.b64url_decode(sealed)[0] ^ 1]) + tee_mode.b64url_decode(sealed)[1:])
+    refused("does not open", ".".join((version, epk, iv, tampered)), method="GET")
+    for malformed in ("", "v1", "v2." + header[3:], f"v1.{epk}.{iv}", f"v1.{epk[:-4]}.{iv}.{sealed}",
+                      f"v1.{epk}.{iv[:-2]}.{sealed}", "v1.!!.!!.!!"):
+        refused("malformed seal|does not open", malformed, method="GET")
+
+
+# A seal the web app made (masseuse-trainer web/src/gpu/teeSeal.test.ts
+# asserts the same strings): its fixed ephemeral key and random bytes, to
+# the seal key below, for PUT /ingest/source at 1_800_000_000.
+SEAL_VECTOR = {
+    "sealKey": "dYVhKDEy4g6XZHcvlKa07u2BW-1htrS7Y9ZZwq9qQUc",
+    "sealPublic": "BLtQoifPJ7dPMnRJO3dN-iihhmDcvT715m_KnjAvexS327FX5zFQ6lDxIgwHwadLkKgJUAMpmUTo8HzftTkLLUw",
+    "header": "v1.BJ4sj5-WJ1gWg2Nz-fzaC0M6qhmEC6VHTnde2R1PDN1KGegcdHGYXuHVIYNlLWtvEKiSEPSEn9cuUOaNrsJq2q0"
+              ".ICEiIyQlJicoKSor.ChQzKw9wKd_NZ-eh0UzdO86z9K-12b_sBYxR-ks4YyaJtuG9FjCC40oXhhST2OAFBoonBEiT"
+              "wkjXKl96-ahWEI7G-BDUqbw9EsLqtIoWAqPB9JR_H8eK0fOBoq20IiLvAecZK6YDI6dGV3-dAVw8C2veVSDk2BPz7wc"
+              "C8ibyY0q6xZGJZML5NzSi5olwOn3FDjywIL4b9uhffX1RdBFSLyPvKSLAv7Auj_AAmuGTh6YTTiM_sH1JE5-Xlr40J5B"
+              "CJWWCVueHUxc",
+    "body": "MDEyMzQ1Njc4OTo7MhBoJ6ulDwt5wzeUdN2bYlixOwKvFzOVT7E2rQUR1WwAHBrzPlrGxwdA1dsnkBaGmZxu5k3JP-E9"
+            "37H9Z0Gk6ms2AhVD",
+}
+
+
+def test_the_web_apps_seal_opens_here():
+    from cryptography.hazmat.primitives.asymmetric import ec
+
+    private = ec.derive_private_key(
+        int.from_bytes(tee_mode.b64url_decode(SEAL_VECTOR["sealKey"]), "big"), ec.SECP256R1())
+    key = tee_mode.SealKey(tee_mode.EvidenceKey(), private_key=private)
+    assert key.public_b64url == SEAL_VECTOR["sealPublic"]
+    opened = tee_mode.Seals(key, clock=lambda: 1_800_000_000).open(
+        SEAL_VECTOR["header"], method="PUT", target="/ingest/source",
+        body=tee_mode.b64url_decode(SEAL_VECTOR["body"]), client_nonce="")
+    assert opened.capability == tee_mode.b64url(bytes(range(32)))
+    assert opened.body == b'{"url":"rtsps://viewer:s3cret@cam.example:7441/back"}'
+
+
+def test_the_seals_remembered_are_bounded_and_forgotten_once_stale():
+    now = [1_800_000_000]
+    key = tee_mode.SealKey(tee_mode.EvidenceKey())
+    seals = tee_mode.Seals(key, clock=lambda: now[0], remember=3)
+    cap, _ = capability()
+    sent = [seal(key, cap, "GET", "/ingest/egress", iat=now[0]) for _ in range(4)]
+    for header, _ in sent:
+        seals.open(header, method="GET", target="/ingest/egress", body=b"", client_nonce="")
+    assert len(seals._seen) == 3
+    # Past their time they are forgotten, and refused as stale anyway.
+    now[0] += 121
+    with pytest.raises(tee_mode.SealError, match="stale"):
+        seals.open(sent[-1][0], method="GET", target="/ingest/egress", body=b"", client_nonce="")
+    seals.open(seal(key, cap, "GET", "/ingest/egress", iat=now[0])[0],
+               method="GET", target="/ingest/egress", body=b"", client_nonce="")
+    assert len(seals._seen) == 1
 
 
 def test_tls_spki_nonce_reads_the_newest_leaf_caddy_stored(tmp_path):
@@ -688,6 +858,84 @@ def test_lease_then_whip_with_the_capability_yields_signed_evidence():
         assert counters["teeEvidenceIssued"] == 4
         assert counters["teeLegEvicted"] == 3
         assert counters["teeCapabilityRejects"] >= 5
+
+
+def test_a_sealed_slot_takes_only_sealed_requests_under_the_capability():
+    json_type = {"Content-Type": "application/json"}
+    sdp_type = {"Content-Type": "application/sdp"}
+    link = b'{"url": "rtsps://viewer:s3cret@cam.example:7441/back?enableSrtp"}'
+    destination = b'{"url": "rtmps://live.example.com/app/sk_live_1234", "audio": true}'
+    with Slot(sealed=True) as slot:
+        slot.tee.attestation.refresh()
+        code, _, body = slot.request("GET", "/attestation", headers={"Origin": ORIGIN})
+        assert code == 200 and json.loads(body)["sealKey"] == slot.tee.seal_key.describe()
+        code, headers, _ = slot.request(
+            "OPTIONS", "/ingest/whip", b"",
+            {"Origin": ORIGIN, "Access-Control-Request-Method": "POST",
+             "Access-Control-Request-Headers": "content-type, x-masseuse-seal"})
+        assert code == 204 and "X-Masseuse-Seal" in headers["Access-Control-Allow-Headers"]
+
+        cap = slot.lease()
+        # The bare capability, even the right one, opens nothing.
+        for method, path, body in (("POST", "/ingest/whip", OFFER), ("PUT", "/ingest/source", link),
+                                   ("PUT", "/ingest/egress", destination), ("GET", "/ingest/view", b"")):
+            code, headers, payload = slot.as_phone(cap, method, path, body)
+            assert code == 401 and json.loads(payload)["reason"] == "the request is not sealed"
+            assert headers["WWW-Authenticate"] == "Masseuse-Seal"
+        assert slot.relay.requests == [] and slot.probes == [] and slot.egress_procs == []
+        # Another lease's capability, sealed, is still the wrong one.
+        other, _ = capability()
+        code, _, payload = slot.as_sealed(other, "GET", "/ingest/source")
+        assert code == 401 and json.loads(payload)["reason"] == "capability does not match the lease"
+
+        # WHIP: the offer is opened for the relay, the answer is vouched for.
+        code, headers, body = slot.as_sealed(cap, "POST", "/ingest/whip", OFFER, sdp_type,
+                                             client_nonce="phone-nonce-0001")
+        assert code == 201
+        forwarded = slot.relay.requests[-1]
+        assert forwarded["body"] == OFFER
+        assert "X-Masseuse-Seal" not in forwarded["headers"]
+        payload = tee_mode.verify_evidence(slot.tee.evidence.public_bytes, headers["X-Masseuse-Evidence"])
+        assert payload["clientNonce"] == "phone-nonce-0001" and payload["sessionSecret"] == WHIP_SECRET
+        # A seal is for one request: replayed, or sent on to another route, it is refused.
+        header, wire = seal(slot.tee.seal_key, cap, "POST", "/ingest/whip", OFFER)
+        sealed = {tee_mode.SEAL_HEADER: header, "Origin": ORIGIN, **sdp_type}
+        assert slot.request("POST", "/ingest/whip", wire, sealed)[0] == 201
+        code, _, payload = slot.request("POST", "/ingest/whip", wire, sealed)
+        assert code == 401 and json.loads(payload)["reason"] == "seal already used"
+        code, _, payload = slot.request("POST", "/overlay/whep", wire, sealed)
+        assert code == 401 and json.loads(payload)["reason"] == "seal is for another request"
+        path = headers["Location"][len(f"https://{HOST}"):]
+        assert slot.as_sealed(cap, "PATCH", path, b"a=candidate",
+                              {"Content-Type": "application/trickle-ice-sdpfrag"})[0] == 204
+        assert slot.relay.requests[-1]["body"] == b"a=candidate"
+        assert slot.as_sealed(cap, "DELETE", path)[0] == 200
+
+        # The camera's link and the stream's key reach the enclave and
+        # nothing in front of it: the wire carries neither.
+        header, wire = seal(slot.tee.seal_key, cap, "PUT", "/ingest/source", link)
+        assert b"s3cret" not in wire and b"s3cret" not in header.encode()
+        code, _, body = slot.request("PUT", "/ingest/source", wire,
+                                     {tee_mode.SEAL_HEADER: header, "Origin": ORIGIN, **json_type})
+        assert code == 200, body
+        assert slot.relay.ext_config["source"] == "rtsps://viewer:s3cret@cam.example:7441/back?enableSrtp"
+        code, _, body = slot.as_sealed(cap, "GET", "/ingest/source")
+        assert code == 200 and json.loads(body)["kind"] == "external"
+        header, wire = seal(slot.tee.seal_key, cap, "PUT", "/ingest/egress", destination)
+        assert b"sk_live" not in wire and b"sk_live" not in header.encode()
+        code, _, body = slot.request("PUT", "/ingest/egress", wire,
+                                     {tee_mode.SEAL_HEADER: header, "Origin": ORIGIN, **json_type})
+        assert code == 200, body
+        assert slot.egress_procs[0].argv[-1] == "rtmps://live.example.com/app/sk_live_1234"
+        code, _, body = slot.as_sealed(cap, "PUT", "/ingest/view", b'{"overlay": "keypoints"}', json_type)
+        assert code == 200 and json.loads(body)["overlay"] == "keypoints"
+        assert slot.as_sealed(cap, "PUT", "/ingest/source", b"x" * 5000, json_type)[0] == 413
+        assert slot.as_sealed(cap, "DELETE", "/ingest/egress")[0] == 200
+        assert slot.as_sealed(cap, "DELETE", "/ingest/source")[0] == 200
+
+        code, _, body = slot.as_trainer("GET", "/statz")
+        counters = json.loads(body)["counters"]
+        assert counters["teeCapabilityRejects"] == 5 and counters["teeSealRejects"] == 2
 
 
 def test_lease_validation_and_a_stop_that_leaves_the_lease_standing():

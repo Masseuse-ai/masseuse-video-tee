@@ -166,7 +166,14 @@ fingerprint, the session, the leg and its own nonce
 (`X-Masseuse-Evidence`), and refuses the connection if it does not hold.
 The browser cannot read the TLS certificate it negotiated, so the
 `nonce.tls-spki` check is the verifier's job; the browser's DTLS
-fingerprint check gives the media the same property.
+fingerprint check gives the media the same property. For the same reason
+an image that attests `TEE_REQUEST_SEAL=v1` takes nothing under the
+phone's capability in the clear: the browser holds the seal key the
+attestation document names to the evidence key's statement for it, and
+seals every such request to that key, its body with it (README "Sealed
+requests"). A bare capability is refused by the enclave, so a certificate
+for the slot's hostname yields neither the capability nor a camera's link
+or a stream key.
 
 The home-network connector (`masseuse-camlink`) runs the same checks
 before it dials a slot (`internal/attest` there is a port of `verifier/`)

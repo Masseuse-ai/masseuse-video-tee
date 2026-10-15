@@ -17,11 +17,14 @@ Three pieces, all in memory, nothing on disk:
                 readings the producer posts back, in the other direction.
   Lease         `POST /lease {sessionId, capabilityHash, expiresAt}` from
                 the trainer parks the SHA-256 of a 32-byte capability the
-                phone generated. The phone presents the capability itself as
-                a bearer on /ingest/whip*, /overlay/whep* and /ingest/source
-                (an external camera's link, external_source.py); the trainer
-                and Cloudflare only ever saw the hash, so none of them can
-                publish to, read from, or point a camera at this slot.
+                phone generated. The phone presents the capability itself on
+                /ingest/whip*, /overlay/whep*, /ingest/source (an external
+                camera's link, external_source.py) and the other routes
+                under it; the trainer and Cloudflare only ever saw the hash,
+                so none of them can publish to, read from, or point a camera
+                at this slot. With TEE_REQUEST_SEAL the capability and each
+                body are sealed to the enclave (SealKey), so neither can
+                whoever holds a certificate for this hostname.
   EvidenceKey   an Ed25519 key generated at boot. Its public key's SHA-256
   Attestation   is a nonce in the Google Cloud Attestation token requested
                 from the launcher (with the TLS leaf's SPKI hash as the
@@ -78,7 +81,16 @@ FINGERPRINT = re.compile(rb"^a=fingerprint:\s*([A-Za-z0-9-]+)\s+([0-9A-Fa-f:]+)\
 # What the phone reads off a WHIP/WHEP answer, and may send with its offer.
 EXPOSED_HEADERS = "Location, ETag, ID, Link, Accept-Patch, X-Masseuse-Evidence"
 ALLOWED_REQUEST_HEADERS = ("Authorization, Content-Type, If-Match, "
-                           "X-Masseuse-Client-Nonce")
+                           "X-Masseuse-Client-Nonce, X-Masseuse-Seal")
+# A sealed request (SealKey): the header that carries it, how far its time
+# may sit from this VM's clock (the phone's evidence check allows the same
+# the other way), and how many opened seals are remembered against replay.
+SEAL_HEADER = "X-Masseuse-Seal"
+SEAL_ALG = "ECDH-P256"
+SEAL_SALT = b"masseuse-video-tee seal v1"
+SEAL_SKEW_S = 120
+SEAL_REMEMBER = 4096
+SEAL_RID = re.compile(r"^[A-Za-z0-9_-]{22}$")  # base64url of 16 bytes
 LEASE_MAX_S = 6 * 3600.0
 # IdleExit defaults (TEE_IDLE_EXIT_S, TEE_BOOT_IDLE_S): a minute after the
 # session for a page refresh to reconnect, five for a boot nobody leases.
@@ -140,6 +152,11 @@ class TeeConfig:
     # refuses a slot whose bucket is another. Empty: the slot keeps no
     # record, and a lease that asks for one is refused.
     capture_bucket: str = ""
+    # TEE_REQUEST_SEAL=v1 (Dockerfile.tee; attested, and not one the launch
+    # policy lets the metadata override): every request under the phone's
+    # capability is sealed to the enclave's seal key, and a bare bearer is
+    # refused. The phone reads the same variable off the token and seals.
+    require_seal: bool = False
 
     @classmethod
     def from_env(cls, env=os.environ) -> "TeeConfig":
@@ -167,7 +184,8 @@ class TeeConfig:
                    refresh_s=float(env.get("TEE_TOKEN_REFRESH_S", TOKEN_REFRESH_S)),
                    idle_exit_s=float(env.get("TEE_IDLE_EXIT_S") or IDLE_EXIT_S),
                    boot_idle_s=float(env.get("TEE_BOOT_IDLE_S") or BOOT_IDLE_S),
-                   capture_bucket=capture_bucket)
+                   capture_bucket=capture_bucket,
+                   require_seal=(env.get("TEE_REQUEST_SEAL") or "") == "v1")
 
     @property
     def origin(self) -> str:
@@ -234,6 +252,136 @@ def verify_evidence(public_key_raw: bytes, evidence: str) -> dict:
     ed25519.Ed25519PublicKey.from_public_bytes(public_key_raw).verify(
         b64url_decode(signature_b64), body)
     return json.loads(body)
+
+
+# -- sealed requests ---------------------------------------------------------------
+
+
+class SealKey:
+    """A P-256 key that lives exactly as long as this process, which the
+    phone seals its requests to.
+
+    The phone's capability must never cross TLS in the clear: the browser
+    cannot check which key its TLS connection reached, so whoever holds a
+    certificate for this hostname could read it there. Instead each
+    request carries `X-Masseuse-Seal: v1.<epk>.<iv>.<ciphertext>`: an
+    ephemeral P-256 key of the phone's, and, under the key both sides
+    derive from it and this one (ECDH, HKDF-SHA256), the capability, the
+    method, the request target, the time, a request id and the client
+    nonce, AES-256-GCM. A body goes as `<iv><ciphertext>` under the same
+    key. The evidence key vouches for this key (`statement`), and the
+    attestation for the evidence key.
+    """
+
+    def __init__(self, evidence: EvidenceKey, private_key=None):
+        from cryptography.hazmat.primitives import serialization
+        from cryptography.hazmat.primitives.asymmetric import ec
+
+        self._key = private_key or ec.generate_private_key(ec.SECP256R1())
+        self.public_bytes = self._key.public_key().public_bytes(
+            serialization.Encoding.X962, serialization.PublicFormat.UncompressedPoint)
+        self.public_b64url = b64url(self.public_bytes)
+        self.statement = evidence.sign({"v": 1, "role": "seal", "alg": SEAL_ALG,
+                                        "publicKey": self.public_b64url})
+
+    def describe(self) -> dict:
+        return {"alg": SEAL_ALG, "publicKey": self.public_b64url,
+                "statement": self.statement}
+
+    def key_for(self, peer_public: bytes) -> bytes:
+        """The AES-256-GCM key shared with the phone's ephemeral key."""
+        from cryptography.hazmat.primitives import hashes
+        from cryptography.hazmat.primitives.asymmetric import ec
+        from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+
+        peer = ec.EllipticCurvePublicKey.from_encoded_point(ec.SECP256R1(), peer_public)
+        shared = self._key.exchange(ec.ECDH(), peer)
+        return HKDF(algorithm=hashes.SHA256(), length=32, salt=SEAL_SALT,
+                    info=peer_public + self.public_bytes).derive(shared)
+
+
+class SealError(Exception):
+    """A seal the enclave will not open; the message is the 401's reason."""
+
+
+@dataclass(frozen=True)
+class Opened:
+    capability: str
+    body: bytes
+
+
+class Seals:
+    """Opens the phone's sealed requests. A seal holds for one request, the
+    one it names (method, target, body), within SEAL_SKEW_S of now, and
+    once: each request id opened is remembered until its time is past."""
+
+    def __init__(self, key: SealKey, clock=time.time, skew_s: float = SEAL_SKEW_S,
+                 remember: int = SEAL_REMEMBER):
+        self.key = key
+        self.clock = clock
+        self.skew_s = skew_s
+        self.remember = remember
+        self._seen: dict[str, float] = {}
+        self._lock = threading.Lock()
+
+    def open(self, header: str, *, method: str, target: str, body: bytes,
+             client_nonce: str) -> Opened:
+        from cryptography.exceptions import InvalidTag
+        from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
+        parts = (header or "").strip().split(".")
+        if len(parts) != 4 or parts[0] != "v1":
+            raise SealError("malformed seal")
+        try:
+            epk, iv, sealed = (b64url_decode(p) for p in parts[1:])
+        except ValueError:
+            raise SealError("malformed seal") from None
+        if len(epk) != 65 or len(iv) != 12:
+            raise SealError("malformed seal")
+        try:
+            aead = AESGCM(self.key.key_for(epk))
+            claims = json.loads(aead.decrypt(iv, sealed, b"claims"))
+        except (InvalidTag, ValueError):
+            raise SealError("seal does not open") from None
+        if not isinstance(claims, dict) or claims.get("v") != 1:
+            raise SealError("unknown seal version")
+        if claims.get("method") != method or claims.get("target") != target:
+            raise SealError("seal is for another request")
+        if (claims.get("clientNonce") or "") != client_nonce:
+            raise SealError("seal is for another client nonce")
+        iat = claims.get("iat")
+        if not isinstance(iat, int) or abs(float(self.clock()) - iat) > self.skew_s:
+            raise SealError("seal is stale")
+        rid = claims.get("rid")
+        if not isinstance(rid, str) or not SEAL_RID.match(rid):
+            raise SealError("malformed seal")
+        capability = claims.get("capability")
+        if not isinstance(capability, str):
+            raise SealError("malformed seal")
+        if claims.get("body") is True:
+            if len(body) < 12 + 16:
+                raise SealError("sealed body is missing")
+            try:
+                opened = aead.decrypt(body[:12], body[12:], b"body")
+            except InvalidTag:
+                raise SealError("sealed body does not open") from None
+        elif claims.get("body") is False:
+            if body:
+                raise SealError("seal names no body")
+            opened = b""
+        else:
+            raise SealError("malformed seal")
+        now = float(self.clock())
+        with self._lock:
+            for seen, until in list(self._seen.items()):
+                if until < now:
+                    del self._seen[seen]
+            if rid in self._seen:
+                raise SealError("seal already used")
+            if len(self._seen) >= self.remember:
+                del self._seen[min(self._seen, key=self._seen.get)]
+            self._seen[rid] = iat + self.skew_s
+        return Opened(capability=capability, body=opened)
 
 
 # -- the TLS leaf ------------------------------------------------------------------
@@ -790,13 +938,16 @@ class TeeMode:
                  attestation: Attestation | None = None,
                  control_auth: ControlAuth | None = None,
                  lease: Lease | None = None, launcher: LauncherClient | None = None,
-                 clock=time.time, log=print):
+                 seal_key: SealKey | None = None, clock=time.time, log=print):
         self.config = config
         self.evidence = evidence or EvidenceKey()
         self.attestation = attestation or Attestation(
             config, self.evidence, launcher=launcher, clock=clock, log=log)
         self.control_auth = control_auth or ControlAuth(config, log=log)
         self.lease = lease or Lease(clock=clock, capture_bucket=config.capture_bucket)
+        # Only an image that requires sealed requests has a seal key.
+        self.seal_key = (seal_key or SealKey(self.evidence)) if config.require_seal else None
+        self.seals = Seals(self.seal_key, clock=clock) if self.seal_key else None
         self.clock = clock
         self.log = log
 
@@ -813,20 +964,24 @@ class TeeMode:
 
     def attestation_body(self, client_nonce: str | None) -> tuple[int, dict]:
         """`GET /attestation[?nonce=]`: the cached boot token, or a live one
-        with the caller's nonce appended."""
+        with the caller's nonce appended; with the seal key, when the image
+        has one, and the evidence key's statement for it."""
         if client_nonce:
             try:
-                return 200, self.attestation.live(client_nonce)
+                body = self.attestation.live(client_nonce)
             except ValueError as error:
                 return 400, {"error": str(error)}
             except Exception as error:  # noqa: BLE001 - the launcher is down
                 self.log(f"tee: live attestation failed: {error!r}", flush=True)
                 return 503, {"error": "attestation unavailable"}
-        current = self.attestation.current()
-        if current is None:
-            return 503, {"error": "attestation not yet available",
-                         "evidenceKey": self.evidence.describe()}
-        return 200, current
+        else:
+            body = self.attestation.current()
+            if body is None:
+                return 503, {"error": "attestation not yet available",
+                             "evidenceKey": self.evidence.describe()}
+        if self.seal_key is not None:
+            body = {**body, "sealKey": self.seal_key.describe()}
+        return 200, body
 
     def evidence_for(self, *, role: str, answer: bytes, client_nonce: str,
                      session_secret: str, session_id: str) -> str | None:
@@ -850,4 +1005,5 @@ class TeeMode:
                              "tlsNonce": bool(current.get("tlsSpkiNonce"))}
                             if current else None),
             "evidenceKeyNonce": self.evidence.nonce,
+            "sealedRequests": self.seals is not None,
         }
