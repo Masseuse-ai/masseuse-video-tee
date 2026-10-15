@@ -91,8 +91,8 @@ from relay_proxy import (RelayProxy, location_secret,  # noqa: E402
                          route as relay_route)
 from sinks import Capture, Poster  # noqa: E402
 from sync import ViewSync  # noqa: E402
-from tee_mode import (CLIENT_NONCE, IdleExit, TeeMode,  # noqa: E402
-                      bearer as bearer_token, cors_headers)
+from tee_mode import (CLIENT_NONCE, SEAL_HEADER, IdleExit, SealError,  # noqa: E402
+                      TeeMode, bearer as bearer_token, cors_headers)
 from telemetry import Telemetry  # noqa: E402
 
 FPS = 30.0
@@ -2529,20 +2529,60 @@ def build_server(args, telemetry: Telemetry,
 
         def _tee_signalling_gate(self, leg: str) -> str | None:
             """The phone's capability on a WHIP/WHEP/source request in TEE
-            mode. The lease's session id when it opens; None once a 401 or
-            400 has been written."""
+            mode. The lease's session id when it opens; None once a 401,
+            400 or 413 has been written. A sealed request's body is opened
+            here, whole, and `_body` hands it to the route."""
             cors = self._cors()
+            self._opened_body = None
             nonce = self.headers.get("X-Masseuse-Client-Nonce") or ""
             if nonce and not CLIENT_NONCE.match(nonce):
                 self._json(400, {"error": "malformed client nonce"}, cors)
                 return None
-            ok, info = tee.lease.check(bearer_token(self.headers))
+            if tee.seals is None:
+                capability = bearer_token(self.headers)
+            else:
+                seal = self.headers.get(SEAL_HEADER) or ""
+                if not seal:
+                    telemetry.count("teeCapabilityRejects")
+                    self._json(401, {"error": "unauthorized",
+                                     "reason": "the request is not sealed"},
+                               cors + [("WWW-Authenticate", "Masseuse-Seal")])
+                    return None
+                # The IV and the tag a sealed body adds.
+                length = int(self.headers.get("Content-Length") or 0)
+                if length > max(relay.body_cap, LEASE_BODY_CAP) + 28:
+                    self._json(413, {"error": "body too large"}, cors)
+                    return None
+                wire = self.rfile.read(length) if length else b""
+                try:
+                    opened = tee.seals.open(seal, method=self.command, target=self.path,
+                                            body=wire, client_nonce=nonce)
+                except SealError as error:
+                    telemetry.count("teeSealRejects")
+                    self._json(401, {"error": "unauthorized", "reason": str(error)},
+                               cors + [("WWW-Authenticate", "Masseuse-Seal")])
+                    return None
+                capability = opened.capability
+                self._opened_body = opened.body
+            ok, info = tee.lease.check(capability)
             if not ok:
                 telemetry.count("teeCapabilityRejects")
                 self._json(401, {"error": "unauthorized", "reason": info},
                            cors + [("WWW-Authenticate", "Bearer")])
                 return None
             return info
+
+        def _body(self, cap: int) -> bytes | None:
+            """The request's body for a route behind the gate: the one the
+            gate opened from a seal, else read off the connection. None when
+            it is over `cap`."""
+            body = getattr(self, "_opened_body", None)
+            if body is None:
+                length = int(self.headers.get("Content-Length") or 0)
+                if length > cap:
+                    return None
+                body = self.rfile.read(length) if length else b""
+            return body if len(body) <= cap else None
 
         def _tee_answer(self, leg: str, code: int, headers, payload: bytes,
                         session_id: str, path: str | None = None,
@@ -2613,13 +2653,13 @@ def build_server(args, telemetry: Telemetry,
                 body["status"] = "removed" if had else "none"
                 self._json(200, body, cors)
                 return
-            length = int(self.headers.get("Content-Length") or 0)
-            if length > LEASE_BODY_CAP:
+            raw = self._body(LEASE_BODY_CAP)
+            if raw is None:
                 self._json(413, {"status": "failed", "reason": "bad-url",
                                  "error": "body too large"}, cors)
                 return
             try:
-                body = json.loads(self.rfile.read(length) or b"{}")
+                body = json.loads(raw or b"{}")
                 if not isinstance(body, dict):
                     raise ValueError("not an object")
             except ValueError as error:
@@ -2673,12 +2713,12 @@ def build_server(args, telemetry: Telemetry,
             if self._tee_signalling_gate("view") is None:
                 return
             if self.command == "PUT":
-                length = int(self.headers.get("Content-Length") or 0)
-                if length > LEASE_BODY_CAP:
+                raw = self._body(LEASE_BODY_CAP)
+                if raw is None:
                     self._json(413, {"error": "body too large"}, cors)
                     return
                 try:
-                    body = json.loads(self.rfile.read(length) or b"{}")
+                    body = json.loads(raw or b"{}")
                     if not isinstance(body, dict):
                         raise ValueError("expected an object")
                     given = {k: body[k] for k in ("mirror", "overlay") if k in body}
@@ -2757,13 +2797,13 @@ def build_server(args, telemetry: Telemetry,
                 body["status"] = "removed" if had else "none"
                 self._json(200, body, cors)
                 return
-            length = int(self.headers.get("Content-Length") or 0)
-            if length > LEASE_BODY_CAP:
+            raw = self._body(LEASE_BODY_CAP)
+            if raw is None:
                 self._json(413, {"status": "failed", "reason": "bad-url",
                                  "error": "body too large"}, cors)
                 return
             try:
-                body = json.loads(self.rfile.read(length) or b"{}")
+                body = json.loads(raw or b"{}")
                 if not isinstance(body, dict):
                     raise ValueError("not an object")
             except ValueError as error:
@@ -2820,9 +2860,7 @@ def build_server(args, telemetry: Telemetry,
                 body["status"] = "removed" if had else "none"
                 self._json(200, body, cors)
                 return
-            length = int(self.headers.get("Content-Length") or 0)
-            if 0 < length <= LEASE_BODY_CAP:
-                self.rfile.read(length)
+            self._body(LEASE_BODY_CAP)
             try:
                 answer = share.connect(session_id)
             except ShareError as error:
@@ -2874,13 +2912,13 @@ def build_server(args, telemetry: Telemetry,
                 body["status"] = "removed" if had else "none"
                 self._json(200, body, cors)
                 return
-            length = int(self.headers.get("Content-Length") or 0)
-            if length > LEASE_BODY_CAP:
+            raw = self._body(LEASE_BODY_CAP)
+            if raw is None:
                 self._json(413, {"status": "failed", "reason": "bad-url",
                                  "error": "body too large"}, cors)
                 return
             try:
-                body = json.loads(self.rfile.read(length) or b"{}")
+                body = json.loads(raw or b"{}")
                 if not isinstance(body, dict):
                     raise ValueError("not an object")
             except ValueError as error:
@@ -3064,11 +3102,10 @@ def build_server(args, telemetry: Telemetry,
                     kicked = 0
                 if kicked:
                     telemetry.count("teeLegEvicted", kicked)
-            length = int(self.headers.get("Content-Length") or 0)
-            if length > relay.body_cap:
+            body = self._body(relay.body_cap)
+            if body is None:
                 self._json(413, {"error": "body too large"}, self._cors())
                 return True
-            body = self.rfile.read(length) if length else b""
             code, headers, payload = relay.forward(
                 self.command, secret, self.headers, body,
                 client=self.client_address[0], leg=leg, path=path)

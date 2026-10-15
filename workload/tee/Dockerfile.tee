@@ -239,6 +239,11 @@ ENV TEE_TLS_CERT_DIR=/run/tee/caddy/certificates \
 # routes and /attestation); the deployment appends the trainer's own origin
 # for the direct path (terraform phone_origins).
 ENV TEE_ALLOWED_ORIGINS=https://masseuse.ai,https://www.masseuse.ai
+# Every request under the phone's capability is sealed to the enclave's seal
+# key and a bare bearer is refused (tee_mode.SealKey). Attested with this
+# environment and not in allow_env_override: the phone reads it off the
+# token to know it must seal, and no metadata can take it away.
+ENV TEE_REQUEST_SEAL=v1
 
 # The release stamp (see the ARGs at the top): attested with the rest of
 # this environment, and repeated as the standard OCI labels so a registry

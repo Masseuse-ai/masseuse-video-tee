@@ -168,9 +168,9 @@ The external cameras keep the same boundary, with one difference the third
 kind makes plain:
 
 - **A camera the user names (RTSPS, reachable from the internet).** The phone
-  hands the enclave an `rtsps://` link (`PUT /ingest/source`, capability
-  bearer, only after the phone has verified the attestation). The link is a
-  credential and stays in the enclave: the masseuse and Cloudflare learn only
+  hands the enclave an `rtsps://` link (`PUT /ingest/source`, sealed under
+  the capability, only after the phone has verified the attestation). The
+  link is a credential and stays in the enclave: the masseuse and Cloudflare learn only
   `source: external`, the enclave never logs it, nothing of it persists. The
   enclave probes the camera once for reachability and its certificate's
   SHA-256, then MediaMTX pulls RTSPS with that fingerprint pinned. Plain
@@ -225,7 +225,7 @@ kind makes plain:
   it on the computer (`masseuse-camlink -share-phone on`, which is the
   only thing that makes the connector accept it, and which the connector
   reports to the service) and their phone, seeing that, asks the enclave
-  to send it (`PUT /ingest/share`, the capability bearer). One `ffmpeg`
+  to send it (`PUT /ingest/share`, under the capability). One `ffmpeg`
   in this image then copies the phone's own video track off the relay's
   loopback path - no decoding, no re-encoding - and publishes it into the
   connector's `phone` path, through the gateway's own-endpoint listener
@@ -265,14 +265,29 @@ the inset is the connector's (`faceSource`), and nothing of any picture.
 
 **One session per slot.** A slot serves one session at a time: the lease
 holds a single capability hash, and the publish and overlay routes accept
-only that capability as a bearer, so a second person cannot join a slot
-that is someone else's.
+only that capability, so a second person cannot join a slot that is
+someone else's.
+
+**Sealed requests.** The browser cannot see which key its TLS connection
+to the slot reached, so a certificate for the slot's hostname would be
+enough to read whatever crosses that connection. Nothing under the
+phone's capability crosses it in the clear. The image says so in its
+attested environment (`TEE_REQUEST_SEAL=v1`, which no deployment metadata
+can change); the attestation document carries a P-256 seal key, made at
+boot, that the evidence key vouches for; and every request under the
+capability carries `X-Masseuse-Seal`: an ephemeral key of the phone's
+and, under the key the two derive (ECDH, HKDF-SHA256, AES-256-GCM), the
+capability, the method, the path, the time, a request id and the client
+nonce, with the body (an offer, a camera's link, a stream key) sealed
+beside them. The enclave opens each seal once, for the request it names,
+within two minutes of its time, and refuses a bare bearer
+(`workload/producer/tee_mode.py`, `SealKey`).
 
 **The live stream (opt-in).** A user may send the view on to a
 live-streaming service of their choosing, the way a creator streams a
 show: the page hands the enclave the service's `rtmp://` or `rtmps://`
 address, stream key included (`PUT /ingest/egress {url, audio?, hud?}`,
-the same capability bearer as WHIP, over the slot's own TLS, after the
+under the same capability as WHIP and sealed with it, after the
 attestation check), and one `ffmpeg` inside the image reads the view back
 from the relay's loopback path and pushes it there, with the microphone
 as AAC when `audio` is asked for and, when `hud` is (the default), a HUD
