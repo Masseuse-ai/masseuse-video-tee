@@ -77,9 +77,9 @@ def test_tee_models_clears_a_stale_marker_first_and_touches_it_last(tmp_path, mo
     seen: list[str] = []
     original_fetch = tee_models.fetch
 
-    def fetch(bucket, jobs, target):
+    def fetch(bucket, jobs, target, expected=None):
         seen.append("stale marker present" if marker.exists() else "marker cleared")
-        original_fetch(bucket, jobs, target)
+        original_fetch(bucket, jobs, target, expected)
 
     monkeypatch.setattr(tee_models, "fetch", fetch)
     fake_tm = SimpleNamespace(download_chunks_concurrently=lambda *a, **k: None)

@@ -7,11 +7,13 @@
 # submods.container.image_signatures[] = {key_id, signature_algorithm}
 # where key_id is the hex SHA-256 of the DER-encoded public key. The WIF
 # production provider, the trainer/phone policy and the camera connector
-# pin that key_id: it is the image's identity. Only the github-release
-# service account may sign (github-release.tf), and only a release.yml run
-# on a tag may become that account, so "signed by the key" means "built by
-# release.yml from a tag of the public repository", for whatever digest the
-# token then reports. Same shape as auth-broker-tee/terraform/kms.tf.
+# pin that key_id. Terraform lets only the github-release service account
+# sign (github-release.tf), and only a release.yml run on a tag may become
+# that account; the project's owners can grant themselves the role, so
+# "signed by the key" means "promoted through this project", not "built by
+# release.yml". The latter is the keyless signature and SLSA provenance on
+# ghcr.io, which the trainer and the connector check for every digest a
+# token reports. Same shape as auth-broker-tee/terraform/kms.tf.
 #
 # Signing runs on every release; *requiring* the signature is the
 # require_signed_image switch (production flip), because the debug images

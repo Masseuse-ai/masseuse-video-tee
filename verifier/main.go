@@ -16,10 +16,15 @@
 //     attestation-bound GPU, not just a TDX CPU.
 //  4. Pins the workload: a signature by the release KMS key in
 //     image_signatures[] (the launcher verified it before starting the
-//     image; only the release workflow can sign with that key), the image
-//     reference under the project's Artifact Registry, TRAINER_URL and
-//     TEE_CAPTURE_BUCKET env as expected (where readings go, and the one
-//     bucket a leased session's record may be written to), and the
+//     image; the release workflow signs with the key, and so can whoever
+//     the enclave project's IAM lets, which is why step 6 is not optional),
+//     the image reference under the project's Artifact Registry, the
+//     environment the deployment sets at boot as expected (TRAINER_URL,
+//     where readings go; TEE_CAPTURE_BUCKET, the one bucket a leased
+//     session's record may be written to; TEE_REQUEST_SEAL v1, the phone's
+//     requests sealed and a bare bearer refused; exactly the trainer as
+//     TRAINER_INVOKER_SERVICE_ACCOUNT, the one identity the control routes
+//     take a token from), the rest of what it may set reported, and the
 //     release stamp the workflow baked into the image
 //     (TEE_IMAGE_VERSION, TEE_IMAGE_COMMIT in the attested environment):
 //     which release is running, held to -expect-release / -min-release
@@ -36,11 +41,13 @@
 //     eat_nonce must hold those three and nothing else: the enclave
 //     appends one caller's nonce and refuses one shaped like its own key
 //     hashes, so no other party's key can sit in the token beside them.
-//  6. Optionally shells out to `slsa-verifier verify-image` for the digest
-//     the token names, in the public registry, against the source
-//     repository at the release the token names: the SLSA provenance
-//     proves which commit of the public source produced the running
-//     image, and its commit must be the one the image stamp says.
+//  6. Shells out to `slsa-verifier verify-image` for the digest the token
+//     names, in the public registry, against the source repository at the
+//     release the token names: the SLSA provenance proves which commit of
+//     the public source produced the running image, and its commit must be
+//     the one the image stamp says. A run that cannot make this check (no
+//     slsa-verifier, an unstamped image, a provenance naming no commit),
+//     or the signature check (no accepted key), does not pass.
 //  7. Optionally shells out to `cosign verify --key` to confirm the
 //     signature over the running digest independently of the launcher.
 //
@@ -65,6 +72,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"io/fs"
 	"net/http"
 	"os"
 	"os/exec"
@@ -90,7 +98,17 @@ const (
 	// -source-uri and -image-repo name that home.
 	defaultSourceURI = "github.com/Masseuse-ai/masseuse-video-tee"
 	defaultImageRepo = "ghcr.io/masseuse-ai/masseuse-video-tee"
+	// The release key's fingerprint (VERIFY.md, terraform output
+	// image_signer_fingerprint), and the trainer's runtime account: the
+	// one identity the slot's control routes should take a token from.
+	defaultSignerKeyID    = "cfb085b950e93abb8332cede62fa50df662ef9aebb1533b2ae0bf1403ea4f811"
+	defaultTrainerInvoker = "masseuse-trainer@prod-femled-couple-router.iam.gserviceaccount.com"
 )
+
+// The variables the launch policy lets the deployment set at boot
+// (Dockerfile.tee allow_env_override) that this tool reports and does
+// not hold to a value: what each can and cannot change is in VERIFY.md.
+var reportedEnv = []string{"MODELS_BUCKET", "WIF_AUDIENCE", "ACME_DIRECTORY_URL", "TEE_ALLOWED_ORIGINS"}
 
 type config struct {
 	origin          string
@@ -101,6 +119,8 @@ type config struct {
 	allowedDigests  []string
 	trainerURL      string
 	captureBucket   string
+	requestSeal     string
+	trainerInvokers []string
 	signerKeyIDs    []string
 	minRelease      string
 	expectRelease   string
@@ -280,7 +300,7 @@ func main() {
 
 func parseFlags() (*config, error) {
 	cfg := &config{}
-	var digests, signers string
+	var digests, signers, invokers string
 	flag.StringVar(&cfg.origin, "origin", "https://slot-0.tee.masseuse.ai", "the slot's origin (also the token audience)")
 	flag.StringVar(&cfg.fetchBase, "fetch-base", "", "debug only: send the requests here instead of to -origin (an IAP tunnel to the producer's loopback port, http://127.0.0.1:18080); the audience is still -origin, and the TLS binding cannot pass because the connection is not to the slot")
 	flag.StringVar(&cfg.jwksURL, "jwks-url", defaultJWKSURL, "Confidential Space attestation signer JWKS")
@@ -289,10 +309,12 @@ func parseFlags() (*config, error) {
 	flag.StringVar(&digests, "allowed-digests", "", "comma-separated sha256:... digests to pin the slot to; empty (the norm) reports the digest and relies on the signature and the release stamp")
 	flag.StringVar(&cfg.trainerURL, "trainer-url", "https://masseuse-trainer-125139120897.us-central1.run.app", "expected TRAINER_URL in the workload env (where readings go)")
 	flag.StringVar(&cfg.captureBucket, "capture-bucket", "masseuse-ai-prod", "expected TEE_CAPTURE_BUCKET in the workload env (the bucket a leased session's record is written to, under the prefix the trainer's lease names); \"\" requires the slot to keep no record at all")
-	flag.StringVar(&signers, "signer-key-ids", "", "comma-separated hex sha256 fingerprints of accepted cosign signing keys (terraform output image_signer_fingerprint, or VERIFY.md); empty skips the signature check")
+	flag.StringVar(&cfg.requestSeal, "request-seal", "v1", "expected TEE_REQUEST_SEAL in the workload env (requests under the phone's capability sealed to a key the enclave attests, and a bare bearer refused); \"\" expects it unset")
+	flag.StringVar(&invokers, "trainer-invoker", defaultTrainerInvoker, "comma-separated service accounts TRAINER_INVOKER_SERVICE_ACCOUNT in the workload env must name, exactly: the only identities the slot's control routes take a token from")
+	flag.StringVar(&signers, "signer-key-ids", defaultSignerKeyID, "comma-separated hex sha256 fingerprints of accepted cosign signing keys (terraform output image_signer_fingerprint, or VERIFY.md); the run cannot pass without one")
 	flag.StringVar(&cfg.minRelease, "min-release", "", "the lowest release (vX.Y.Z) the image may be, held against its attested TEE_IMAGE_VERSION; empty accepts any, including images built before the stamp")
 	flag.StringVar(&cfg.expectRelease, "expect-release", "", "the exact release (vX.Y.Z) the image must be stamped with (a roll's check that the new image is what booted)")
-	flag.StringVar(&cfg.slsaVerifierBin, "slsa-verifier", "", "path to slsa-verifier; verifies the SLSA provenance of the running digest in -image-repo against -source-uri at the release the token names, and that the provenance's commit is the image's TEE_IMAGE_COMMIT")
+	flag.StringVar(&cfg.slsaVerifierBin, "slsa-verifier", "slsa-verifier", "slsa-verifier (a path, or found on PATH): verifies the SLSA provenance of the running digest in -image-repo against -source-uri at the release the token names, and that the provenance's commit is the image's TEE_IMAGE_COMMIT; the run cannot pass without it")
 	flag.StringVar(&cfg.sourceURI, "source-uri", defaultSourceURI, "the source repository the provenance must name")
 	flag.StringVar(&cfg.imageRepo, "image-repo", defaultImageRepo, "the public registry holding the same digest with its provenance")
 	flag.BoolVar(&cfg.allowDebug, "allow-debug", false, "accept dbgstat=enabled and no STABLE attribute (a debug image; never for production verification)")
@@ -318,14 +340,15 @@ func parseFlags() (*config, error) {
 		}
 	}
 	cfg.signerKeyIDs = splitTrim(signers)
+	cfg.trainerInvokers = invokersOf(invokers)
 	if cfg.minRelease != "" && !validRelease(cfg.minRelease) {
 		return nil, fmt.Errorf("-min-release %q is not a release tag (vX.Y.Z)", cfg.minRelease)
 	}
 	if cfg.expectRelease != "" && !validRelease(cfg.expectRelease) {
 		return nil, fmt.Errorf("-expect-release %q is not a release tag (vX.Y.Z)", cfg.expectRelease)
 	}
-	if cfg.slsaVerifierBin != "" && (cfg.sourceURI == "" || cfg.imageRepo == "") {
-		return nil, errors.New("-slsa-verifier needs -source-uri and -image-repo")
+	if cfg.sourceURI == "" || cfg.imageRepo == "" {
+		return nil, errors.New("-source-uri and -image-repo name where the provenance is checked; neither may be empty")
 	}
 	if (cfg.cosignBin == "") != (cfg.cosignPublicKey == "") {
 		return nil, errors.New("-cosign and -cosign-public-key go together")
@@ -447,19 +470,15 @@ func run(ctx context.Context, cfg *config, r *report) error {
 		captureDetail = "(unset: the slot keeps no session record)"
 	}
 	r.add("image.env.TEE_CAPTURE_BUCKET", capture == cfg.captureBucket, captureDetail)
+	for _, c := range bootEnvChecks(cfg, env) {
+		r.add(c.Name, c.OK, c.Detail)
+	}
 	r.Release = releaseOf(env)
 	relOK, relDetail := releaseCheck(cfg, r.Release)
 	r.add("image.release", relOK, relDetail)
 	r.SignerKeyIDs = signatureKeyIDs(claims.Submods)
-	if len(cfg.signerKeyIDs) > 0 {
-		ok := false
-		for _, id := range r.SignerKeyIDs {
-			if contains(cfg.signerKeyIDs, id) {
-				ok = true
-			}
-		}
-		r.add("image.signature", ok, fmt.Sprintf("key ids in token: %v", r.SignerKeyIDs))
-	}
+	sigOK, sigDetail := signatureCheck(cfg.signerKeyIDs, r.SignerKeyIDs)
+	r.add("image.signature", sigOK, sigDetail)
 
 	// Nonce bindings.
 	r.add("nonce.fresh", nonceMatches(claims.EatNonce, nonce), "eat_nonce echoes this run's nonce")
@@ -482,7 +501,14 @@ func run(ctx context.Context, cfg *config, r *report) error {
 
 	// Provenance: the public copy of the running digest, its SLSA
 	// provenance, the source repository at the release the token names.
-	if cfg.slsaVerifierBin != "" && r.ImageDigest != "" {
+	// Not optional: without it nothing outside the enclave's own project
+	// says which build of the public source is running.
+	switch {
+	case r.ImageDigest == "":
+		r.add("provenance.source", false, "the token names no image digest")
+	case cfg.slsaVerifierBin == "":
+		r.add("provenance.source", false, "not checked: -slsa-verifier is empty")
+	default:
 		provOK, provDetail := provenanceCheck(ctx, cfg, r.ImageDigest, r.Release)
 		r.add("provenance.source", provOK, provDetail)
 	}
@@ -525,34 +551,100 @@ func releaseCheck(cfg *config, rel *release) (bool, string) {
 	return true, detail
 }
 
-// provenanceCheck runs slsa-verifier over the running digest in the public
-// registry: the provenance must name -source-uri (at the token's release
-// tag when the image is stamped) and its commit must be the one the image
-// stamp names.
-func provenanceCheck(ctx context.Context, cfg *config, digest string, rel *release) (bool, string) {
-	args := []string{"verify-image", cfg.imageRepo + "@" + digest, "--source-uri", cfg.sourceURI, "--print-provenance"}
-	if rel != nil && validRelease(rel.Version) {
-		args = append(args, "--source-tag", rel.Version)
+// signatureCheck: one of the token's image_signatures key ids is an
+// accepted key. With no accepted key nothing is checked, and that fails.
+func signatureCheck(accepted, inToken []string) (bool, string) {
+	if len(accepted) == 0 {
+		return false, "not checked: -signer-key-ids names no key"
 	}
+	for _, id := range inToken {
+		if contains(accepted, id) {
+			return true, fmt.Sprintf("key ids in token: %v", inToken)
+		}
+	}
+	return false, fmt.Sprintf("key ids in token: %v, none of %v", inToken, accepted)
+}
+
+// bootEnvChecks: the variables of the attested environment the deployment
+// sets at boot that decide who may drive the slot and how the phone's
+// requests reach it, held to their values; and the others it may set,
+// reported.
+func bootEnvChecks(cfg *config, env map[string]any) []check {
+	seal, _ := env["TEE_REQUEST_SEAL"].(string)
+	sealDetail := seal
+	if seal == "" {
+		sealDetail = "(unset: the slot takes the phone's capability as a bare bearer)"
+	}
+	raw, _ := env["TRAINER_INVOKER_SERVICE_ACCOUNT"].(string)
+	got := invokersOf(raw)
+	checks := []check{
+		{Name: "image.env.TEE_REQUEST_SEAL", OK: seal == cfg.requestSeal, Detail: sealDetail},
+		{Name: "image.env.TRAINER_INVOKER_SERVICE_ACCOUNT", OK: slices.Equal(got, cfg.trainerInvokers),
+			Detail: fmt.Sprintf("%s (expected exactly %s)", strings.Join(got, ", "), strings.Join(cfg.trainerInvokers, ", "))},
+	}
+	for _, name := range reportedEnv {
+		value, _ := env[name].(string)
+		if value == "" {
+			value = "(unset: the image's default)"
+		}
+		checks = append(checks, check{Name: "image.env." + name, OK: true, Detail: value + " (reported, not checked)"})
+	}
+	return checks
+}
+
+// invokersOf reads TRAINER_INVOKER_SERVICE_ACCOUNT as the enclave does
+// (tee_mode.py TeeConfig): comma-separated, trimmed, lowercased; sorted
+// and without repeats here.
+func invokersOf(value string) []string {
+	var out []string
+	for _, account := range splitTrim(strings.ToLower(value)) {
+		if !slices.Contains(out, account) {
+			out = append(out, account)
+		}
+	}
+	slices.Sort(out)
+	return out
+}
+
+// provenanceCheck runs slsa-verifier over the running digest in the public
+// registry: the provenance must name -source-uri at the token's release
+// tag, and its commit must be the one the image stamp names. An image with
+// no stamp, or a provenance whose commit cannot be read, fails.
+func provenanceCheck(ctx context.Context, cfg *config, digest string, rel *release) (bool, string) {
+	if rel == nil || !validRelease(rel.Version) || rel.Commit == "" {
+		return false, "the image carries no release stamp (TEE_IMAGE_VERSION, TEE_IMAGE_COMMIT) to hold the provenance to"
+	}
+	args := []string{"verify-image", cfg.imageRepo + "@" + digest, "--source-uri", cfg.sourceURI,
+		"--source-tag", rel.Version, "--print-provenance"}
 	cmd := exec.CommandContext(ctx, cfg.slsaVerifierBin, args...)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr
 	if err := cmd.Run(); err != nil {
-		return false, truncate(strings.TrimSpace(stderr.String()+" "+stdout.String()), 300)
+		if errors.Is(err, exec.ErrNotFound) || errors.Is(err, fs.ErrNotExist) {
+			return false, "not checked: " + cfg.slsaVerifierBin + " not found (install slsa-verifier, VERIFY.md, or pass -slsa-verifier)"
+		}
+		said := strings.TrimSpace(stderr.String() + " " + stdout.String())
+		if said == "" {
+			said = err.Error()
+		}
+		return false, truncate(said, 300)
 	}
-	commit, ref := provenanceSource(stdout.Bytes())
-	detail := cfg.sourceURI
+	return provenanceVerdict(cfg.sourceURI, stdout.Bytes(), rel)
+}
+
+// provenanceVerdict holds what slsa-verifier printed to the image stamp.
+func provenanceVerdict(sourceURI string, printed []byte, rel *release) (bool, string) {
+	commit, ref := provenanceSource(printed)
+	detail := sourceURI
 	if ref != "" {
 		detail += "@" + ref
 	}
-	if commit != "" {
-		detail += " commit " + commit
+	if commit == "" {
+		return false, detail + " (the provenance names no source commit)"
 	}
-	if rel != nil && rel.Commit != "" && commit != "" && commit != rel.Commit {
+	detail += " commit " + commit
+	if commit != rel.Commit {
 		return false, detail + " (the image stamp says " + rel.Commit + ")"
-	}
-	if rel == nil {
-		detail += " (image unstamped: the tag is not checked)"
 	}
 	return true, detail
 }

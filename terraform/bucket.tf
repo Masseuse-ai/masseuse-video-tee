@@ -4,8 +4,10 @@
 # A copy of the weights prefixes of the current producer bucket (README:
 # `gcloud storage cp -r` of hf-bf16/, detectors/ and the artifact file).
 # Readable by the attested image digest(s) through the WIF pool and by no
-# service account: the operator can upload weights, and can grant nothing
-# a running enclave would not already prove about itself.
+# service account. The operators can upload weights, and as the project's
+# owners could replace them or grant anyone else what the pool has; an
+# attested image loads only the objects its models.lock names, each by
+# SHA-256, so a replaced file makes the store refused rather than loaded.
 # ---------------------------------------------------------------------------
 resource "google_storage_bucket" "models" {
   project                     = var.project_id

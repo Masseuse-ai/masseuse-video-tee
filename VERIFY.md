@@ -16,10 +16,12 @@ not prove. If you are not technical, hand it to someone who is.
    nothing.
 2. The enclave runs an image that the release workflow of this public
    repository built from a tagged commit and signed, on a production
-   Confidential Space image with debugging disabled since boot (no SSH, no
-   log redirection, no memory monitoring), on hardware Google attests to,
-   with the GPU attestation-bound. The attestation names the image's
-   digest, the release it was built from and the signature.
+   Confidential Space VM image with debugging disabled since boot (no SSH,
+   no log redirection, no memory monitoring: that is what `dbgstat`
+   attests, of the VM image the launcher runs, not of the container),
+   on hardware Google attests to, with the GPU attestation-bound. The
+   attestation names the image's digest, the release it was built from and
+   the signature.
 3. TLS for the signalling origin (`slot-N.tee.masseuse.ai`) terminates
    inside the enclave: the certificate's key was generated there and is
    named in the attestation.
@@ -27,14 +29,23 @@ not prove. If you are not technical, hand it to someone who is.
    SDP answer's DTLS fingerprint is signed by an Ed25519 key generated in
    the enclave and named in the attestation, and your browser's own DTLS
    handshake then verifies that fingerprint.
-5. FemLed operators cannot change what runs without publishing a release:
-   the signing key the clients pin can be used only by the release workflow
-   of this repository running on a tag, every release carries SLSA
-   provenance naming the commit it was built from, and the only credential
-   that can read the model weights is minted from the attestation of the
-   deployed image, which the production posture also requires to be
-   signed. An image nobody released cannot read the weights or take a
-   session, whatever its digest.
+5. An image this repository's release workflow did not build cannot take
+   a session, and a released image runs only the weights and the analysis
+   bundle its release names. FemLed's operators own the enclave's Google
+   Cloud project, and owning it they can sign an image with the key the
+   launcher checks, boot it, give it the weights, mint a certificate for a
+   slot's name, and set the variables the launch policy leaves to the
+   deployment. That is not where the clients look for the image's
+   identity: the trainer and the camera connector hold every slot to the
+   keyless signature and the SLSA provenance the release workflow leaves
+   for the digest in the public transparency log, at the tag and commit
+   the image is stamped with, which no one holding the project can make,
+   and the phone sends nothing to a slot the trainer has not vouched for
+   that way. The trainer's ID token goes only over the TLS key the
+   attestation binds, and the phone's requests are sealed to a key the
+   attestation names, so a certificate for the name opens nothing.
+   `models.lock` and `analysis.lock`, part of the image, fix by SHA-256
+   what it loads, whatever the bucket holds.
 6. What the enclave sends onward is derived readings (numbers), never
    frames: `README.md`, "What happens to your video".
 
@@ -47,12 +58,13 @@ running image and be the tree it was built from. The identity that holds
 at every moment is in the attestation token itself:
 
 - `submods.container.image_signatures[].key_id`: the fingerprint of the KMS
-  signing key (below). Only the release workflow may sign with it
-  (`terraform/github-release.tf`, `signing.tf`), and only from a run of
-  `.github/workflows/release.yml` on a `v*` tag of this repository, so a
-  signature by that key means "built by the release workflow from a tag of
-  the public source". The launcher verified the signature before it started
-  the image.
+  signing key (below). The launcher verified the signature before it
+  started the image. Terraform grants the key to the release workflow
+  alone (`terraform/github-release.tf`, `signing.tf`: a run of
+  `.github/workflows/release.yml` on a `v*` tag of this repository, on a
+  GitHub-hosted runner), but the project's owners can grant it to
+  themselves, so the signature says the image went through the enclave's
+  project, not who built it.
 - `submods.container.env.TEE_IMAGE_VERSION` and `TEE_IMAGE_COMMIT`: the
   release tag and the commit the workflow baked into the image
   (`workload/tee/Dockerfile.tee`), attested with the rest of the workload
@@ -62,13 +74,22 @@ at every moment is in the attestation token itself:
   from `v0.12.4` on, `ghcr.io/femled/masseuse-video-tee` for images up to `v0.12.3`)
   with its SLSA provenance, which names the source commit; that commit must be the one
   the stamp names, and `slsa-verifier` checks the tag.
+- The release workflow's keyless signature over the digest and the SLSA
+  generator's provenance for it, both in the Sigstore transparency log:
+  certificates that name `release.yml` of this repository at the tag (and
+  the generator, for the provenance), a GitHub-hosted run, and the commit.
+  This is what says who built the image, and it is not the enclave
+  project's to write. The trainer and the connector check it for every
+  slot, and `tee-verify` does.
 
-The clients (the web app, the connector) pin the signing key and, once
-every running image is stamped, a minimum release; they do not pin digests.
-The connector goes further: the signing key, the minimum release, the
-project and registry the enclave must run from and this repository as the
-source are compiled into it as floors the served policy can only tighten,
-and it checks the digest's public record itself (below).
+The clients pin the signing key and a minimum release; they do not pin
+digests. The trainer and the connector check the digest's public record
+themselves (below), and the web app, which cannot read the transparency
+log, requires the trainer's verdict on it (`requireProvenance` in the
+policy). The connector goes further: the signing key, the minimum release,
+the project and registry the enclave must run from and this repository as
+the source are compiled into it as floors the served policy can only
+tighten.
 Every release's digest and validation record is on its GitHub Release
 ([releases](https://github.com/Masseuse-ai/masseuse-video-tee/releases)), written
 by the workflow that built it and appended to by the operators when the
@@ -76,32 +97,34 @@ image has been verified on a slot and carried a session.
 
 ## What you need
 
-- The signing key fingerprint (below).
 - `go` 1.22+ to build the verifier in `verifier/`.
-- [`slsa-verifier`](https://github.com/slsa-framework/slsa-verifier) to tie
-  the running digest to this source; optionally `cosign` to check the image
-  signature independently.
+- [`slsa-verifier`](https://github.com/slsa-framework/slsa-verifier) on
+  your `PATH` (or `-slsa-verifier <path>`) to tie the running digest to
+  this source: a run without it does not pass. Optionally `cosign` to check
+  the image signature independently.
+- The signing key fingerprint (below) is the default of `-signer-key-ids`;
+  pass it explicitly if you would rather not take the verifier's word.
 
 ## Run the verifier
 
 ```sh
 cd verifier
 go build -o tee-verify .
-./tee-verify -origin https://slot-0.tee.masseuse.ai \
-    -signer-key-ids <signing key fingerprint below> \
-    -slsa-verifier "$(command -v slsa-verifier)"
+./tee-verify -origin https://slot-0.tee.masseuse.ai
 ```
 
 Exit code 0 and `"passed": true` means every check below held for a token
 minted seconds ago for your nonce. The report names the digest and the
 release (`release.version`, `release.commit`) that are running. Add
 `-expect-release vX.Y.Z` to insist on a particular release (the newest one
-on the releases page, say) or `-min-release vX.Y.Z` for a floor; without
-either, an unstamped image (released before `v0.4.0`) passes with
-`image.release` saying so. Add `-v` to print the decoded attestation
-claims; add `-cosign <path> -cosign-public-key signer.pub` to have cosign
-re-verify the image signature from the registry. `-allowed-digests` pins
-the slot to a list if you have a reason to; nothing here requires it.
+on the releases page, say) or `-min-release vX.Y.Z` for a floor. A run
+that cannot make the signature check (no accepted key) or the provenance
+check (no `slsa-verifier`, an image released before `v0.4.0` with no
+stamp to hold the provenance to, a provenance naming no commit) does not
+pass. Add `-v` to print the decoded attestation claims; add `-cosign
+<path> -cosign-public-key signer.pub` to have cosign re-verify the image
+signature from the registry. `-allowed-digests` pins the slot to a list if
+you have a reason to; nothing here requires it.
 
 Each check, and why it matters:
 
@@ -110,14 +133,17 @@ Each check, and why it matters:
 | `jwt.signature`, `jwt.issuer` | the token is signed by Google's Confidential Space attestation service (`https://confidentialcomputing.googleapis.com`), whose keys are at `https://www.googleapis.com/service_accounts/v1/metadata/jwk/signer@confidentialspace-sign.iam.gserviceaccount.com`. Only the launcher inside a real Confidential Space VM can obtain one. |
 | `jwt.audience` | the token was minted for this slot's origin, not lifted from another service. |
 | `cs.swname`, `cs.hwmodel`, `cs.secboot` | Confidential Space on Intel TDX with Secure Boot. |
-| `cs.dbgstat`, `cs.support_attributes.STABLE` | the production image family, debugging disabled since boot: the operator cannot SSH in, redirect the container's output, or read memory metrics. (`-allow-debug` accepts the debug posture; production verification must not pass it.) |
+| `cs.dbgstat`, `cs.support_attributes.STABLE` | the production VM image family, debugging disabled since boot: the operator cannot SSH in, redirect the container's output, or read memory metrics. It is the VM image's posture; what the container does is the image's, below. (`-allow-debug` accepts the debug posture; production verification must not pass it.) |
 | `gpu.cc_mode`, `gpu.hwmodel` | the H100 is in confidential-computing mode and its device attestation is part of the token: the models run on protected GPU memory, not a plain GPU next to a TDX CPU. |
-| `image.signature` | the image carries a cosign signature by the KMS key whose fingerprint is published below; the launcher verified it at boot. Only the release workflow on a tag can make that signature, and rebuilding the image with different code changes the digest and voids it. This is the check that identifies the image. |
+| `image.signature` | the image carries a cosign signature by the KMS key whose fingerprint is published below (`-signer-key-ids`, that key by default); the launcher verified it at boot. Rebuilding the image with different code changes the digest and voids it. Who can make the signature is whoever the enclave project's IAM lets use the key: the release workflow on a tag, and the project's owners if they grant themselves the role. It says the image went through the project; `provenance.source` says who built it. |
 | `image.release` | the release stamp (`TEE_IMAGE_VERSION`, `TEE_IMAGE_COMMIT`) the workflow baked in: which release is running, held to `-expect-release` / `-min-release` when given. |
 | `image.digest`, `image.reference` | the digest of the running container, reported (and pinned to `-allowed-digests` if you passed a list), pulled from FemLed's registry for this project. |
 | `image.env.TRAINER_URL` | the enclave posts its readings (numbers, never frames) to the trainer service you expect and nowhere else (the whole workload environment is in the token; `-v` shows it). |
 | `image.env.TEE_CAPTURE_BUCKET` | the one bucket a signed-in session's record (keypoints, descriptors, audio measurements, the analysis's rows; README "Session records") may be written to is the one you expect (`-capture-bucket`, default `masseuse-ai-prod`); the enclave refuses a lease naming a record when the variable is unset, and `-capture-bucket ""` requires a slot that keeps none. The trainer holds the same expectation before it leases. |
-| `provenance.source` | (with `-slsa-verifier`) the running digest, on the public registry its release names (`-image-repo`), carries SLSA provenance from this project's release workflow (`-source-uri`) at the release the stamp names, and the provenance's commit is the stamp's commit: the image is the public source at that tag, built by GitHub's runners. |
+| `image.env.TEE_REQUEST_SEAL` | `v1` (`-request-seal`): requests under the phone's capability are sealed to a key the enclave attests, and a bare bearer is refused. Not settable at boot; checked because an image without it takes the capability in the clear. |
+| `image.env.TRAINER_INVOKER_SERVICE_ACCOUNT` | exactly the trainer's runtime account (`-trainer-invoker`), read as the enclave reads it: the one identity the slot's control routes (`/lease`, `/produce`, ...) take an ID token from. The deployment can set it at boot, so an extra identity here is an extra caller that could re-lease the slot. The trainer and the phone hold it to the policy's `expectedTrainerInvokers` too. |
+| `image.env.MODELS_BUCKET`, `WIF_AUDIENCE`, `ACME_DIRECTORY_URL`, `TEE_ALLOWED_ORIGINS` | reported, not checked: the deployment may set them at boot. What each can change: which bucket the weights come from (`models.lock` fixes what loads, by SHA-256), which identity pool the attestation is exchanged at, which CA issues the certificate (the TLS key is attested whatever the CA), which page origins the slot answers (every request under the capability is sealed regardless). |
+| `provenance.source` | the running digest, on the public registry its release names (`-image-repo`), carries SLSA provenance from this project's release workflow (`-source-uri`) at the release the stamp names, and the provenance's commit is the stamp's commit: the image is the public source at that tag, built by GitHub's runners. Required: without `slsa-verifier`, a stamp, or a commit in the provenance, the run fails. |
 | `nonce.fresh` | `eat_nonce` contains the random nonce this run sent: the token was minted now, not replayed. |
 | `nonce.evidence-key` | `eat_nonce` contains `sha256(evidence key)`: the Ed25519 key that signs DTLS fingerprints lives in this enclave. |
 | `nonce.tls-spki` | `eat_nonce` contains `sha256(SubjectPublicKeyInfo)` of the certificate this very TLS connection negotiated: the TLS endpoint is the enclave, not a proxy in front of it. |
@@ -151,13 +177,35 @@ own, or start one and run the verifier from another machine.
 
 ## What the clients check
 
+The masseuse.ai trainer, which leases a slot to a phone and drives it with
+its own Google ID token, checks the slot before anything with that token
+reaches it (`masseuse-trainer/server/`, "Attested before leased" in its
+README). It fetches the slot's `/attestation` with no token, over a
+connection of its own, and requires the token to bind the TLS key that
+very connection presented; it holds the claims to its policy (the same
+document the browser fetches, below); and it checks the image's public
+record the way the connector does (`tee-provenance.js`, a port of the
+connector's `internal/provenance`): the release workflow's keyless
+signature over the attested digest at the attested tag and commit from a
+GitHub-hosted run, and the SLSA generator's provenance naming this
+repository at that tag and commit, both verified against Sigstore's trust
+root and the transparency log, with the certificates matched exactly.
+Only then does it pin every connection to the slot to the attested TLS
+key, checked in the handshake, so its token reaches the enclave that was
+verified and nobody holding a certificate for the slot's name. It reports
+what it found to the phone (`attested.provenance`), which requires it.
+
 The masseuse.ai web app does the same verification in the browser before it
 sends any media: JWT signature against the same JWKS, the same claims
 against the policy the trainer publishes at
 `https://masseuse.ai/api/tee-policy` (the signing key it accepts, the
 minimum release once one is set, the source repository and public image
-repository the provenance must name, the debug and GPU posture), and the
-evidence-key binding. The browser asks for no nonce of its own, so it takes
+repository the provenance must name, the debug and GPU posture, exactly
+the trainer as the slot's control-route caller), and the evidence-key
+binding; and it refuses a slot the trainer has not described (the same
+instance, image and evidence key it verified itself) or, under
+`requireProvenance`, whose provenance the trainer has not verified. The
+browser asks for no nonce of its own, so it takes
 the slot's boot token only: `eat_nonce` must be the evidence key's hash,
 then the TLS key's once the slot has a certificate, and nothing else; a
 token minted for anyone's nonce is refused. Then, on every WebRTC leg, it
@@ -229,8 +277,9 @@ no provenance, all in the debug posture; they were retired on 2026-09-09.
 They were signed by the same key by the build system of the time, so the
 signature alone does not exclude them: the production posture does
 (`dbgstat`), the deployment's digest pin keeps the weights from them, and
-so will the minimum release the clients pin once every running image
-carries a stamp, since none of them does.
+so do the minimum release the clients pin and the provenance the trainer
+and the connector check, since none of them carries a stamp or a
+provenance.
 
 Production posture since 2026-09-09 22:20 UTC (`v0.2.3`), except for two
 debug windows on 2026-09-10 recorded on the `v0.3.0` and `v0.3.1`
@@ -305,10 +354,14 @@ verifiable release, and `camlink.lock` at the tag says which one.
 ## Image signing key
 
 Cosign signatures are made by a Cloud KMS `EC_SIGN_P256_SHA256` key
-(`terraform/signing.tf`) that only the release workflow's identity may use
-(`terraform/github-release.tf`: a Workload Identity Federation pool that
-admits runs of `release.yml` on `v*` tags of this repository and nothing
-else); every release signs its digest.
+(`terraform/signing.tf`) that terraform grants to the release workflow's
+identity alone (`terraform/github-release.tf`: a Workload Identity
+Federation pool that admits runs of `release.yml` on `v*` tags of this
+repository, by name and by GitHub's ids, on GitHub-hosted runners, and
+nothing else); every release signs its digest. The project's owners can
+change that grant, and every use of the key is in the project's Data
+Access audit log; the clients do not rely on either, they check the
+keyless signature and the provenance as well.
 
 - key_id (hex SHA-256 of the DER public key, what the attestation reports
   in `submods.container.image_signatures[].key_id`):
@@ -344,6 +397,24 @@ policy and in the WIF provider, all in this repository's history.
 - What the analysis module does with the readings. It consumes keypoints
   and descriptors, not frames; its logic is not published (`README.md`,
   "What happens to your video").
+- That the launcher refused anything. It does not refuse an unsigned image:
+  it logs the miss and mints a token with no `image_signatures`, which the
+  clients and this verifier then refuse (`docs/OPERATIONS.md`, "Image
+  signing").
+- That nothing touches a disk. The VM has its boot disk and the container
+  its writable layer; the workload keeps the weights, the TLS key, the
+  credential and the session's capture rows on two tmpfs mounts (`/models`,
+  `/run/tee`) and writes nothing of a session anywhere else, which is the
+  image's code, not something the token attests.
+- A camera the user names. Its certificate is pinned on first use, from
+  the enclave's network: the fingerprint is whatever answered the enclave's
+  first probe, and for a camera behind the home connector that probe goes
+  through the connector, which is trusted not to answer it itself and
+  substitute a camera.
+- Anything this tool cannot see from outside: the variables it reports
+  rather than checks (above), the policy and the script the phone is
+  served, and whether the trainer's verdict on provenance, which the phone
+  relies on, is the one it computed.
 - Availability. Confidential Space GPU VMs are Spot instances that boot on
   demand (about three minutes after you tap Enable camera) and stop a
   minute or two after the session; while one boots, or when one is
@@ -361,15 +432,23 @@ policy and in the WIF provider, all in this repository's history.
   the key in the enclave over TLS-ALPN-01 at every boot (chain: leaf →
   `WR1` → `GTS Root R1`). The ACME account is registered with an External
   Account Binding the enclave mints for itself with its attested identity;
-  only a signed image on TDX with the GPU in CC mode may mint one. The CAA
-  record on `tee.masseuse.ai` (`0 issue "pki.goog"`) allows no other CA.
-  Each boot's certificate is public in the CT logs: a timestamp per session
-  start, no identity.
+  of the slots, only a signed image on TDX with the GPU in CC mode may mint
+  one. The project's owners can grant themselves the same and get a
+  certificate for a slot's name; that is why the trainer pins the attested
+  TLS key, the phone seals its requests to an attested key, and the DTLS
+  fingerprints are signed by the evidence key. The CAA record on
+  `tee.masseuse.ai` (`0 issue "pki.goog"`) allows no other CA. Each boot's
+  certificate is public in the CT logs: a timestamp per session start, no
+  identity.
 - FemLed: the policy (which signing key and minimum release the clients
-  accept) and the JavaScript, as above. The provenance, the Releases and
-  this verifier are how that trust is checked rather than assumed. For the
-  home-network connector this residual is smaller: the policy can only
-  tighten anchors fixed in its reproducible build, and it verifies each
-  digest's signature and provenance against the public registry and the
-  transparency log itself, so a served policy or a served script cannot
-  send it to an image this repository's release workflow did not build.
+  accept), the JavaScript, and the trainer's verdict on each slot's
+  provenance, which the phone relies on; and, as owners of the enclave's
+  project, the signing key, the weights bucket, the identity pools, the
+  CA account and the variables set at boot. The provenance, the locks in
+  the image, the TLS pin, the seal, the Releases and this verifier are how
+  that trust is checked rather than assumed. For the home-network connector
+  this residual is smaller: the policy can only tighten anchors fixed in
+  its reproducible build, and it verifies each digest's signature and
+  provenance against the public registry and the transparency log itself,
+  so a served policy or a served script cannot send it to an image this
+  repository's release workflow did not build.

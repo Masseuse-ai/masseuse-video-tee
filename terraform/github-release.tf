@@ -10,13 +10,16 @@
 # (tee-signed-image-repos) and the production provider's key_id pin are
 # unchanged. The promote job needs write on the repository and sign on the
 # key, nothing else; it gets them through this pool, and only from runs of
-# release.yml in the named repository on a release tag. Nothing else can
-# sign with the key (signing.tf grants it to no other principal), so a
-# signature by it, which the launcher verifies at boot and the attestation
-# token reports as image_signatures[].key_id, means: built by release.yml
-# from a tag of this repository. That is what the trainer, the phone and
-# the camera connector pin, instead of a list of digests that would always
-# be one release behind the image (VERIFY.md, "What identifies the image").
+# release.yml in the named repository, on a GitHub-hosted runner, on a
+# release tag. signing.tf grants the key to no other principal, but the
+# project's owners can grant it, or make a pool and a provider of their
+# own: a signature by it (which the launcher verifies at boot and the token
+# reports as image_signatures[].key_id) says the image went through this
+# project, not that release.yml built it. What says that is public and not
+# the project's to write: the keyless signature and the SLSA provenance
+# release.yml leaves for the digest in the transparency log, which the
+# trainer and the camera connector check on every slot (VERIFY.md, "What
+# identifies the image").
 #
 # A second pool rather than a second provider in `tee`: the enclave pool's
 # principals are image digests and its bucket grant is per digest; mixing
@@ -26,6 +29,21 @@ variable "github_repository" {
   description = "The GitHub repository whose release workflow may promote images into Artifact Registry and sign them (owner/name)."
   type        = string
   default     = "Masseuse-ai/masseuse-video-tee"
+}
+
+# The same repository and its organization by GitHub's numeric ids, which
+# a name does not have: a repository deleted and made again under the same
+# name, or an organization renamed and its name taken, gets new ids.
+variable "github_repository_id" {
+  description = "GitHub's numeric id of github_repository (gh api repos/<owner>/<name> --jq .id)."
+  type        = string
+  default     = "1389657080"
+}
+
+variable "github_repository_owner_id" {
+  description = "GitHub's numeric id of github_repository's owner (gh api repos/<owner>/<name> --jq .owner.id)."
+  type        = string
+  default     = "334280083"
 }
 
 resource "google_iam_workload_identity_pool" "github" {
@@ -56,17 +74,22 @@ resource "google_iam_workload_identity_pool_provider" "github" {
     "attribute.job_workflow" = "assertion.job_workflow_ref"
   }
 
-  # Only this repository, only a release tag, only release.yml: a pull
-  # request, a branch build, or another workflow file added to the
-  # repository (even on a tag) gets no token exchange. job_workflow_ref is
-  # the workflow file the running job belongs to, at the ref that ran it,
-  # so the signing job is the release.yml of the tag's own commit. The tag
+  # Only this repository (by name and by id, in this organization), only
+  # a release tag, only release.yml, only on a GitHub-hosted runner: a pull
+  # request, a branch build, another workflow file added to the repository
+  # (even on a tag), or a job on a self-hosted runner, whose machine is
+  # whoever runs it, gets no token exchange. job_workflow_ref is the
+  # workflow file the running job belongs to, at the ref that ran it, so
+  # the signing job is the release.yml of the tag's own commit. The tag
   # itself cannot be moved or deleted afterwards: the repository's ruleset
   # "Tags are immutable" (all tags; no update, deletion or force push; no
   # bypass actor) keeps the commit a provenance names the commit the tag
   # named when it was released.
   attribute_condition = join(" && ", [
     "assertion.repository == '${var.github_repository}'",
+    "assertion.repository_id == '${var.github_repository_id}'",
+    "assertion.repository_owner_id == '${var.github_repository_owner_id}'",
+    "assertion.runner_environment == 'github-hosted'",
     "assertion.ref_type == 'tag'",
     "assertion.ref.startsWith('refs/tags/v')",
     "assertion.job_workflow_ref.startsWith('${var.github_repository}/.github/workflows/release.yml@refs/tags/v')",

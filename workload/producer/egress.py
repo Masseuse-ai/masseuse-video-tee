@@ -19,10 +19,14 @@ What the enclave checks before it connects:
   scheme      rtmp:// or rtmps://, the two a streaming service's ingest
               speaks (anything else, a web page's https:// above all, is
               refused as `bad-scheme`). The transit to the service is
-              encrypted only when its address is rtmps://; most creator
-              platforms publish a plain rtmp:// ingest (OnlyFans among
-              them), which is the service's own design for every
-              broadcasting program, and the user's choice of destination.
+              encrypted only when its address is rtmps://, and then the
+              service's certificate is checked: its chain to the system's
+              roots and its name against the address's host, so the
+              stream and its key go to the service the address names and
+              not to whoever answers on the way. Most creator platforms
+              publish a plain rtmp:// ingest (OnlyFans among them), which
+              is the service's own design for every broadcasting program,
+              and the user's choice of destination.
   address     the host must resolve to a public address (the same rule as
               a camera link: RFC 1918, loopback, link-local, multicast and
               the VM's own address are refused with a reason the page can
@@ -62,6 +66,9 @@ from external_source import _refused_address
 URL_CAP = 2048
 ALLOWED_SCHEMES = ("rtmp", "rtmps")
 DEFAULT_PORTS = {"rtmp": 1935, "rtmps": 443}
+# The system's roots (ca-certificates, workload/Dockerfile): what an
+# rtmps:// service's certificate must chain to.
+CA_FILE = "/etc/ssl/certs/ca-certificates.crt"
 BACKOFF_S = (1.0, 2.0, 4.0, 8.0, 15.0)
 HUD_FPS = 2.0
 STOP_WAIT_S = 3.0
@@ -224,6 +231,10 @@ class EgressPublisher:
             argv += ["-map", f"{audio_index}:a", "-c:a", "aac", "-b:a", "128k", "-ar", "48000"]
         else:
             argv += ["-an"]
+        if urlsplit(self.destination).scheme.lower() == "rtmps":
+            # ffmpeg's rtmps output hands these to the tls protocol it opens:
+            # the chain to the system's roots, and the host's name.
+            argv += ["-tls_verify", "1", "-ca_file", CA_FILE]
         argv += ["-f", "flv", self.destination]
         return argv
 

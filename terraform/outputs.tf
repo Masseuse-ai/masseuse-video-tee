@@ -47,7 +47,7 @@ output "capture_bucket" {
 }
 
 output "capture_writer_principals" {
-  description = "Image digest -> the Workload Identity Federation principal an enclave running that digest authenticates as (the deployed image and the candidates). The trainer's Terraform (masseuse-trainer/terraform/records.tf) grants exactly these roles/storage.objectCreator on the session-records bucket, so only an attested enclave of a released image can write a record there, and nothing can delete one."
+  description = "Image digest -> the Workload Identity Federation principal an enclave running that digest authenticates as (the deployed image and the candidates). The trainer's Terraform (masseuse-trainer/terraform/records.tf) grants exactly these roles/storage.objectCreator on the session-records bucket, so of the slots only an attested enclave of a deployed digest writes a record there, and none can delete one. The record's parts are not signed by the enclave: the project's owners could add a provider whose principal looks the same and write parts of their own (README, Session records)."
   value       = local.wif_principals
 }
 

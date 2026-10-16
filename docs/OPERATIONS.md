@@ -70,7 +70,10 @@ and `cosign sign --key gcpkms://...` with the key in `signing.tf`, in the
 layout the launcher reads. The promote job authenticates as the
 `github-release` service account through the GitHub OIDC pool in
 `terraform/github-release.tf`, which admits only `release.yml` runs on
-`v*` tag refs of this repository; nothing else can sign with the key. The
+GitHub-hosted runners on `v*` tag refs of this repository (by name and by
+GitHub's ids for it and its organization); terraform grants the key to
+nothing else, though the project's owners could, which is why the clients
+hold the image to the keyless signature and the provenance too. The
 TEE build gets the tag and commit as build arguments and the image carries
 them as `TEE_IMAGE_VERSION` and `TEE_IMAGE_COMMIT` in its environment
 (attested in `submods.container.env`) and as OCI labels; promote refuses
@@ -183,9 +186,14 @@ The models bucket (`terraform output models_bucket`) holds the detector and
 keypoint model weights under `detectors/` and `hf-bf16/`, and the pinned
 analysis bundle under `analysis/`. The enclave copies them into the
 `/models` tmpfs at boot with the credential its attestation earns (about
-3.3 GB; the hub `blobs/` and `.locks/` directories the boot never reads are
-skipped). Weights are copied in by an operator once; only an attested image
-digest can read them afterwards.
+3.3 GB): exactly the objects `models.lock` names, each refused unless its
+size and SHA-256 are the lock's, and nothing the lock does not name.
+Weights are copied in by an operator once; of the slots, only an attested
+image digest can read them afterwards (the project's owners can, as owners
+can). A change to the weights is a release: copy the new objects in, run
+`python3 workload/producer/tee_models.py --bucket <bucket>
+--write-models-lock models.lock` against the bucket (it hashes every
+object as it streams), and tag the commit that carries the new lock.
 
 ## 4. Boot
 
@@ -551,10 +559,15 @@ Every image digest is signed with the project's Cloud KMS key
 (`masseuse-video-tee-cosign/image-signer`, `EC_SIGN_P256_SHA256`,
 `prevent_destroy`), through `cosign sign --key gcpkms://...` with the two
 annotations Confidential Space requires (`dev.cosignproject.cosign/sigalg`,
-`dev.cosignproject.cosign/pub`), no Rekor upload. Only the release
-workflow's identity (`github-release`, `terraform/github-release.tf`)
-holds `cloudkms.signerVerifier` on the key, and it can only be assumed by a
-tag build of this repository. The signature is a tag on the image's own
+`dev.cosignproject.cosign/pub`), no Rekor upload. Terraform grants
+`cloudkms.signerVerifier` on the key to the release workflow's identity
+alone (`github-release`, `terraform/github-release.tf`), and that can only
+be assumed by a tag build of this repository on a GitHub-hosted runner.
+The project's owners can grant themselves the role (every use of the key is
+in the Data Access audit log, `terraform/main.tf`), so the signature says
+an image went through this project; the release workflow's keyless
+signature and SLSA provenance, which the trainer and the connector check,
+say who built it. The signature is a tag on the image's own
 repository (`.../masseuse-video-tee:sha256-<digest>.sig`), which is
 therefore what `tee-signed-image-repos` names. cosign 2.x writes that
 layout; the keyless signature on ghcr.io is cosign 3's bundle format, which
@@ -574,7 +587,10 @@ mints a token with no signatures); the refusals are downstream, where they
 are checked: the production WIF provider's condition demands a signature by
 the key before the image can read the weights, and the trainer's and the
 clients' policy (`imageSignatures`) refuse to lease or send media to a slot
-whose token carries none.
+whose token carries none. A signature by the key is not the last word on
+an image either: the trainer and the connector also require the release
+workflow's keyless signature and SLSA provenance for the digest
+(`requireProvenance`), which nobody holding the project can make.
 
 ## Session records (`workload/producer/record.py`)
 
@@ -644,18 +660,24 @@ us-central1` runs it by hand and returns the list of instances it stopped.
 ## The verifier (`verifier/`, `VERIFY.md`)
 
 `go build ./verifier` gives a standalone checker anybody can point at a slot
-(`-origin https://slot-0.tee.masseuse.ai -signer-key-ids <fingerprint>
--slsa-verifier "$(command -v slsa-verifier)"`, plus `-expect-release
-vX.Y.Z` on a roll); it fetches `/attestation` with a fresh nonce and
-`/evidence-key`, verifies the RS256 signature against Google's JWKS and
-checks every claim the clients do plus the TLS SPKI binding (the browser
-cannot see its certificate; this can), reads the release stamp off the
-attested environment, runs `slsa-verifier` for the running digest against
-this repository at that release and compares the provenance's commit to
-the stamp's, and optionally re-runs `cosign verify`. `-allowed-digests`
-pins a list when one is wanted; the default reports the digest and relies
-on the signature and the stamp. `go test ./verifier` covers the checks
-against a fake slot and a stub `slsa-verifier`.
+(`-origin https://slot-0.tee.masseuse.ai`, with `slsa-verifier` on `PATH`,
+plus `-expect-release vX.Y.Z` on a roll); it fetches `/attestation` with a
+fresh nonce and `/evidence-key`, verifies the RS256 signature against
+Google's JWKS and checks every claim the clients do plus the TLS SPKI
+binding (the browser cannot see its certificate; this can), holds the
+environment the deployment sets at boot to what production sets
+(`TEE_REQUEST_SEAL` `v1`, exactly the trainer as
+`TRAINER_INVOKER_SERVICE_ACCOUNT`) and reports the rest it may set, reads
+the release stamp off the attested environment, runs `slsa-verifier` for
+the running digest against this repository at that release and compares
+the provenance's commit to the stamp's, and optionally re-runs `cosign
+verify`. A run that cannot check the signature (`-signer-key-ids`
+defaults to the release key) or the provenance (no `slsa-verifier`, an
+unstamped image, a provenance naming no commit) does not pass.
+`-allowed-digests` pins a list when one is wanted; the default reports the
+digest and relies on the signature, the stamp and the provenance. `go test
+./verifier` covers the checks against a fake slot and a stub
+`slsa-verifier`.
 
 ## Certificate authority (`tools/gts-acme-test.sh`)
 
@@ -692,8 +714,12 @@ How it is wired:
 - `acme.tf`: `roles/publicca.externalAccountKeyCreator` on every
   digest-pinned `principalSet://.../attribute.image_digest/<digest>` (the
   same list `bucket.tf` grants the weights to) and on no service account.
-  Only an attested image on TDX with the GPU in CC mode can mint an EAB, so
-  no operator can register an ACME account in a slot's name.
+  Of the slots, only an attested image on TDX with the GPU in CC mode can
+  mint an EAB. The project's owners can grant themselves the role and get a
+  certificate for a slot's name (every mint is in the Data Access audit
+  log); it gets them no session: the trainer sends its token only over the
+  TLS key the attestation binds, and the phone seals every request under
+  its capability to the attested seal key.
 - The entrypoint mints the EAB right before Caddy with the same retry the
   weights get: `externalAccountKeys.create` with the rendered
   `external_account` credential, `b64MacKey` decoded exactly once (the REST
@@ -723,10 +749,12 @@ the SPKI nonce binding would stay safe.
 
 ## Rolling an image
 
-Every change to what runs in the enclave is a release, and a release is
-what the clients trust: they pin the signing key only the release workflow
-holds and, once every running image is stamped, a minimum release, so a
-roll touches the trainer's policy only when that floor moves. The
+Every change to what runs in the enclave is a release, the weights
+included (`models.lock`), and a release is what the clients trust: they
+pin the signing key and a minimum release, and the trainer and the
+connector check the digest's keyless signature and SLSA provenance from
+the release workflow at the stamped tag, so a roll touches the trainer's
+policy only when that floor moves. The
 deployment's own pin is the digest, in this repository's `terraform.tfvars`:
 
 1. Release the image (tag; the workflow builds, stamps, signs, attests,
@@ -746,9 +774,10 @@ deployment's own pin is the digest, in this repository's `terraform.tfvars`:
 3. Hand-boot a slot with no lease (`gcloud compute instances start
    masseuse-video-tee-slot-0 --zone us-central1-a`; the VM's power state is
    not Terraform's after creation, see `vm.tf`) and run `tee-verify
-   -expect-release vX.Y.Z -slsa-verifier ...` against it within the boot
-   idle window; every check passes, `image.release` names the tag and
-   `provenance.source` its commit.
+   -expect-release vX.Y.Z` (with `slsa-verifier` on `PATH`) against it
+   within the boot idle window; every check passes, `image.release` names
+   the tag, `provenance.source` its commit, `image.env.TEE_REQUEST_SEAL`
+   `v1` and `image.env.TRAINER_INVOKER_SERVICE_ACCOUNT` the trainer alone.
 4. Carry a session end to end from a phone; the trainer's diagnostics show
    the release beside the digest.
 5. Record the validation (when `tee-verify` passed, the session) in the

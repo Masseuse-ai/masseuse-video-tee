@@ -7,9 +7,13 @@
 # external_account credential (workload/tee/wif-credential.json.tmpl)
 # exchanges it here. Only tokens that satisfy a provider's condition are
 # exchanged, and the models bucket grants read to the pool principal whose
-# attribute.image_digest is the deployed digest - so the weights can be
-# read by exactly one image, on exactly this hardware, and by nobody at
-# the console.
+# attribute.image_digest is the deployed digest - so of the slots, exactly
+# one image on exactly this hardware reads the weights. The project's
+# owners can add a provider (or a pool) of their own and grant it what this
+# one has; what keeps that from a session is not this file but the clients:
+# they check the image's public provenance, pin the attested TLS key and
+# seal their requests, and a released image loads only what models.lock
+# names.
 #
 # Claim paths below were read off a real token on the Phase 0 spike VM
 # (masseuse-video-tee/README.md, "Phase 0 findings"):

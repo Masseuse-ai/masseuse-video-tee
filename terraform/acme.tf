@@ -7,9 +7,13 @@
 # certificate live on the enclave's tmpfs and die with it), so the mint
 # happens inside the enclave at boot, with the same federated identity that
 # reads the models bucket: the attested image digest on TDX with the GPU in
-# CC mode. No service account holds this role. An operator can therefore
-# not obtain an EAB and register an account that impersonates a slot, and
-# the WIF provider's condition (wif.tf) decides who is a slot.
+# CC mode. No service account holds this role, and the WIF provider's
+# condition (wif.tf) decides who is a slot. The project's owners can grant
+# themselves the role and get a certificate for a slot's name (every mint
+# is in the Data Access audit log, main.tf); a certificate is not a
+# session: the trainer sends its token only over the TLS key the slot's
+# attestation binds, and the phone seals its requests to the attested seal
+# key.
 #
 # EAB keys are single-use and expire unused after seven days; the project's
 # quota is 120 requests a minute on this API and 100 new ACME accounts an

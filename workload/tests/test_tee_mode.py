@@ -331,8 +331,13 @@ class Slot:
         merged.update(headers or {})
         return self.request(method, path, body, merged)
 
-    def lease(self, session_id: str = "sess-1") -> str:
-        cap, cap_hash = capability()
+    def lease(self, session_id: str = "sess-1", cap: str | None = None) -> str:
+        """Lease the slot under a fresh capability, or under `cap` again
+        (what the trainer does when it restarts: the session's hash)."""
+        if cap is None:
+            cap, cap_hash = capability()
+        else:
+            cap_hash = hashlib.sha256(tee_mode.b64url_decode(cap)).hexdigest()
         code, _, body = self.as_trainer(
             "POST", "/lease", json.dumps({"sessionId": session_id,
                                           "capabilityHash": cap_hash}).encode(),
@@ -410,6 +415,26 @@ def test_the_lease_opens_for_the_preimage_only_and_expires():
     assert code == 200 and body["expiresAt"] == 1061 + 6 * 3600
     lease.clear()
     assert lease.check(cap) == (False, "no lease")
+
+
+def test_a_grant_under_another_capability_names_the_one_it_replaced_once():
+    lease = tee_mode.Lease()
+    cap_a, hash_a = capability()
+    _, hash_b = capability()
+    assert lease.grant({"sessionId": "s1", "capabilityHash": hash_a})[0] == 200
+    assert lease.take_replaced() == ""
+    # The trainer restarting re-leases under the session's own hash.
+    assert lease.grant({"sessionId": "s1", "capabilityHash": hash_a})[0] == 200
+    assert lease.take_replaced() == ""
+    # Another capability, the same session or another: named, once.
+    assert lease.grant({"sessionId": "s1", "capabilityHash": hash_b})[0] == 200
+    assert lease.take_replaced() == hash_a
+    assert lease.take_replaced() == ""
+    assert lease.check(cap_a) == (False, "capability does not match the lease")
+    # After a teardown's clear there was nothing to replace.
+    lease.clear()
+    assert lease.grant({"sessionId": "s2", "capabilityHash": hash_a})[0] == 200
+    assert lease.take_replaced() == ""
 
 
 def test_control_auth_wants_a_verified_trainer_email_for_this_origin():
@@ -1215,9 +1240,9 @@ def test_the_phone_names_an_external_camera_with_its_capability():
         code, _, body = slot.as_phone(cap2, "GET", "/ingest/source")
         assert json.loads(body)["kind"] == "phone"
         assert json.loads(slot.as_trainer("GET", "/ingest/status")[2])["path"] == "cam"
-        # The same session re-leasing keeps it.
+        # The same session re-leasing (a trainer restart: its own hash) keeps it.
         assert slot.as_phone(cap2, "PUT", "/ingest/source", link, json_type)[0] == 200
-        cap2b = slot.lease("sess-2")
+        cap2b = slot.lease("sess-2", cap=cap2)
         assert slot.external.active is True
         # The phone's DELETE goes back to its own camera.
         code, _, body = slot.as_phone(cap2b, "DELETE", "/ingest/source")
@@ -1638,6 +1663,37 @@ def test_the_phone_opens_a_live_stream_with_its_capability_and_the_trainer_may_o
         assert slot.exits == [0]
 
 
+def test_a_lease_under_another_capability_ends_everything_the_old_one_opened():
+    json_type = {"Content-Type": "application/json"}
+    sdp = {"Content-Type": "application/sdp"}
+    destination = b'{"url": "rtmps://live.example.com/app/sk_live_1234"}'
+    with Slot() as slot:
+        cap = slot.lease("sess-1")
+        # The phone's camera on the relay, its view and its live stream.
+        assert slot.as_phone(cap, "POST", "/ingest/whip", OFFER, sdp)[0] == 201
+        slot.server.current["session"] = argparse.Namespace(overlay=FakeOverlay(), run_name="sess-1")
+        assert slot.as_phone(cap, "PUT", "/ingest/egress", destination, json_type)[0] == 200
+        assert slot.egress.active is True
+        kicked = list(slot.relay.kicks)
+        # The trainer re-leasing under the same capability (a restart) leaves all of it.
+        slot.lease("sess-1", cap=cap)
+        assert slot.relay.kicks == kicked and slot.egress.active is True
+        # Under another capability for the same session (the phone reloaded,
+        # or someone else calling /lease): the camera leg and the reader of
+        # every rendition are kicked, the live stream ends, and the old
+        # capability opens nothing more.
+        new = slot.lease("sess-1")
+        assert slot.relay.kicks[len(kicked):] == ["cam-1", "r1", "r1-half", "r1-small", "r1-lean"]
+        assert slot.egress.active is False
+        assert slot.egress_procs[0].returncode == -15
+        assert slot.as_phone(cap, "POST", "/ingest/whip", OFFER, sdp)[0] == 401
+        assert slot.as_phone(cap, "PUT", "/ingest/egress", destination, json_type)[0] == 401
+        code, _, body = slot.as_trainer("GET", "/statz")
+        assert json.loads(body)["counters"]["teeCapabilityChanges"] == 1
+        # The new capability is the lease's.
+        assert slot.as_phone(new, "POST", "/ingest/whip", OFFER, sdp)[0] == 201
+
+
 def test_a_lease_for_another_session_takes_the_live_stream_with_it():
     json_type = {"Content-Type": "application/json"}
     destination = b'{"url": "rtmps://live.example.com/app/sk_live_1234"}'
@@ -1646,7 +1702,7 @@ def test_a_lease_for_another_session_takes_the_live_stream_with_it():
         assert slot.as_phone(cap, "PUT", "/ingest/egress", destination, json_type)[0] == 200
         assert slot.egress.active is True and slot.egress.session_id == "sess-1"
         # The same session leasing again (a trainer restart) keeps it.
-        slot.lease("sess-1")
+        slot.lease("sess-1", cap=cap)
         assert slot.egress.active is True
         # Another session's lease does not inherit it.
         slot.lease("sess-2")
@@ -1740,7 +1796,7 @@ def test_a_lease_for_another_session_takes_the_share_and_the_face_camera_with_it
         assert code == 200, body
         assert slot.share.active and slot.face_source.active
         # The same session leasing again (a trainer restart) keeps both.
-        slot.lease("sess-1")
+        slot.lease("sess-1", cap=cap)
         assert slot.share.active and slot.face_source.active
         # Another session's lease inherits neither.
         slot.lease("sess-2")
