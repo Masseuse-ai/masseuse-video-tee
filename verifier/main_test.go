@@ -37,6 +37,8 @@ type fakeSlot struct {
 	signer   *rsa.PrivateKey
 	evidence ed25519.PublicKey
 	claims   func(nonce string) jwt.MapClaims
+	// A stand-in slsa-verifier (stubSLSAVerifier) and where its arguments land.
+	slsaBin, slsaArgs string
 }
 
 func newFakeSlot(t *testing.T, mutate func(jwt.MapClaims)) *fakeSlot {
@@ -52,6 +54,7 @@ func newFakeSlot(t *testing.T, mutate func(jwt.MapClaims)) *fakeSlot {
 	keyHash := sha256.Sum256(evidence)
 	keyNonce := b64url(keyHash[:])
 	fs := &fakeSlot{signer: signer, evidence: evidence}
+	fs.slsaBin, fs.slsaArgs = stubSLSAVerifier(t)
 
 	jwks := map[string]any{"keys": []map[string]any{{
 		"kty": "RSA", "kid": "test-kid", "alg": "RS256", "use": "sig",
@@ -85,12 +88,11 @@ func newFakeSlot(t *testing.T, mutate func(jwt.MapClaims)) *fakeSlot {
 				"container": map[string]any{
 					"image_digest":    testDigest,
 					"image_reference": "us-central1-docker.pkg.dev/prod-masseuse-video-tee/masseuse-video-tee/masseuse-video-tee@" + testDigest,
-					"env": map[string]any{
-						"TRAINER_URL":        "https://trainer.example",
+					"env": bootEnv(map[string]any{
 						"TEE_CAPTURE_BUCKET": "records.example",
 						"TEE_IMAGE_VERSION":  testVersion,
 						"TEE_IMAGE_COMMIT":   testCommit,
-					},
+					}),
 					"image_signatures": []map[string]any{{"key_id": "cafe", "signature_algorithm": "ECDSA_P256_SHA256"}},
 				},
 			},
@@ -120,20 +122,37 @@ func newFakeSlot(t *testing.T, mutate func(jwt.MapClaims)) *fakeSlot {
 	return fs
 }
 
+// bootEnv: what the deployment sets on every production slot (TRAINER_URL,
+// the request seal, the trainer as the one invoker), plus `extra`.
+func bootEnv(extra map[string]any) map[string]any {
+	env := map[string]any{
+		"TRAINER_URL":                     "https://trainer.example",
+		"TEE_REQUEST_SEAL":                "v1",
+		"TRAINER_INVOKER_SERVICE_ACCOUNT": defaultTrainerInvoker,
+	}
+	for k, v := range extra {
+		env[k] = v
+	}
+	return env
+}
+
 func (fs *fakeSlot) config() *config {
 	u, _ := url.Parse(fs.server.URL)
 	return &config{
-		origin:         "https://" + u.Host,
-		jwksURL:        fs.jwks.URL,
-		projectID:      "prod-masseuse-video-tee",
-		imageRefPrefix: "us-central1-docker.pkg.dev/prod-masseuse-video-tee/masseuse-video-tee/",
-		trainerURL:     "https://trainer.example",
-		captureBucket:  "records.example",
-		signerKeyIDs:   []string{"cafe"},
-		sourceURI:      defaultSourceURI,
-		imageRepo:      defaultImageRepo,
-		insecureTLS:    true, // httptest's certificate
-		timeout:        10 * time.Second,
+		origin:          "https://" + u.Host,
+		jwksURL:         fs.jwks.URL,
+		projectID:       "prod-masseuse-video-tee",
+		imageRefPrefix:  "us-central1-docker.pkg.dev/prod-masseuse-video-tee/masseuse-video-tee/",
+		trainerURL:      "https://trainer.example",
+		captureBucket:   "records.example",
+		requestSeal:     "v1",
+		trainerInvokers: invokersOf(defaultTrainerInvoker),
+		signerKeyIDs:    []string{"cafe"},
+		slsaVerifierBin: fs.slsaBin,
+		sourceURI:       defaultSourceURI,
+		imageRepo:       defaultImageRepo,
+		insecureTLS:     true, // httptest's certificate
+		timeout:         10 * time.Second,
 	}
 }
 
@@ -286,8 +305,8 @@ func TestTheCaptureBucketMustBeTheExpectedOneOrNone(t *testing.T) {
 	// A slot with no bucket keeps no record: it passes only for a verifier
 	// told to expect none, and a slot naming a bucket fails that verifier.
 	bare := newFakeSlot(t, func(c jwt.MapClaims) {
-		c["submods"].(map[string]any)["container"].(map[string]any)["env"] = map[string]any{
-			"TRAINER_URL": "https://trainer.example", "TEE_IMAGE_VERSION": testVersion, "TEE_IMAGE_COMMIT": testCommit}
+		c["submods"].(map[string]any)["container"].(map[string]any)["env"] = bootEnv(map[string]any{
+			"TEE_IMAGE_VERSION": testVersion, "TEE_IMAGE_COMMIT": testCommit})
 	})
 	r := runReport(t, bare.config())
 	if !contains(failed(r), "image.env.TEE_CAPTURE_BUCKET") {
@@ -309,16 +328,24 @@ func TestTheCaptureBucketMustBeTheExpectedOneOrNone(t *testing.T) {
 	}
 }
 
-func TestAnUnstampedImagePassesOnlyWithoutAReleaseFloor(t *testing.T) {
+func TestAnUnstampedImageCannotPassTheProvenanceCheck(t *testing.T) {
 	fs := newFakeSlot(t, func(c jwt.MapClaims) {
-		c["submods"].(map[string]any)["container"].(map[string]any)["env"] = map[string]any{"TRAINER_URL": "https://trainer.example", "TEE_CAPTURE_BUCKET": "records.example"}
+		c["submods"].(map[string]any)["container"].(map[string]any)["env"] = bootEnv(map[string]any{"TEE_CAPTURE_BUCKET": "records.example"})
 	})
 	r := runReport(t, fs.config())
-	if !r.Passed || r.Release != nil {
-		t.Fatalf("an unstamped image passes without a floor; failed %v, release %+v", failed(r), r.Release)
+	// Without a floor the release row reports it; nothing ties it to a
+	// tag and a commit, so the provenance cannot, and the run fails.
+	if r.Release != nil || strings.Join(failed(r), ",") != "provenance.source" {
+		t.Fatalf("an unstamped image fails on its provenance alone; failed %v, release %+v", failed(r), r.Release)
 	}
-	if rel := checkNamed(t, r, "image.release"); !strings.Contains(rel.Detail, "unstamped") {
+	if rel := checkNamed(t, r, "image.release"); !rel.OK || !strings.Contains(rel.Detail, "unstamped") {
 		t.Fatalf("detail should say unstamped: %+v", rel)
+	}
+	if prov := checkNamed(t, r, "provenance.source"); !strings.Contains(prov.Detail, "no release stamp") {
+		t.Fatalf("provenance.source: %+v", prov)
+	}
+	if _, err := os.Stat(fs.slsaArgs); err == nil {
+		t.Fatalf("slsa-verifier should not run for an unstamped image")
 	}
 	for _, set := range []func(*config){
 		func(c *config) { c.minRelease = "v0.4.0" },
@@ -346,9 +373,7 @@ func TestRefusesAMalformedReleaseStamp(t *testing.T) {
 
 func TestVerifiesProvenanceAgainstTheStamp(t *testing.T) {
 	fs := newFakeSlot(t, nil)
-	bin, argsFile := stubSLSAVerifier(t)
 	cfg := fs.config()
-	cfg.slsaVerifierBin = bin
 	r := runReport(t, cfg)
 	if !r.Passed {
 		t.Fatalf("expected pass, failed: %v", failed(r))
@@ -357,8 +382,8 @@ func TestVerifiesProvenanceAgainstTheStamp(t *testing.T) {
 	if !strings.Contains(prov.Detail, defaultSourceURI+"@v0.4.0") || !strings.Contains(prov.Detail, "commit "+testCommit) {
 		t.Fatalf("provenance detail: %q", prov.Detail)
 	}
-	args := stubArgs(t, argsFile)
-	want := []string{"verify-image", defaultImageRepo + "@" + testDigest, "--source-uri", defaultSourceURI, "--print-provenance", "--source-tag", testVersion}
+	args := stubArgs(t, fs.slsaArgs)
+	want := []string{"verify-image", defaultImageRepo + "@" + testDigest, "--source-uri", defaultSourceURI, "--source-tag", testVersion, "--print-provenance"}
 	if strings.Join(args, " ") != strings.Join(want, " ") {
 		t.Fatalf("slsa-verifier args\n got %v\nwant %v", args, want)
 	}
@@ -378,22 +403,78 @@ func TestVerifiesProvenanceAgainstTheStamp(t *testing.T) {
 	if prov := checkNamed(t, r, "provenance.source"); prov.OK || !strings.Contains(prov.Detail, "FAILED") {
 		t.Fatalf("a slsa-verifier failure must fail: %+v", prov)
 	}
+
+	// A provenance whose commit cannot be read is no proof of the commit.
+	t.Setenv("STUB_FAIL", "")
+	t.Setenv("STUB_COMMIT", "")
+	r = runReport(t, cfg)
+	if prov := checkNamed(t, r, "provenance.source"); prov.OK || !strings.Contains(prov.Detail, "names no source commit") {
+		t.Fatalf("a provenance without a commit must fail: %+v", prov)
+	}
 }
 
-func TestProvenanceOfAnUnstampedImageSkipsTheTag(t *testing.T) {
-	fs := newFakeSlot(t, func(c jwt.MapClaims) {
-		c["submods"].(map[string]any)["container"].(map[string]any)["env"] = map[string]any{"TRAINER_URL": "https://trainer.example", "TEE_CAPTURE_BUCKET": "records.example"}
-	})
-	bin, argsFile := stubSLSAVerifier(t)
+func TestARunThatCannotCheckTheSignatureOrTheProvenanceDoesNotPass(t *testing.T) {
+	fs := newFakeSlot(t, nil)
 	cfg := fs.config()
-	cfg.slsaVerifierBin = bin
+	cfg.signerKeyIDs = nil
 	r := runReport(t, cfg)
-	prov := checkNamed(t, r, "provenance.source")
-	if !prov.OK || !strings.Contains(prov.Detail, "image unstamped") {
-		t.Fatalf("provenance.source: %+v", prov)
+	if sig := checkNamed(t, r, "image.signature"); sig.OK || !strings.Contains(sig.Detail, "not checked") || r.Passed {
+		t.Fatalf("no accepted key must fail the run: %+v", sig)
 	}
-	if args := stubArgs(t, argsFile); contains(args, "--source-tag") {
-		t.Fatalf("no --source-tag for an unstamped image: %v", args)
+	cfg = fs.config()
+	cfg.slsaVerifierBin = filepath.Join(t.TempDir(), "no-such-slsa-verifier")
+	r = runReport(t, cfg)
+	if prov := checkNamed(t, r, "provenance.source"); prov.OK || !strings.Contains(prov.Detail, "not found") || r.Passed {
+		t.Fatalf("a missing slsa-verifier must fail the run: %+v", prov)
+	}
+	cfg.slsaVerifierBin = ""
+	r = runReport(t, cfg)
+	if prov := checkNamed(t, r, "provenance.source"); prov.OK || !strings.Contains(prov.Detail, "not checked") {
+		t.Fatalf("an empty -slsa-verifier must fail the run: %+v", prov)
+	}
+}
+
+func TestHoldsTheRequestSealAndTheInvokerAndReportsTheRest(t *testing.T) {
+	withEnv := func(set map[string]any, drop ...string) *fakeSlot {
+		return newFakeSlot(t, func(c jwt.MapClaims) {
+			env := c["submods"].(map[string]any)["container"].(map[string]any)["env"].(map[string]any)
+			for k, v := range set {
+				env[k] = v
+			}
+			for _, k := range drop {
+				delete(env, k)
+			}
+		})
+	}
+	ok := withEnv(map[string]any{"TRAINER_INVOKER_SERVICE_ACCOUNT": " " + strings.ToUpper(defaultTrainerInvoker) + ",", "MODELS_BUCKET": "prod-masseuse-video-tee-models"})
+	r := runReport(t, ok.config())
+	if !r.Passed {
+		t.Fatalf("the trainer alone, read as the enclave reads it, passes; failed %v", failed(r))
+	}
+	for _, name := range reportedEnv {
+		if c := checkNamed(t, r, "image.env."+name); !c.OK || !strings.Contains(c.Detail, "reported, not checked") {
+			t.Fatalf("%s should be reported: %+v", name, c)
+		}
+	}
+	if c := checkNamed(t, r, "image.env.MODELS_BUCKET"); !strings.HasPrefix(c.Detail, "prod-masseuse-video-tee-models") {
+		t.Fatalf("MODELS_BUCKET: %+v", c)
+	}
+	cases := []struct {
+		slot *fakeSlot
+		row  string
+		text string
+	}{
+		{withEnv(nil, "TEE_REQUEST_SEAL"), "image.env.TEE_REQUEST_SEAL", "bare bearer"},
+		{withEnv(map[string]any{"TEE_REQUEST_SEAL": "v2"}), "image.env.TEE_REQUEST_SEAL", "v2"},
+		{withEnv(map[string]any{"TRAINER_INVOKER_SERVICE_ACCOUNT": defaultTrainerInvoker + ",someone@prod-masseuse-video-tee.iam.gserviceaccount.com"}),
+			"image.env.TRAINER_INVOKER_SERVICE_ACCOUNT", "someone@"},
+		{withEnv(nil, "TRAINER_INVOKER_SERVICE_ACCOUNT"), "image.env.TRAINER_INVOKER_SERVICE_ACCOUNT", "expected exactly"},
+	}
+	for _, tc := range cases {
+		r := runReport(t, tc.slot.config())
+		if c := checkNamed(t, r, tc.row); c.OK || !strings.Contains(c.Detail, tc.text) || strings.Join(failed(r), ",") != tc.row {
+			t.Fatalf("%s should fail alone (%q): %+v, failed %v", tc.row, tc.text, c, failed(r))
+		}
 	}
 }
 

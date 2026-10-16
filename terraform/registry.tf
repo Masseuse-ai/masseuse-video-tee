@@ -4,8 +4,11 @@
 # The release workflow (.github/workflows/release.yml) builds the TEE image
 # (workload/tee/Dockerfile.tee) on GitHub, publishes it to ghcr.io with
 # SLSA provenance, and its promote job copies it by digest into this
-# repository and signs it there (github-release.tf, signing.tf). Nothing
-# else writes here: the only writer is the github-release service account.
+# repository and signs it there (github-release.tf, signing.tf). Terraform
+# grants writing here to the github-release service account alone; the
+# project's owners can write too (every push and pull is in the Data Access
+# audit log, main.tf), so an image here is not a release for being here:
+# the clients hold it to the release workflow's provenance on ghcr.io.
 # The WIF condition requires the attested image_reference to be under this
 # repository, so an image pushed anywhere else cannot read the weights even
 # if it were somehow launched with the right digest.

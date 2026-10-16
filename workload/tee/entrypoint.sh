@@ -228,13 +228,15 @@ python3 /app/workload/producer/producer.py \
 pids+=($!)
 
 # Weights and the analysis bundle into the /models tmpfs, then the marker
-# the producer's boot is waiting on. The bundle is the one /app/analysis.lock
-# names, or nothing: tee_models.py refuses a bundle whose SHA-256 is not the
-# lock's. The claims token the credential reads appears once the launcher
-# has attested; the first attempt may race it, so retry. No weights, no
-# slot: the producer goes down with the script.
+# the producer's boot is waiting on. The weights are the objects
+# /app/models.lock names and the bundle the one /app/analysis.lock names, or
+# nothing: tee_models.py refuses either unless its SHA-256 is the lock's.
+# The claims token the credential reads appears once the launcher has
+# attested; the first attempt may race it, so retry. No weights, no slot:
+# the producer goes down with the script.
 attempt=0
 until python3 /app/workload/producer/tee_models.py --bucket "$MODELS_BUCKET" --target /models \
+        --models-lock /app/models.lock \
         --analysis-lock /app/analysis.lock \
         --ready-file "$POSE_MODELS_READY_FILE"; do
     attempt=$((attempt + 1))

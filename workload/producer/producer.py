@@ -2423,6 +2423,22 @@ def build_server(args, telemetry: Telemetry,
             self._json(code, body, cors + [("Cache-Control", "no-store")])
             return True
 
+        def _close_capability(self, reason: str) -> None:
+            """End what the replaced capability opened: the camera leg and
+            every rendition of the view on the relay, the external and
+            face cameras, the share and the live stream."""
+            kicked, failed = (relay.evict_all() if relay is not None else (0, []))
+            for problem in failed:
+                print(f"tee: evicting {problem} failed", flush=True)
+            cleared = [name for name, holder in (("camera", external), ("face camera", face_source),
+                                                 ("share", share), ("live stream", egress))
+                       if holder is not None and holder.active and holder.clear(reason)]
+            telemetry.count("teeCapabilityChanges")
+            if kicked:
+                telemetry.count("teeLegEvicted", kicked)
+            print(f"lease: {reason}: {kicked} relay session(s) kicked"
+                  f"{', cleared ' + ', '.join(cleared) if cleared else ''}", flush=True)
+
         def _lease(self) -> None:
             """POST /lease from the trainer: park the capability hash."""
             length = int(self.headers.get("Content-Length") or 0)
@@ -2441,6 +2457,13 @@ def build_server(args, telemetry: Telemetry,
                 teardown.cancel("/lease")
                 print(f"lease: session {answer['sessionId']} until "
                       f"{answer['expiresAt']}", flush=True)
+                # Under another capability than the lease had: the phone
+                # reloaded (its old legs are dead), or whoever else can call
+                # /lease is taking the slot over. Nothing opened under the
+                # old capability stays, so a takeover finds nothing of the
+                # phone's to read and the phone sees its picture end.
+                if tee.lease.take_replaced():
+                    self._close_capability("lease under another capability")
                 # Another session's record left open (a lease that ended
                 # without a /stop) closes now, off this request; the same
                 # session re-leasing (a trainer restart) keeps its own.

@@ -1,5 +1,6 @@
 """The model store into the enclave's /models tmpfs, with the enclave's own
-credential and no mount - and the analysis bundle, pinned by analysis.lock.
+credential and no mount, pinned by models.lock - and the analysis bundle,
+pinned by analysis.lock.
 
 The Confidential Space slot has no bucket mount and a VM service account
 that can read nothing; the credential that can is minted from the
@@ -13,20 +14,30 @@ vouched for, and only in memory (`tee-mount` makes /models a tmpfs).
 Run once by tee/entrypoint.sh, alongside the producer it has just started:
 
     python3 tee_models.py --bucket $MODELS_BUCKET --target /models \
-        --analysis-lock /app/analysis.lock --ready-file /models/.complete
+        --models-lock /app/models.lock --analysis-lock /app/analysis.lock \
+        --ready-file /models/.complete
 
-Copies the prefixes the boot reads (hf-bf16/, detectors/), skipping what
-the pose boot never opens; fetches the analysis bundle the lock names,
-refuses it unless its SHA-256 is the lock's, and unpacks it to
-<target>/analysis/; then touches --ready-file. The producer's boot
-(live_pose.wait_for_model_store, POSE_MODELS_READY_FILE) imports torch
-meanwhile and waits for that file before it loads weights, so the two
-slowest things on the boot overlap. Exit code non-zero on any failure so
-the entrypoint can retry; a stale marker is removed first, so a retry's
-partial store never reads as complete.
+Copies exactly the objects models.lock names (the weights of the pose
+model and the person detector, as the boot reads them), and refuses the
+store unless every one is there with the lock's size and SHA-256; nothing
+the lock does not name is copied. Fetches the analysis bundle
+analysis.lock names, refuses it unless its SHA-256 is the lock's, and
+unpacks it to <target>/analysis/; then touches --ready-file. The
+producer's boot (live_pose.wait_for_model_store, POSE_MODELS_READY_FILE)
+imports torch meanwhile and waits for that file before it loads weights,
+so the two slowest things on the boot overlap. Exit code non-zero on any
+failure so the entrypoint can retry; a stale marker is removed first, so a
+retry's partial store never reads as complete.
 
-The lock is part of the image, so the attestation digest covers which
-analysis bundle may run (analysis/protocol.md).
+Both locks are part of the image, so the attestation digest covers which
+weights and which analysis bundle may run (analysis/protocol.md): whoever
+can write the bucket can change what is in it, not what an attested image
+will load. Changing the weights is a release.
+
+Without --models-lock the prefixes the boot reads (hf-bf16/, detectors/)
+are copied as listed, unverified: a development path the image never
+takes. `--write-models-lock FILE` lists those prefixes and writes the lock
+for what is there now.
 """
 
 from __future__ import annotations
@@ -73,7 +84,77 @@ def plan(bucket, prefixes: list[str]) -> list[tuple[str, int]]:
     return jobs
 
 
-def fetch(bucket, jobs: list[tuple[str, int]], target: Path) -> None:
+def read_models_lock(path: Path) -> dict[str, tuple[int, str]]:
+    """`<sha256> <size> <object name>` lines (`#` comments): the store,
+    object by object. Names are relative and stay inside the target."""
+    entries: dict[str, tuple[int, str]] = {}
+    for number, line in enumerate(path.read_text().splitlines(), 1):
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split(None, 2)
+        if len(parts) != 3:
+            raise ValueError(f"{path}:{number}: not '<sha256> <size> <object name>'")
+        digest, size, name = parts[0].lower(), parts[1], parts[2]
+        if len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest):
+            raise ValueError(f"{path}:{number}: sha256 is not 64 hex digits")
+        if not size.isdigit():
+            raise ValueError(f"{path}:{number}: size is not a byte count")
+        segments = name.split("/")
+        if (name.startswith("/") or name.endswith("/") or "\\" in name
+                or any(s in ("", ".", "..") for s in segments)):
+            raise ValueError(f"{path}:{number}: {name!r} is not an object name inside the store")
+        if name in entries:
+            raise ValueError(f"{path}:{number}: {name} is named twice")
+        entries[name] = (int(size), digest)
+    if not entries:
+        raise ValueError(f"{path}: names no objects")
+    return entries
+
+
+def verify_store(root: Path, expected: dict[str, tuple[int, str]]) -> None:
+    """Every object the lock names is under `root` with its size and
+    SHA-256; raises ValueError naming every one that is not."""
+    def problem(item) -> str | None:
+        name, (size, digest) = item
+        path = root / name
+        if not path.is_file():
+            return f"{name} is missing"
+        actual_size = path.stat().st_size
+        if actual_size != size:
+            return f"{name} is {actual_size} bytes, models.lock pins {size}"
+        actual = sha256_of(path)
+        if actual != digest:
+            return f"{name} is sha256 {actual}, models.lock pins {digest}"
+        return None
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        problems = [p for p in pool.map(problem, sorted(expected.items())) if p]
+    if problems:
+        raise ValueError("refusing the model store: " + "; ".join(problems))
+
+
+def write_models_lock(bucket, prefixes: list[str], path: Path) -> int:
+    """List the prefixes as plan() does and write the lock for what is in
+    the bucket now, hashing each object as it streams. Returns how many."""
+    lines = []
+    for name, size in sorted(plan(bucket, prefixes)):
+        digest = hashlib.sha256()
+        with bucket.blob(name).open("rb") as handle:
+            for block in iter(lambda: handle.read(CHUNK), b""):
+                digest.update(block)
+        lines.append(f"{digest.hexdigest()} {size} {name}")
+    header = ("# The model store tee_models.py copies into the enclave's /models,\n"
+              "# object by object: <sha256> <size> <object name>. Part of the image,\n"
+              "# so the attested digest covers which weights load; a store that\n"
+              f"# differs is refused. Written from gs://{bucket.name} by\n"
+              "#   python3 workload/producer/tee_models.py --bucket <bucket> --write-models-lock models.lock\n")
+    path.write_text(header + "\n".join(lines) + "\n")
+    return len(lines)
+
+
+def fetch(bucket, jobs: list[tuple[str, int]], target: Path,
+          expected: dict[str, tuple[int, str]] | None = None) -> None:
     from google.cloud.storage import transfer_manager
 
     # Staged inside the target: /models is its own tmpfs, and a rename from
@@ -96,6 +177,13 @@ def fetch(bucket, jobs: list[tuple[str, int]], target: Path) -> None:
 
     with ThreadPoolExecutor(max_workers=8) as pool:
         list(pool.map(one, small))
+    # Checked where it landed, before any of it is in place.
+    if expected is not None:
+        try:
+            verify_store(partial, expected)
+        except ValueError:
+            shutil.rmtree(partial, ignore_errors=True)
+            raise
     # Whole prefixes appear at once: a producer that boots mid-copy sees
     # either nothing or everything.
     for child in list(partial.iterdir()):
@@ -190,6 +278,14 @@ def main(argv=None) -> int:
                                                ",".join(DEFAULT_PREFIXES)),
                         help="comma-separated object prefixes (trailing slash) "
                              "or object names")
+    parser.add_argument("--models-lock", default="",
+                        help="models.lock naming every object of the store with "
+                             "its size and SHA-256: exactly those are copied, and "
+                             "the store is refused unless they all match; empty = "
+                             "the prefixes, unverified")
+    parser.add_argument("--write-models-lock", default="",
+                        help="write models.lock for what the prefixes hold now "
+                             "to this file, and copy nothing")
     parser.add_argument("--analysis-lock", default="",
                         help="analysis.lock naming the analysis bundle to "
                              "fetch, verify and unpack to <target>/analysis/; "
@@ -202,12 +298,14 @@ def main(argv=None) -> int:
         print("tee-models: no bucket configured", flush=True)
         return 2
     prefixes = [p.strip() for p in args.prefixes.split(",") if p.strip()]
+    expected = read_models_lock(Path(args.models_lock)) if args.models_lock else None
     lock = read_lock(Path(args.analysis_lock)) if args.analysis_lock else None
     target = Path(args.target)
-    target.mkdir(parents=True, exist_ok=True)
     ready = Path(args.ready_file) if args.ready_file else None
-    if ready is not None:
-        ready.unlink(missing_ok=True)
+    if not args.write_models_lock:
+        target.mkdir(parents=True, exist_ok=True)
+        if ready is not None:
+            ready.unlink(missing_ok=True)
     started = time.monotonic()
 
     import multiprocessing
@@ -221,11 +319,20 @@ def main(argv=None) -> int:
     # (only the quota project for these reads, so any real project would do).
     client = storage.Client(project=os.environ.get("GOOGLE_CLOUD_PROJECT") or None)
     bucket = client.bucket(args.bucket)
-    jobs = plan(bucket, prefixes)
+    if args.write_models_lock:
+        count = write_models_lock(bucket, prefixes, Path(args.write_models_lock))
+        print(f"tee-models: {count} objects from gs://{args.bucket} -> "
+              f"{args.write_models_lock}", flush=True)
+        return 0
+    if expected is not None:
+        jobs = [(name, size) for name, (size, _) in sorted(expected.items())]
+    else:
+        jobs = plan(bucket, prefixes)
     total = sum(size for _, size in jobs)
     print(f"tee-models: {len(jobs)} objects, {total / 1e9:.2f} GB from "
-          f"gs://{args.bucket} -> {target}", flush=True)
-    fetch(bucket, jobs, target)
+          f"gs://{args.bucket} -> {target}"
+          f"{' (models.lock)' if expected is not None else ' (unverified)'}", flush=True)
+    fetch(bucket, jobs, target, expected)
     if lock is not None:
         where = fetch_analysis(bucket, lock, target)
         print(f"tee-models: analysis {lock['version']} "

@@ -27,13 +27,19 @@
 #   log_redirect=debugonly   stdout reaches Cloud Logging on the debug image
 #                            only; the production image cannot be made to log.
 #   allow_cmd_override=false the baked entrypoint is the workload; no tee-cmd.
-#   allow_env_override       exactly the deployment knobs the entrypoint reads;
-#                            none of them can change what code runs or where
-#                            the camera goes (the phone checks the image's
-#                            signature and release stamp and the origin it
-#                            is talking to). The stamp itself
-#                            (TEE_IMAGE_VERSION, TEE_IMAGE_COMMIT) is not
-#                            in the list.
+#   allow_env_override       exactly the deployment knobs the entrypoint reads.
+#                            None changes what code runs. Each is attested
+#                            with the rest of the environment, and the ones
+#                            that decide who drives the slot and where its
+#                            output goes are held to the policy by the
+#                            trainer, the phone and tee-verify: TRAINER_URL,
+#                            TEE_CAPTURE_BUCKET, TRAINER_INVOKER_SERVICE_ACCOUNT
+#                            (exactly the trainer). MODELS_BUCKET may name
+#                            any bucket; models.lock decides what loads from
+#                            it. WIF_AUDIENCE, ACME_DIRECTORY_URL and
+#                            TEE_ALLOWED_ORIGINS are reported by tee-verify.
+#                            The stamp (TEE_IMAGE_VERSION, TEE_IMAGE_COMMIT)
+#                            and TEE_REQUEST_SEAL are not in the list.
 #   allow_mount_destinations the two tmpfs mounts: weights and the boot's
 #                            ephemeral state (TLS key, capture rows).
 #                            Colon-separated (a comma makes one bad path and
@@ -54,8 +60,10 @@ ARG BASE=masseuse-video-tee-base:local
 # (submods.container.env), so anyone holding a slot's token can read which
 # release is running without a list of digests kept anywhere; the trainer,
 # the phone and masseuse-camlink refuse a release below their policy's
-# minRelease. Not in allow_env_override: the launcher cannot be told to
-# change them. A local build leaves them empty (an unstamped image).
+# minRelease, and the trainer and masseuse-camlink hold the digest's SLSA
+# provenance to this tag and commit. Not in allow_env_override: the
+# launcher cannot be told to change them. A local build leaves them empty
+# (an unstamped image, which no client accepts).
 ARG TEE_IMAGE_VERSION=""
 ARG TEE_IMAGE_COMMIT=""
 # bluenviron/mediamtx v1.20.1 (2026-08-18); the WebRTC keys in
@@ -190,13 +198,15 @@ RUN groupadd --system analysis && useradd --system --gid analysis \
     --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin analysis
 
 # The workload, copied again over the base's copy so the layer the digest
-# is measured on carries exactly this tree; analysis.lock fixes which
-# analysis bundle the entrypoint may run (analysis/protocol.md).
+# is measured on carries exactly this tree; models.lock fixes which weights
+# it may load and analysis.lock which analysis bundle the entrypoint may run
+# (analysis/protocol.md), whatever the models bucket holds.
 COPY workload/pixel /app/workload/pixel
 COPY workload/audio /app/workload/audio
 COPY workload/producer /app/workload/producer
 COPY --from=reader /out/stream-reader /app/bin/stream-reader
 COPY analysis.lock /app/analysis.lock
+COPY models.lock /app/models.lock
 COPY workload/tee/entrypoint.sh /app/tee/entrypoint.sh
 COPY workload/tee/Caddyfile /app/tee/Caddyfile
 COPY workload/tee/mediamtx.tee.yml /app/tee/mediamtx.tee.yml

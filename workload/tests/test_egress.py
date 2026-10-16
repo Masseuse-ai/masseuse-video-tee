@@ -97,6 +97,23 @@ def test_the_host_must_resolve_to_a_public_address_that_is_not_our_own():
 # -- the command ------------------------------------------------------------------------
 
 
+def test_an_rtmps_service_must_show_a_certificate_for_its_name_from_the_system_roots():
+    # Ubuntu 24.04's ffmpeg 6.1 (the image's) refuses, with these, a
+    # self-signed endpoint and an address whose name the certificate does
+    # not carry ("Peer certificate failed verification") and goes on to the
+    # RTMP handshake with a public ingest; the rtmps output hands them to
+    # the tls protocol it opens.
+    secure = EgressPublisher(DESTINATION, "rtsp://127.0.0.1:8554/overlay").argv()
+    assert secure[-7:] == ["-tls_verify", "1", "-ca_file", egress_module.CA_FILE, "-f", "flv", DESTINATION]
+    assert egress_module.CA_FILE == "/etc/ssl/certs/ca-certificates.crt"
+    upper = EgressPublisher("RTMPS://live.example.com/app/key", "rtsp://127.0.0.1:8554/overlay").argv()
+    assert "-tls_verify" in upper
+    # A plain rtmp:// ingest has no certificate to check.
+    plain = EgressPublisher("rtmp://live.example.com/app/key", "rtsp://127.0.0.1:8554/overlay").argv()
+    assert "-tls_verify" not in plain and "-ca_file" not in plain
+    assert plain[-3:] == ["-f", "flv", "rtmp://live.example.com/app/key"]
+
+
 def test_the_command_copies_the_view_and_adds_the_microphone_and_the_card_when_asked():
     plain = EgressPublisher(DESTINATION, "rtsp://127.0.0.1:8554/overlay").argv()
     assert plain[:2] == ["ffmpeg", "-nostdin"]

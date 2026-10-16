@@ -612,6 +612,12 @@ class Lease:
     # stops the run and starts another under a fresh lease of the same
     # session) and left a torn-down slot's lease to whoever leased next.
     stopped_at: float | None = None
+    # The capability hash a grant replaced with another one, until
+    # producer.py's /lease takes it (take_replaced) to close what was
+    # opened under it. The trainer re-leases under a new capability when the
+    # phone reloads; anyone else who can call /lease would be taking the
+    # slot over, and finds the phone's legs gone rather than readable.
+    replaced: str = ""
     lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
     clock: object = field(default=time.time, repr=False)
 
@@ -639,6 +645,8 @@ class Lease:
         if expires_at <= now:
             return 400, {"error": "expiresAt is in the past"}
         with self.lock:
+            if self.capability_hash and self.capability_hash != capability_hash:
+                self.replaced = self.capability_hash
             self.session_id = session_id
             self.capability_hash = capability_hash
             self.expires_at = expires_at
@@ -651,6 +659,14 @@ class Lease:
             answer["record"] = {**record, "bucket": self.capture_bucket}
         return 200, answer
 
+    def take_replaced(self) -> str:
+        """The capability hash the last grant replaced with another, once;
+        empty when it kept the same one (a trainer restart re-leasing) or
+        followed no lease."""
+        with self.lock:
+            replaced, self.replaced = self.replaced, ""
+            return replaced
+
     def clear(self) -> None:
         with self.lock:
             self.session_id = ""
@@ -658,6 +674,7 @@ class Lease:
             self.expires_at = 0.0
             self.record = None
             self.stopped_at = None
+            self.replaced = ""
 
     def note_stop(self) -> None:
         """A /stop under this lease: the lease stands, nothing works under it."""

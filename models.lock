@@ -1,0 +1,10 @@
+# The model store tee_models.py copies into the enclave's /models,
+# object by object: <sha256> <size> <object name>. Part of the image,
+# so the attested digest covers which weights load; a store that
+# differs is refused. Written from gs://prod-masseuse-video-tee-models by
+#   python3 workload/producer/tee_models.py --bucket <bucket> --write-models-lock models.lock
+6912734704579139b15ce836ce6161d997e4bf622a014999b998fbed76c1fca4 252934504 detectors/rtdetrv4/rtv4_hgnetv2_x_coco_ema.safetensors
+c50c2f343b4b5c7e61e058c2895cb51a78c538615d0442d47fa059533e297fff 40 hf-bf16/hub/models--facebook--sapiens2-pose-1b/refs/main
+7c7cbfe722c167c3d6b3dc9e269667103d7ef57ccc19dd821b11d5d554599bb9 21688 hf-bf16/hub/models--facebook--sapiens2-pose-1b/snapshots/f5fed8b97b99698d5eea1d14ff0855d0b4c3f000/config.json
+a0777fe7f2ddc8821e9ba7f0f19e7439b3d9f8d64cd2581f0267ed6e368e7585 3039634848 hf-bf16/hub/models--facebook--sapiens2-pose-1b/snapshots/f5fed8b97b99698d5eea1d14ff0855d0b4c3f000/model.safetensors
+c63123e8d940368bb27f2011cfb45e23f5add5d0a73c10b717f114b2ec1dc858 476 hf-bf16/hub/models--facebook--sapiens2-pose-1b/snapshots/f5fed8b97b99698d5eea1d14ff0855d0b4c3f000/preprocessor_config.json

@@ -302,6 +302,20 @@ class RelayProxy:
                 break
         return kicked
 
+    def evict_all(self) -> tuple[int, list[str]]:
+        """Kick every WebRTC session on the camera leg and on each of the
+        view's renditions: what a lease under another capability leaves
+        none of (producer.py /lease). Returns how many were kicked, and the
+        legs that could not be asked."""
+        kicked, failed = 0, []
+        paths = [self.path] + [OVERLAY_PATH + RENDITION_SUFFIXES[name] for name in self.renditions]
+        for leg, path in [("whip", None)] + [("whep", p) for p in dict.fromkeys(paths)]:
+            try:
+                kicked += self.evict(leg, path)
+            except Exception as error:  # noqa: BLE001 - reported, the rest still go
+                failed.append(f"{leg} {path or self.ingest_path}: {error!r}")
+        return kicked, failed
+
     def _headers(self, headers, leg: str = "whep",
                  path: str | None = None) -> list[tuple[str, str]]:
         out = []

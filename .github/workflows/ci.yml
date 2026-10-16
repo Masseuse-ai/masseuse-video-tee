@@ -118,7 +118,7 @@ jobs:
           for f in workload/Dockerfile workload/tee/Dockerfile.tee; do
             sed -n 's/^COPY \([^-][^ ]*\) .*/\1/p' "$f" | while read -r src; do
               test -e "$src" || { echo "$f copies $src, which does not exist" >&2; exit 1; }
-              case "$src" in workload/*|analysis.lock|camlink.lock) ;; *) echo "$f copies $src, outside .dockerignore's allow-list" >&2; exit 1;; esac
+              case "$src" in workload/*|analysis.lock|camlink.lock|models.lock) ;; *) echo "$f copies $src, outside .dockerignore's allow-list" >&2; exit 1;; esac
             done
           done
 
@@ -135,3 +135,9 @@ jobs:
           . ./camlink.lock
           [[ "$CAMLINK_VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+ ]] && [[ "$CAMLINK_SHA256" =~ ^[0-9a-f]{64}$ ]]
           grep -Eq '^version=' analysis.lock && grep -Eq '^object=analysis/' analysis.lock && grep -Eq '^sha256=[0-9a-f]{64}$' analysis.lock
+          # models.lock: one `<sha256> <size> <object>` per line besides comments, and at least one.
+          if grep -Ev '^(#.*|[0-9a-f]{64} [0-9]+ (hf-bf16|detectors)/[^ ]+)?$' models.lock; then
+            echo "models.lock has a line that is not '<sha256> <size> <object>'" >&2
+            exit 1
+          fi
+          grep -Eq '^[0-9a-f]{64} [0-9]+ ' models.lock

@@ -183,3 +183,49 @@ resource "google_project_iam_audit_config" "storage_audit" {
     log_type = "DATA_WRITE"
   }
 }
+
+# The operations that would let someone with the project's IAM pass an
+# image off as a release or take a slot's name are on the record too: every
+# use of the image signing key (signing.tf), every push and pull in the
+# image registry (registry.tf), and every certificate-authority account key
+# minted for the slots' ACME account (acme.tf). The clients do not rely on
+# these logs (they check the image's public provenance and pin the attested
+# TLS key); they say who did what afterwards.
+resource "google_project_iam_audit_config" "kms_audit" {
+  project = var.project_id
+  service = "cloudkms.googleapis.com"
+
+  audit_log_config {
+    log_type = "ADMIN_READ"
+  }
+  audit_log_config {
+    log_type = "DATA_READ"
+  }
+  audit_log_config {
+    log_type = "DATA_WRITE"
+  }
+}
+
+resource "google_project_iam_audit_config" "artifactregistry_audit" {
+  project = var.project_id
+  service = "artifactregistry.googleapis.com"
+
+  audit_log_config {
+    log_type = "DATA_READ"
+  }
+  audit_log_config {
+    log_type = "DATA_WRITE"
+  }
+}
+
+resource "google_project_iam_audit_config" "publicca_audit" {
+  project = var.project_id
+  service = "publicca.googleapis.com"
+
+  audit_log_config {
+    log_type = "DATA_READ"
+  }
+  audit_log_config {
+    log_type = "DATA_WRITE"
+  }
+}

@@ -89,7 +89,7 @@ print('beats', tagger.version, tagger.class_count, 'classes', tagger.embedding_s
 print('torch', torch.__version__, 'torchvision', torchvision.__version__, 'transformers', transformers.__version__, 'cuda', torch.version.cuda)" \\
  && python3 /app/workload/producer/producer.py --help > /dev/null \\
  && python3 /app/workload/producer/tee_models.py --help > /dev/null \\
- && test -f /app/analysis.lock && test -x /app/tee/entrypoint.sh \\
+ && test -f /app/analysis.lock && test -f /app/models.lock && test -x /app/tee/entrypoint.sh \\
  && id analysis && setpriv --version && tar --zstd --help > /dev/null \\
  && caddy version && test -x /usr/local/bin/mediamtx && ffmpeg -version | head -1 \\
  && masseuse-camlink-gateway --version \\

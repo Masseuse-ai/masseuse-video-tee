@@ -153,15 +153,33 @@ record of each release is on its GitHub Release.
 - masseuse.ai itself, meaning any employee, contractor or administrator
   working on its behalf, including the owners of the Google Cloud project,
   cannot read enclave memory, SSH into the production image, redirect its
-  logs, run an image the release workflow did not build and sign from a tag
-  of this repository, or obtain the DTLS keys or the capability.
+  logs, or obtain the DTLS keys or the capability.
+- The owners of the enclave's Google Cloud project can do what owning it
+  allows: sign an image with the launcher's key, boot it, give it the
+  weights, mint a certificate for a slot's name, set the variables the
+  launch policy leaves to the deployment. None of that gets them a
+  session. The trainer and the camera connector hold every slot's image
+  to the release workflow's public record of it (its keyless signature
+  and SLSA provenance in the Sigstore transparency log, which only a run of
+  `release.yml` at the tag can make) before they lease it or dial it, and
+  the phone sends nothing to a slot the trainer has not vouched for that
+  way. The trainer pins its connections to the TLS key the attestation
+  binds before it sends its ID token, and the phone seals every request
+  under its capability to a key the attestation names, so a certificate
+  for the slot's name reads nothing. A released image loads only the
+  weights `models.lock` names and the analysis bundle `analysis.lock`
+  names, whatever the bucket holds, and a slot whose attested
+  `TRAINER_INVOKER_SERVICE_ACCOUNT` names anyone besides the trainer is
+  refused.
 - Residual: the JavaScript bundle and the policy (which signing key and
-  minimum release the clients accept) are served by masseuse.ai. The
-  provenance on every release, this verifier, and the connector are the
-  mitigations: the connector runs the checks itself, outside the browser,
-  treats the served policy as something that can only tighten the anchors
-  compiled into its reproducible build, and verifies each attested digest's
-  signature and SLSA provenance against the public registry and the Sigstore
+  minimum release the clients accept) are served by masseuse.ai, and the
+  phone, which cannot read the transparency log, takes the trainer's word
+  for an image's provenance. The provenance on every release, this
+  verifier, and the connector are the mitigations: the connector runs the
+  checks itself, outside the browser, treats the served policy as
+  something that can only tighten the anchors compiled into its
+  reproducible build, and verifies each attested digest's signature and
+  SLSA provenance against the public registry and the Sigstore
   transparency log before it sends a frame.
 
 The external cameras keep the same boundary, with one difference the third
@@ -173,7 +191,9 @@ kind makes plain:
   link is a credential and stays in the enclave: the masseuse and Cloudflare learn only
   `source: external`, the enclave never logs it, nothing of it persists. The
   enclave probes the camera once for reachability and its certificate's
-  SHA-256, then MediaMTX pulls RTSPS with that fingerprint pinned. Plain
+  SHA-256, then MediaMTX pulls RTSPS with that fingerprint pinned: trust on
+  first use, from the enclave's network, so the pin is whatever answered
+  that probe. Plain
   `rtsp://`, multicast, CGNAT and unspecified addresses and the VM's own
   address are refused before any connection; a private, loopback or
   link-local address is not dialed from the enclave at all but reached
@@ -185,7 +205,10 @@ kind makes plain:
   hands it to MediaMTX on loopback as if it were the camera. Nothing
   decrypts in between: the camera's TLS still terminates in MediaMTX with
   the certificate fingerprint pinned, so neither the connector nor the
-  gateway holds the stream or can substitute one. Before dialing, the
+  gateway holds the stream. The fingerprint is the one the enclave's first
+  probe found, and that probe goes through the connector: the connector is
+  trusted not to answer it itself and substitute a camera, as its open,
+  reproducible source says it does not. Before dialing, the
   connector verifies the slot's attestation the way the phone does, against
   a policy it only lets tighten the anchors compiled into it (the signing
   key, the minimum release, this repository, the project and registry the
@@ -266,7 +289,12 @@ the inset is the connector's (`faceSource`), and nothing of any picture.
 **One session per slot.** A slot serves one session at a time: the lease
 holds a single capability hash, and the publish and overlay routes accept
 only that capability, so a second person cannot join a slot that is
-someone else's.
+someone else's. A lease under another capability (the phone reloaded, or
+whoever else can call `/lease` took the slot over) ends everything the old
+one opened: the camera leg and every rendition of the view are kicked off
+the relay, and the fixed camera, the face camera, the picture sent to the
+computer and the live stream are cleared, so nothing of the phone's is
+there to read and the phone sees its picture end.
 
 **Sealed requests.** The browser cannot see which key its TLS connection
 to the slot reached, so a certificate for the slot's hostname would be
@@ -299,7 +327,9 @@ link is: the two schemes a service's ingest speaks and no other (a web
 page's `https://` is refused as `bad-scheme`), a host that resolves to a
 public address and not this VM's; nothing about it beyond its host is
 logged or reported, and the key stays inside the process. The transit to
-the service is encrypted only when its address is `rtmps://`; most
+the service is encrypted only when its address is `rtmps://`, and then the
+service's certificate is checked against the system's roots and the
+address's host name, so the key goes to the service it names; most
 creator platforms publish a plain `rtmp://` ingest (OnlyFans among them,
 `rtmp://cloudbetastreaming.onlyfans.com/live` in OBS's service list),
 which is the service's own design for every broadcasting program and the
@@ -321,9 +351,11 @@ Attestation OIDC token (TDX quote + GPU report → Google-signed JWT) whose
 `eat_nonce` binds the in-enclave Ed25519 evidence key and the TLS leaf's
 SPKI hash. A verifier's own nonce goes after them, and the enclave refuses
 one shaped like a key hash, so no token names anyone else's key beside the
-enclave's. The same kind of token is exchanged at STS for the only credential
-that can read the model weights; the VM's service account has no data
-access.
+enclave's. The same kind of token is exchanged at STS for the credential
+the slot reads the model weights with; the VM's service account has no data
+access. The project's owners can read and write the weights bucket as
+owners can, and what an attested image loads from it is fixed by
+`models.lock`: every file by SHA-256, the store refused when one differs.
 
 ## Session records
 
@@ -366,7 +398,11 @@ How the destination is bound:
   Federation principal keyed to the running image digest, granted only
   `objectCreator` on that bucket. It can add a file; it cannot read, list,
   overwrite (every part is created once) or delete one. No service
-  account and no person holds a delete on the bucket.
+  account and no person is granted a delete on the bucket, though the
+  owners of its project could grant one. The parts are not signed by the
+  enclave: a principal the enclave project's owners added to its identity
+  pool could write parts that look the same, so a record shows what the
+  enclave wrote together with the pool's audit log, not on its own.
 - The prefix is validated against its shape and comes from the lease; a
   slot without a bucket refuses a lease that asks for a record, so a
   session is never silently unrecorded.
@@ -396,6 +432,7 @@ report a check that should hold and does not.
 | `workload/tests/` | The workload's tests, CPU only |
 | `analysis/protocol.md` | What crosses the socket to the analysis module and what comes back |
 | `analysis.lock` | The analysis bundle (version and SHA-256) the image will run; copied into the image |
+| `models.lock` | Every weights file the image loads from the models bucket (SHA-256, size, object name); copied into the image, which refuses a store that differs, so a change to the weights is a release |
 | `camlink.lock` | The `masseuse-camlink-gateway` release (tag and checksum) the image carries |
 | `.github/workflows/release.yml` | The build: images to `ghcr.io` stamped with the tag and commit, SLSA provenance, keyless signature, promotion by digest into the enclave's registry, KMS signature, the GitHub Release that records the digest |
 | `terraform/` | The project: service account, Workload Identity Federation pool and providers keyed to the attestation, models bucket, Artifact Registry, a subnet per region and a static IP per slot, firewall, the slot VMs spread over `slot_zones` (even slots in us-central1-a, odd in us-east5-a), the masseuse's start/stop role, the KMS signing key, the release workflow's identity, the sweeper, VPC Service Controls (off until the project has an organization) |
