@@ -417,6 +417,34 @@ def test_the_lease_opens_for_the_preimage_only_and_expires():
     assert lease.check(cap) == (False, "no lease")
 
 
+def test_the_lease_carries_the_camera_views():
+    """The lease's `views` (tee_mode.parse_views): a body view by default,
+    a lone `face` for a single front camera; echoed in the answer, in
+    the snapshot, and read by /produce (views_for). Bad values are refused;
+    a cleared lease is a body view again."""
+    lease = tee_mode.Lease()
+    _, cap_hash = capability()
+    grant = {"sessionId": "s1", "capabilityHash": cap_hash}
+    # Absent: the body view every session was.
+    code, body = lease.grant(grant)
+    assert code == 200 and body["views"] == ["body"]
+    assert lease.views_for() == ["body"] and lease.snapshot()["views"] == ["body"]
+    # A lone face view.
+    code, body = lease.grant({**grant, "views": ["face"]})
+    assert code == 200 and body["views"] == ["face"]
+    assert lease.views_for() == ["face"] and lease.snapshot()["views"] == ["face"]
+    # Deduped, in the order given.
+    assert lease.grant({**grant, "views": ["face", "face", "body"]})[1]["views"] == ["face", "body"]
+    # Refused, and the stored views are left as they were.
+    assert lease.grant({**grant, "views": []})[0] == 400
+    assert lease.grant({**grant, "views": ["torso"]})[0] == 400
+    assert lease.grant({**grant, "views": "face"})[0] == 400
+    assert lease.views_for() == ["face", "body"]
+    # A teardown's clear is a body view again; an unheld lease reads body.
+    lease.clear()
+    assert lease.views_for() == ["body"] and lease.snapshot()["views"] == ["body"]
+
+
 def test_a_grant_under_another_capability_names_the_one_it_replaced_once():
     lease = tee_mode.Lease()
     cap_a, hash_a = capability()
@@ -699,7 +727,7 @@ def test_control_routes_take_the_trainer_token_and_nothing_else():
         snapshot = json.loads(body)
         assert snapshot["tee"]["origin"] == f"https://{HOST}"
         assert snapshot["tee"]["lease"] == {"sessionId": None, "active": False, "stopped": False,
-                                            "expiresAt": None, "record": None}
+                                            "expiresAt": None, "views": ["body"], "record": None}
         assert snapshot["counters"].get("teeControlRejects") == 11
         code, _, body = slot.as_trainer("GET", "/ingest/status")
         assert code == 200 and json.loads(body)["ready"] is False

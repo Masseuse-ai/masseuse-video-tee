@@ -267,6 +267,62 @@ def test_a_slow_upload_conformed_to_the_grid_is_posed_on_distinct_frames(monkeyp
     assert rows[1]["atS"] == round(4 / 30, 4)
 
 
+def test_a_lone_stream_is_read_as_the_face_when_the_lease_says_so(monkeypatch, tmp_path):
+    """views=["face"] with one stream (a lone front camera): the
+    single decode loop poses that stream as the `face` view, emits facePose
+    rows whose bodyAtS is their own atS (one clock, no body view), tells the
+    analysis there is a face view and no body, and runs one decoder."""
+    grid = [(i, i / 30) for i in range(12)]
+    session, pose, link = run_session(
+        monkeypatch, tmp_path, pose_fps=9.0, face_stream="", audio_stream=BODY_URL,
+        views=["face"], scripts={BODY_URL: grid})
+    assert session.face_only is True and session.face_stream == "" and session.sync is None
+    # The analysis is told the session reads the face alone.
+    assert link.fields["views"] == ["face"]
+    assert link.fields["facePoseFps"] == 9.0 and link.fields["faceView"] == "phone"
+    # One decoder, the primary (it does not wait for a track the way a
+    # second view's does).
+    assert [d.url for d in StubDecoder.made] == [BODY_URL]
+    assert not StubDecoder.made[0].kwargs.get("wait_for_track")
+    # Every pose step is the face view's; the single stream is never the body.
+    assert pose.steps and all(view == "face" for view, _, _ in pose.steps)
+    # The rows go out as facePose, not pose, and bodyAtS is the row's own atS.
+    face_rows = [m for m in link.sent if m["kind"] == "facePose"]
+    assert [row["frame"] for row in face_rows] == [0, 3, 7, 10]
+    assert all(row["bodyAtS"] == row["atS"] for row in face_rows)
+    # Nothing of a body view: no pose rows, and no frame descriptors, not
+    # even from the frames still decoded when the stream ends.
+    assert not any(m["kind"] in ("pose", "frame") for m in link.sent)
+    # /statz reports the one view as the face's.
+    assert set(session.views()) == {"face"}
+    assert session.views()["face"]["url"] == BODY_URL
+
+
+def test_a_lone_face_view_is_posed_at_the_face_cadence(monkeypatch, tmp_path):
+    """--face-pose-fps 3 with the body at 6 and a lone face view: the one
+    stream is posed on the 3 fps picker's slots (0, 10, ...), the face's
+    cadence, and `hello` gives that one cadence for both."""
+    grid = [(i, i / 30) for i in range(12)]
+    session, pose, link = run_session(
+        monkeypatch, tmp_path, pose_fps=6.0, face_pose_fps=3.0, face_stream="",
+        audio_stream=BODY_URL, views=["face"], scripts={BODY_URL: grid})
+    assert session.pose_fps == 3.0 and session.face_pose_fps == 3.0
+    assert link.fields["poseFps"] == 3.0 and link.fields["facePoseFps"] == 3.0
+    assert [(view, index) for view, index, _ in pose.steps] == [("face", 0), ("face", 10)]
+
+
+def test_the_lone_face_view_carries_the_detectors_people_count(monkeypatch, tmp_path):
+    """The face-only path keeps the person count and identity flag the two-
+    view path does (protocol.md facePose), read from the same detector."""
+    grid = [(i, i / 30) for i in range(12)]
+    _session, _pose, link = run_session(
+        monkeypatch, tmp_path, pose_fps=9.0, face_stream="", audio_stream=BODY_URL,
+        views=["face"], pose=CountingPose(), scripts={BODY_URL: grid})
+    rows = {m["frame"]: m for m in link.sent if m["kind"] == "facePose"}
+    assert rows[0]["people"] == 1 and rows[0]["identityUnresolved"] is False
+    assert rows[10]["people"] == 2 and rows[10]["identityUnresolved"] is True
+
+
 def test_one_view_without_a_face_stream(monkeypatch, tmp_path):
     session, pose, link = run_session(monkeypatch, tmp_path, face_stream="",
                                       audio_stream="")
