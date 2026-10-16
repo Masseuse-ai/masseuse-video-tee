@@ -1059,6 +1059,17 @@ class Session:
         if face_stream == args.stream:
             face_stream = ""  # one camera is one view
         self.face_stream = face_stream
+        # A lone stream read as the face (a single front camera + mic, the
+        # external live path): the lease named `views=["face"]` and there
+        # is no second stream, so the primary decode loop poses this one
+        # stream as the `face` view - one clock, no body view, no body
+        # motion descriptors. The default `["body"]` is the body view every
+        # session was. A face view beside a body one is the two-camera path
+        # above (`face_stream`), which a lone-face lease does not take.
+        views = tuple(getattr(args, "views", None) or ("body",))
+        self.face_only = views == ("face",) and not self.face_stream
+        # Whether this session has a face view at all, by either path.
+        has_face = bool(self.face_stream) or self.face_only
         # The face view shown, when it is not the phone's: the connector's
         # front-facing camera (`args.face_view_stream`, producer
         # external_view_args), decoded on its own for the inset alone. The
@@ -1085,6 +1096,11 @@ class Session:
         self.face_pose_fps = CadencePicker(
             FPS, float(getattr(args, "face_pose_fps", None)
                        or self.pose_fps)).pose_fps
+        if self.face_only:
+            # A lone face view is the session's one stream, posed at the
+            # face's cadence: the only cadence the session has.
+            self.picker = CadencePicker(FPS, self.face_pose_fps)
+            self.pose_fps = self.picker.pose_fps
         bridge_s = max(0.35, 1.3 * self.picker.interval_s)
         self.assembler = RowAssembler(FPS, bridge_s=bridge_s)
         self.assembler_lock = threading.Lock()
@@ -1177,12 +1193,13 @@ class Session:
                            if beats is not None else None),
             beatsHopS=(args.beats_hop_s if beats is not None else None),
             beatsEmbeddingSize=(beats.embedding_size if beats is not None else None),
-            views=(["body", "face"] if self.face_stream else ["body"]),
-            facePoseFps=(self.face_pose_fps if self.face_stream else None),
+            views=(["face"] if self.face_only
+                   else (["body", "face"] if self.face_stream else ["body"])),
+            facePoseFps=(self.face_pose_fps if has_face else None),
             faceView=(("connector" if self.face_view_stream else "phone")
-                      if self.face_stream else None),
+                      if has_face else None),
             faceFrameIntervalS=(self.face_frame_interval_s
-                                if self.face_stream else None))
+                                if has_face else None))
         self._relink_lock = threading.Lock()
         self._relink_thread: threading.Thread | None = None
         try:
@@ -1237,6 +1254,14 @@ class Session:
     def _record_sources(self) -> dict:
         """hello.json's account of the sources: which camera each view is,
         so a reader knows what `poses/` and `faces/` are pictures of."""
+        if self.face_only:
+            # The lone stream is the face view; there is no body.
+            return {
+                "poses": None,
+                "faces": {"view": "face", "stream": self.args.stream,
+                          "poseFps": self.pose_fps},
+                "audio": {"stream": self.audio_stream} if self.audio_classifier else None,
+            }
         return {
             "poses": {"view": "body", "stream": self.args.stream,
                       "poseFps": self.pose_fps},
@@ -1410,8 +1435,10 @@ class Session:
         """Every real face-view pose row, from the face pose worker: the
         `facePose` message, with the body view's moment for it, how many
         people the detector found in the frame and whether it could tell
-        which of them is the one the view follows."""
-        body_at_s = self.sync.body_at_s(row["atS"]) if self.sync else None
+        which of them is the one the view follows. With a lone face view
+        (face_only) the face is the only clock, so bodyAtS is its own atS."""
+        body_at_s = (row["atS"] if self.face_only
+                     else (self.sync.body_at_s(row["atS"]) if self.sync else None))
         people = row.get("people")
         self.analysis.send({
             "kind": "facePose",
@@ -1543,8 +1570,12 @@ class Session:
         its grid starts, for /statz; with two views, how they stand to each
         other."""
         out = {}
-        for name, decoder in (("body", self.decoder), ("face", self.face_decoder),
-                              ("faceView", self.face_view_decoder)):
+        # With a lone face view the single decoder is the face's; otherwise
+        # the body view's, beside any face and connector-face decoders.
+        pairs = ((("face", self.decoder),) if self.face_only
+                 else (("body", self.decoder), ("face", self.face_decoder),
+                       ("faceView", self.face_view_decoder)))
+        for name, decoder in pairs:
             if decoder is not None:
                 out[name] = {"timing": decoder.timing, "epoch": decoder.epoch,
                              "url": decoder.url}
@@ -1563,9 +1594,18 @@ class Session:
             lost_after_s=getattr(self.args, "input_lost_after", 0.0) or 0.0)
         self.decoder = decoder
         timing_said: str | None = None
-        worker = PoseWorker(self.pose, self.assembler, self.assembler_lock,
-                            self.telemetry, on_row=self.capture.pose,
-                            on_pose=self._on_pose)
+        if self.face_only:
+            # The single stream is the face: the primary worker poses it as
+            # the `face` view and emits facePose rows, with no assembler and
+            # no descriptors (the motion descriptors are the body view's).
+            worker = PoseWorker(self.pose, None, self.assembler_lock,
+                                self.telemetry, on_row=self.capture.face_pose,
+                                on_pose=self._on_face_pose, view="face",
+                                stage="facePose", dropped_counter="facePoseDropped")
+        else:
+            worker = PoseWorker(self.pose, self.assembler, self.assembler_lock,
+                                self.telemetry, on_row=self.capture.pose,
+                                on_pose=self._on_pose)
         face_worker: PoseWorker | None = None
         face_thread: threading.Thread | None = None
         if self.face_stream:
@@ -1600,18 +1640,25 @@ class Session:
             # The record hears every view's full result - all 308
             # keypoints with their scores - beside the overlay, through the
             # same tap (live_pose.share_full_result); the worker's gap rows
-            # reach it through on_row.
-            for view in ("body", "face") if face_worker is not None else ("body",):
+            # reach it through on_row. A lone face view records the face
+            # alone (its rows land in `faces/`).
+            record_views = (("face",) if self.face_only
+                            else (("body", "face") if face_worker is not None else ("body",)))
+            for view in record_views:
                 state = self.pose.view(view)
                 listener = self.record.keypoint_listener(view, state)
                 state.add_listener(listener)
                 record_taps.append((state, listener))
         if self.overlay is not None:
             # The full result reaches the overlay before row_for narrows it;
-            # the tap is per session on a process-wide GpuPose.
-            self.pose.on_full = self.overlay.offer_pose
-            if face_worker is not None:
-                self.pose.view("face").on_full = self.overlay.offer_face_pose
+            # the tap is per session on a process-wide GpuPose. A lone face
+            # view draws its own skeleton on the one picture returned.
+            if self.face_only:
+                self.pose.view("face").on_full = self.overlay.offer_pose
+            else:
+                self.pose.on_full = self.overlay.offer_pose
+                if face_worker is not None:
+                    self.pose.view("face").on_full = self.overlay.offer_face_pose
             self.overlay.start()
             print(f"overlay: publishing {self.overlay.publisher.url} "
                   f"{self.overlay.snapshot()['size']}@{self.overlay.fps:g} "
@@ -1675,10 +1722,13 @@ class Session:
                     if timing != timing_said:
                         timing_said = timing
                         self.overlay.offer_context("timing", timing_said)
-                pending[index] = gray.copy()
-                if len(pending) > PENDING_CAP:
-                    pending.pop(min(pending))
-                    self.telemetry.count("pendingEvicted")
+                if not self.face_only:
+                    # The body view's frames wait for their pose decision
+                    # and their descriptors; a lone face view has neither.
+                    pending[index] = gray.copy()
+                    if len(pending) > PENDING_CAP:
+                        pending.pop(min(pending))
+                        self.telemetry.count("pendingEvicted")
                 taken = fresh.take(index, yuv)
                 if fresh.deferred != deferred:
                     deferred = fresh.deferred
@@ -1745,12 +1795,15 @@ class Session:
             if self.overlay is not None:
                 # Before the capture closes: the recording, if any, must be
                 # finalised on disk to ride the upload with the jsonl files.
-                self.pose.on_full = None
-                if face_worker is not None:
+                if self.face_only:
                     self.pose.view("face").on_full = None
+                else:
+                    self.pose.on_full = None
+                    if face_worker is not None:
+                        self.pose.view("face").on_full = None
                 self.overlay.close()
             with self.assembler_lock:
-                rows = self.assembler.drain(last_index)
+                rows = [] if self.face_only else self.assembler.drain(last_index)
             for row in rows:
                 gray_row = pending.pop(row["frame"], None)
                 if gray_row is None:
@@ -3409,6 +3462,9 @@ def build_server(args, telemetry: Telemetry,
                     # What it does leave is the session's record, when the
                     # lease named one (tee_mode.Lease.record_for).
                     session_args.record = tee.lease.record_for()
+                    # The camera views the lease named (tee_mode.Lease): a
+                    # lone `["face"]` is the single stream posed as the face.
+                    session_args.views = tee.lease.views_for()
                     tee.lease.note_run()
                 if external_view_args(session_args, external, face_source):
                     session_args.face_mirror = view_prefs["mirror"]
@@ -3559,6 +3615,13 @@ def build_parser() -> argparse.ArgumentParser:
                              "vocalization labels with level and pitch and "
                              "send those numbers over the analysis socket; "
                              "needs CED_LIBRARY_PATH and CED_MODEL_PATH")
+    parser.add_argument("--views",
+                        type=lambda s: [v.strip() for v in s.split(",") if v.strip()],
+                        default=None,
+                        help="the camera views this session reads, comma-separated "
+                             "(body, face); a lone 'face' analyses the single "
+                             "--stream as the face view (the slot takes it from "
+                             "the lease). Default: the body view, as before")
     parser.add_argument("--face-stream", default="",
                         help="a second stream, decoded beside --stream and "
                              "drawn as an inset over the view (with its own "

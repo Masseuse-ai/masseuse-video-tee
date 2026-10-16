@@ -77,6 +77,12 @@ OWN_NONCE = re.compile(r"^[A-Za-z0-9_-]{43}$")
 CAPABILITY_HASH = re.compile(r"^[0-9a-f]{64}$")
 CAPABILITY = re.compile(r"^[A-Za-z0-9_-]{43}$")  # base64url of 32 bytes, unpadded
 SESSION_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+# The camera views a lease may name (producer.py Session): `body`, the
+# session's primary stream, everything a session always was; `face`, a
+# stream posed as the face. `["face"]` alone is a lone front camera read as
+# the face (the primary decode loop poses it as `face`, there is one clock);
+# the default is `["body"]`, a body view, as before the field existed.
+VIEW_NAMES = ("body", "face")
 FINGERPRINT = re.compile(rb"^a=fingerprint:\s*([A-Za-z0-9-]+)\s+([0-9A-Fa-f:]+)\s*$", re.M)
 # What the phone reads off a WHIP/WHEP answer, and may send with its offer.
 EXPOSED_HEADERS = "Location, ETag, ID, Link, Accept-Patch, X-Masseuse-Evidence"
@@ -127,6 +133,23 @@ def bearer(headers) -> str:
     if scheme.lower() != "bearer" or not token.strip():
         return ""
     return token.strip()
+
+
+def parse_views(value) -> tuple[tuple[str, ...], str]:
+    """The lease body's `views`: a non-empty list of `VIEW_NAMES`, deduped
+    in the order given, or (default, why). Absent is `("body",)`, a body
+    view as before the field existed."""
+    if value is None:
+        return ("body",), ""
+    if not isinstance(value, list) or not value:
+        return (), "views must be a non-empty list of body, face"
+    out: list[str] = []
+    for name in value:
+        if name not in VIEW_NAMES:
+            return (), f"views may only contain {', '.join(VIEW_NAMES)}"
+        if name not in out:
+            out.append(name)
+    return tuple(out), ""
 
 
 # -- configuration -----------------------------------------------------------------
@@ -600,6 +623,10 @@ class Lease:
     # asks for it is refused, so the trainer knows nothing will be kept.
     record: dict | None = None
     capture_bucket: str = ""
+    # The camera views this session reads (parse_views): `("body",)` by
+    # default, `("face",)` a lone front camera posed as the face. The
+    # /produce handler reads it (views_for) and hands it to the Session.
+    views: tuple[str, ...] = ("body",)
     # True once any lease has been granted, and it stays true through
     # clear() and expiry: the slot has served a phone, so IdleExit uses the
     # short idle clock from here on, however the ticks fall.
@@ -634,6 +661,9 @@ class Lease:
             return 400, {"error": why}
         if record is not None and not self.capture_bucket:
             return 400, {"error": "this slot keeps no record: no capture bucket"}
+        views, why = parse_views(body.get("views"))
+        if why:
+            return 400, {"error": why}
         now = float(self.clock())
         try:
             expires_at = float(body.get("expiresAt") or (now + LEASE_MAX_S))
@@ -651,10 +681,11 @@ class Lease:
             self.capability_hash = capability_hash
             self.expires_at = expires_at
             self.record = record
+            self.views = views
             self.ever_granted = True
             self.stopped_at = None
         answer = {"status": "leased", "sessionId": session_id,
-                  "expiresAt": int(expires_at)}
+                  "expiresAt": int(expires_at), "views": list(views)}
         if record is not None:
             answer["record"] = {**record, "bucket": self.capture_bucket}
         return 200, answer
@@ -673,6 +704,7 @@ class Lease:
             self.capability_hash = ""
             self.expires_at = 0.0
             self.record = None
+            self.views = ("body",)
             self.stopped_at = None
             self.replaced = ""
 
@@ -714,6 +746,12 @@ class Lease:
             return {**self.record, "bucket": self.capture_bucket,
                     "sessionId": self.session_id}
 
+    def views_for(self) -> list[str]:
+        """The camera views a /produce under this lease reads (producer.py):
+        the lease's, or the default body view when none is held."""
+        with self.lock:
+            return list(self.views) if self.capability_hash else ["body"]
+
     def active(self) -> bool:
         with self.lock:
             return bool(self.capability_hash) and float(self.clock()) < self.expires_at
@@ -742,6 +780,7 @@ class Lease:
                     and float(self.clock()) < self.expires_at,
                     "stopped": self.stopped_at is not None,
                     "expiresAt": int(self.expires_at) if self.expires_at else None,
+                    "views": list(self.views),
                     "record": ({**self.record, "bucket": self.capture_bucket}
                                if self.record is not None else None)}
 

@@ -105,10 +105,17 @@ not cross it.
   fixed camera behind the user as the body view - everything below that
   is not marked otherwise - and the user's phone, pointed at their face,
   as a second view whose keypoints arrive as `facePose`; the audio stage
-  then reads the phone's track. `facePoseFps` is the face view's keypoint
-  cadence (`null` with one view): the body's unless the producer was
+  then reads the phone's track. `["face"]` is one camera read as the face:
+  a single front camera (and its microphone) with no body view, so the one
+  decode loop poses that stream as the face view and its keypoints arrive
+  as `facePose`, not `pose`. No `pose`, `frame` or descriptor message is
+  sent in a lone-face session, and a bundle that needs a body view has
+  none; the face is the whole of what is read (the detectors key off it,
+  and `wearer` reads it). `facePoseFps` is the face view's keypoint
+  cadence (`null` with no face view): the body's unless the producer was
   started with a different one for the face, and picked from the face
-  view's own decode grid the same way.
+  view's own decode grid the same way; in a lone-face session it is the
+  one cadence the stream is posed at, and `poseFps` gives the same.
 - `faceFrameIntervalS` (absent in older producers, `null` when the
   producer has nowhere to send them; then none are sent): asks for `face`
   messages (below) after the face view's rows, at most this many seconds
@@ -149,7 +156,9 @@ Only in a session whose `hello` listed a `face` view.
 - `bodyAtS`: the same moment on the body view's timeline, from the two
   streams' sender clocks (`workload/producer/sync.py`), so a face row can
   be set beside the `pose` and `frame` rows around it; `null` before the
-  two views are lined up.
+  two views are lined up. In a lone-face session (`views: ["face"]`) the
+  face is the only clock, so `bodyAtS` equals the row's own `atS` and is
+  never `null`.
 - `keypoints`, `dropped`, `error`, `frameSize`: as in `pose`, for the face
   view's frame. The model is the same and so are the keypoint names; the
   body points of a face view are whatever of the body the phone sees. A
@@ -529,6 +538,22 @@ after, to the end of the session. The masseuse reads `decided` to choose
 which of the two detectors in `events` it acts on (`onsetEnd` for a woman,
 `peak` otherwise) and keeps its default while `decided` is `null`; the
 block's constants are `ready.wearer` (above).
+
+A lone-face session (`hello.views` is `["face"]`: a single front camera and
+its microphone, with no body view) is read from the face and the audio
+alone. The `face` object and its `hazard`, the `events` block's two
+detectors and their `calls`, and the `wearer` block are all produced from
+the `facePose` rows and the `audio`/`segment` measurements, with no `pose`,
+`frame` or descriptor message to draw on. A bundle that serves this path
+must time its detectors off the face view's clock (the readings are posted
+on the face clock, `facePose.atS`, which is also the only clock
+`facePose.bodyAtS` carries) and must not require a body-derived channel
+(`positioning`/`posture`'s stance and hip numbers, the motion descriptors'
+`buck*`, `rhythmSnr`): those stay `null` with no body view. What a consumer
+of this path reads back is a non-null `face.hazard` (`p30`, `p60`), the
+`events` `calls` (`onset`, `peak`, `end`), and the `wearer` read once the
+face has been in view thirty seconds - the fields a downstream
+readings-to-events consumer of the lone-face path keys on.
 Besides the readings, a leased session's
 record (`workload/producer/record.py`, described in the README under
 "Session records") is the other path out of the enclave: the keypoints,
