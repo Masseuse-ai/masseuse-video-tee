@@ -189,6 +189,12 @@ variable "phone_origins" {
   default     = ["https://masseuse.ai", "https://www.masseuse.ai"]
 }
 
+variable "any_page_origin" {
+  description = "Whether a device page on any site may call the slot's WHIP/WHEP and /attestation (TEE_ALLOWED_ORIGINS gains `*`, answered as `*`). The capability and its sealed requests are the gate either way; false keeps phone_origins as an exact list."
+  type        = bool
+  default     = true
+}
+
 variable "trainer_invoker_service_accounts" {
   description = "The trainer's runtime service account(s): the only callers of the slot's control routes."
   type        = list(string)

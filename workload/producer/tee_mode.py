@@ -963,15 +963,20 @@ class ControlAuth:
 def cors_headers(config: TeeConfig, request_origin: str | None,
                  ) -> list[tuple[str, str]]:
     """The phone talks to the slot cross-origin from masseuse.ai, on a page
-    served with COEP require-corp: allow exactly the configured origins,
-    expose the WHIP/WHEP headers plus the evidence, and mark every response
-    cross-origin-readable."""
+    served with COEP require-corp: allow exactly the configured origins, or
+    any page's when `*` is among them (a device page on another site, the
+    sealed capability being the gate), expose the WHIP/WHEP headers plus the
+    evidence, and mark every response cross-origin-readable."""
     out = [("Cross-Origin-Resource-Policy", "cross-origin"),
            ("Vary", "Origin")]
     origin = (request_origin or "").rstrip("/")
-    # The header carries the configured origin the request's one equals,
-    # never the request's own bytes.
-    allowed = next((o for o in config.allowed_origins if origin and o == origin), None)
+    # The header carries the configured origin the request's one equals, or
+    # `*`, never the request's own bytes. No request to the slot carries
+    # credentials, so `*` answers any page's.
+    if origin and "*" in config.allowed_origins:
+        allowed = "*"
+    else:
+        allowed = next((o for o in config.allowed_origins if origin and o == origin), None)
     if allowed is not None:
         out.extend([
             ("Access-Control-Allow-Origin", allowed),
