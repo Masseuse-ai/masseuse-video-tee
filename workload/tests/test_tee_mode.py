@@ -133,10 +133,11 @@ def seal(seal_key: tee_mode.SealKey, cap: str, method: str, target: str,
     return header, wire
 
 
-def make_tee(require_seal: bool = False, **overrides) -> tee_mode.TeeMode:
+def make_tee(require_seal: bool = False, origins: tuple[str, ...] = (ORIGIN,),
+             **overrides) -> tee_mode.TeeMode:
     config = tee_mode.TeeConfig(
         public_host=HOST, trainer_invoker_service_accounts=(TRAINER_SA,),
-        allowed_origins=(ORIGIN,), tls_cert_dir="/nonexistent",
+        allowed_origins=origins, tls_cert_dir="/nonexistent",
         require_seal=require_seal)
     launcher = FakeLauncher()
     evidence = tee_mode.EvidenceKey()
@@ -236,10 +237,11 @@ class Slot:
     public address and finds a fixed certificate fingerprint without a
     network; `gateway_down` points it at a gateway that is not there."""
 
-    def __init__(self, gateway_down: bool = False, sealed: bool = False):
+    def __init__(self, gateway_down: bool = False, sealed: bool = False,
+                 origins: tuple[str, ...] = (ORIGIN,)):
         self.relay = StubRelay()
         self.gateway = FakeGateway()
-        self.tee = make_tee(require_seal=sealed)
+        self.tee = make_tee(require_seal=sealed, origins=origins)
         self.probes: list[tuple] = []
 
         def probe(host, port, ip, timeout_s, **options):
@@ -686,6 +688,48 @@ def test_cors_is_for_the_page_origin_only():
     assert "Access-Control-Allow-Origin" not in denied
     assert denied["Cross-Origin-Resource-Policy"] == "cross-origin"
     assert "Access-Control-Allow-Origin" not in dict(tee_mode.cors_headers(config, None))
+
+
+def test_cors_answers_any_page_with_a_wildcard():
+    """`*` among the origins (a device page on another site): every page
+    with an Origin gets `*`, never its own origin's bytes; a request without
+    one gets no CORS header."""
+    config = tee_mode.TeeConfig(public_host=HOST,
+                                trainer_invoker_service_accounts=(TRAINER_SA,),
+                                allowed_origins=("*", ORIGIN))
+    for page in ("https://app.example.com", ORIGIN, "http://localhost:3000"):
+        allowed = dict(tee_mode.cors_headers(config, page))
+        assert allowed["Access-Control-Allow-Origin"] == "*"
+        assert "X-Masseuse-Seal" in allowed["Access-Control-Allow-Headers"]
+        assert "X-Masseuse-Evidence" in allowed["Access-Control-Expose-Headers"]
+    assert "Access-Control-Allow-Origin" not in dict(tee_mode.cors_headers(config, None))
+    parsed = tee_mode.TeeConfig.from_env({
+        "TEE_PUBLIC_HOST": HOST, "TRAINER_INVOKER_SERVICE_ACCOUNT": TRAINER_SA,
+        "TEE_ALLOWED_ORIGINS": "*,https://masseuse.ai"})
+    assert parsed.allowed_origins == ("*", "https://masseuse.ai")
+
+
+def test_a_device_page_on_any_site_reaches_the_slot_under_a_wildcard():
+    page = "https://app.example.com"
+    with Slot(sealed=True, origins=("*", ORIGIN)) as slot:
+        code, headers, _ = slot.request("OPTIONS", "/ingest/whip",
+                                        headers={"Origin": page,
+                                                 "Access-Control-Request-Method": "POST",
+                                                 "Access-Control-Request-Headers": "content-type, x-masseuse-seal"})
+        assert code == 204 and headers["Access-Control-Allow-Origin"] == "*"
+        code, headers, _ = slot.request("GET", "/attestation", headers={"Origin": page})
+        assert headers["Access-Control-Allow-Origin"] == "*"
+        # Under the wildcard the capability is still the gate: a bare
+        # bearer from that page is refused as it is from any other.
+        code, headers, _ = slot.request("POST", "/ingest/whip", OFFER,
+                                        headers={"Origin": page, "Content-Type": "application/sdp",
+                                                 "Authorization": "Bearer " + "A" * 43})
+        assert code == 401 and headers["Access-Control-Allow-Origin"] == "*"
+    with Slot(sealed=True) as slot:
+        code, headers, _ = slot.request("OPTIONS", "/ingest/whip",
+                                        headers={"Origin": page,
+                                                 "Access-Control-Request-Method": "POST"})
+        assert "Access-Control-Allow-Origin" not in headers
 
 
 def test_config_from_env_needs_the_host_and_the_trainer():

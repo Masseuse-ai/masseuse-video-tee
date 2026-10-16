@@ -46,7 +46,7 @@ locals {
       ])
       "tee-env-TRAINER_URL"                     = var.trainer_url
       "tee-env-TRAINER_INVOKER_SERVICE_ACCOUNT" = join(",", concat(var.trainer_invoker_service_accounts, var.debug_mode ? [google_service_account.soak[0].email] : []))
-      "tee-env-TEE_ALLOWED_ORIGINS"             = join(",", distinct(concat(var.phone_origins, [var.trainer_url])))
+      "tee-env-TEE_ALLOWED_ORIGINS"             = join(",", distinct(concat(var.any_page_origin ? ["*"] : [], var.phone_origins, [var.trainer_url])))
       "tee-env-MODELS_BUCKET"                   = google_storage_bucket.models.name
       "tee-env-WIF_AUDIENCE"                    = local.wif_audience
       "tee-env-ACME_DIRECTORY_URL"              = local.acme_directory_url
