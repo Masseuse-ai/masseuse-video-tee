@@ -553,7 +553,10 @@ on the face clock, `facePose.atS`, which is also the only clock
 of this path reads back is a non-null `face.hazard` (`p30`, `p60`), the
 `events` `calls` (`onset`, `peak`, `end`), and the `wearer` read once the
 face has been in view thirty seconds - the fields a downstream
-readings-to-events consumer of the lone-face path keys on.
+readings-to-events consumer of the lone-face path keys on. From bundle
+2026.10.16-1 a lone-face session's readings are posted after its
+`facePose` rows, once a second of the face clock from its first posed
+row, with `posture` and `positioning` `null`.
 Besides the readings, a leased session's
 record (`workload/producer/record.py`, described in the README under
 "Session records") is the other path out of the enclave: the keypoints,
