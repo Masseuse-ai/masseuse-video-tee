@@ -1,19 +1,21 @@
-# Verifying a masseuse.ai video slot
+# Verifying a video slot
 
-masseuse.ai's camera pipeline runs in a Google Cloud Confidential Space
-enclave: an `a3-highgpu-1g` VM with Intel TDX on the CPU and an NVIDIA H100
-in confidential-computing mode. This document is how anyone, without an
-account at FemLed or Google, checks that the enclave your phone (or your
-home camera, through [masseuse-camlink](https://github.com/Masseuse-ai/masseuse-camlink))
-would send video to is the one described here, and what that does and does
-not prove. If you are not technical, hand it to someone who is.
+The camera pipeline this repository builds runs in a Google Cloud
+Confidential Space enclave: an `a3-highgpu-1g` VM with Intel TDX on the CPU
+and an NVIDIA H100 in confidential-computing mode. This document is how
+anyone, without an account at FemLed or Google, checks that the enclave a
+device would send video to (a phone on masseuse.ai, the device of a service
+that leases a slot, or a home camera through
+[masseuse-camlink](https://github.com/Masseuse-ai/masseuse-camlink)) is the
+one described here, and what that does and does not prove. If you are not
+technical, hand it to someone who is.
 
 ## What is being claimed
 
 1. Your camera's video is decrypted in exactly two places: your device and
-   the enclave. Cloudflare, the trainer service (Cloud Run), the TURN relay,
-   the home-network connector and FemLed's operators see ciphertext or
-   nothing.
+   the enclave. Cloudflare, the trainer service (Cloud Run), a service that
+   leased the slot through it, the TURN relay, the home-network connector
+   and FemLed's operators see ciphertext or nothing.
 2. The enclave runs an image that the release workflow of this public
    repository built from a tagged commit and signed, on a production
    Confidential Space VM image with debugging disabled since boot (no SSH,
@@ -150,6 +152,35 @@ Each check, and why it matters:
 | `nonce.exact` | `eat_nonce` holds those three and nothing else (the detail lists it as the token has it). The enclave appends one caller's nonce to its own two and refuses a caller's nonce shaped like them (43 characters of base64url, a SHA-256), so a token can never name somebody else's key beside the enclave's. |
 | `cosign.verify` | (optional) cosign independently verifies the registry signature over the running digest with the published public key. |
 
+## Which values to verify against
+
+`tee-verify`'s defaults are the operator's fleet: its project
+(`-project-id`), the registry path its slots pull from
+(`-image-ref-prefix`), the controller its slots post readings to and take
+control tokens from (`-trainer-url`, `-trainer-invoker`), the bucket a
+signed-in session's record may go to (`-capture-bucket`) and the release
+signing key (`-signer-key-ids`). What a slot attests about its image (the
+digest, the release stamp, the provenance) does not depend on who leased
+it or where it runs; those values do.
+
+- **A slot of the operator's fleet, whoever leased it**: masseuse.ai, or a
+  service that leases slots for its own users through the trainer's
+  internal lease API. The defaults apply as they are: a leased session's
+  slot is the same slot, posting to the same trainer, and its lease names
+  no record.
+- **A slot a service names in a policy it publishes.** Take the values
+  from that policy and pass them as the flags above; a value the policy
+  does not name keeps its default.
+- **A slot in your own project**, booted from a released image with your
+  deployment's variables. Pass your project (`-project-id`), the registry
+  path you pull from (`-image-ref-prefix`), your controller
+  (`-trainer-url`, `-trainer-invoker`), and `-capture-bucket ""` for a slot
+  that keeps no record. The release stamp and the provenance checks are
+  unchanged, since the same digest is the same release wherever it boots;
+  the signature check holds when the deployment points the launcher at the
+  release's signatures (`tee-signed-image-repos`, as `terraform/vm.tf`
+  does).
+
 ## Do it by hand
 
 ```sh
@@ -177,8 +208,9 @@ own, or start one and run the verifier from another machine.
 
 ## What the clients check
 
-The masseuse.ai trainer, which leases a slot to a phone and drives it with
-its own Google ID token, checks the slot before anything with that token
+The masseuse.ai trainer, which leases a slot to a phone, or to another
+service's device through its internal lease API, and drives it with its
+own Google ID token, checks the slot before anything with that token
 reaches it (`masseuse-trainer/server/`, "Attested before leased" in its
 README). It fetches the slot's `/attestation` with no token, over a
 connection of its own, and requires the token to bind the TLS key that

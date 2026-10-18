@@ -1,19 +1,21 @@
 # masseuse-video-tee
 
-The enclave that every masseuse.ai camera stream is sent to, published so
-that anyone can read what happens to their video and check that the machine
-they are connected to is running exactly this.
+The confidential-computing enclave that camera streams are analysed in,
+published so that anyone can read what happens to their video and check
+that the machine they are connected to is running exactly this.
 
-masseuse.ai looks at a camera while you use it. The camera is either the
-phone's own, a network camera behind you that the phone names, or, through
-the open-source connector
+The camera is a device's own, a network camera behind the person that the
+device names, or, through the open-source connector
 [masseuse-camlink](https://github.com/Masseuse-ai/masseuse-camlink) running on
 the computer in the room, that computer's own camera and microphone or a
-camera on your home network. Whichever it is, the video is decrypted in two
-places only: on your own devices and inside a Google Cloud Confidential
-Space VM (`a3-highgpu-1g`: Intel TDX, one H100 in confidential-computing
-mode) in the dedicated project `prod-masseuse-video-tee`. This repository is that VM's infrastructure, the
-container image it runs, and the tools to verify both.
+camera on the home network. Whichever it is, the video is decrypted in two
+places only: on the person's own devices and inside a Google Cloud
+Confidential Space VM (`a3-highgpu-1g`: Intel TDX, one H100 in
+confidential-computing mode). This repository is that VM's infrastructure,
+the container image it runs, and the tools to verify both. The operator's
+fleet runs in the dedicated project `prod-masseuse-video-tee` and serves
+masseuse.ai and the services that lease its slots; the same released image
+can boot in any other project ("Who it serves").
 
 ## What happens to your video and audio
 
@@ -91,18 +93,19 @@ Inside the enclave, in code that is in this repository:
   words cannot be recovered. Both go to the analysis module and into the
   session record, beside the first tagger's scores.
 - Frames and audio are then discarded. Nothing of them is written to disk;
-  the VM has no persistent storage and nobody at masseuse.ai can read its
+  the VM has no persistent storage and nobody operating it can read its
   memory.
 
 The keypoints (the face view's included, as their own rows), descriptors
 and vocalization labels, which identify nobody, go to an analysis module
-that turns them into a few numbers per second for the masseuse (the
-masseuse.ai service on Cloud Run). The analysis module
+that turns them into a few numbers per second for the slot's controller:
+on the operator's fleet, the masseuse (the masseuse.ai service on Cloud
+Run). The analysis module
 runs inside the same enclave as a separate process, receives no frames and
 no audio, and its logic is not published; its exact version is pinned by
 hash in this repository so the attested image says which one is running.
 The numbers, never frames or sound, are what leaves the enclave, over TLS to
-the masseuse's address that is itself part of the attestation; the one
+the controller's address that is itself part of the attestation; the one
 exception is the live stream the user opens, below. From v0.15.0 the
 analysis module also reports, once a session and after 30 seconds of the
 face in view, which of its two response detectors the masseuse should act
@@ -138,6 +141,33 @@ never off a list kept here. `VERIFY.md` says how to check that for the
 digest and release your session attested; the digest and validation
 record of each release is on its GitHub Release.
 
+## Who it serves
+
+Every slot has one controller: the identity its attested
+`TRAINER_INVOKER_SERVICE_ACCOUNT` names, the only one its control routes
+take a token from, and the address its attested `TRAINER_URL` names, the
+only place its readings go. On the operator's fleet the controller is the
+masseuse, which attests each slot before it leases it (`VERIFY.md`, "What
+the clients check"), and through it the slots serve:
+
+- **masseuse.ai's own sessions**: the phone, the cameras it names and the
+  connector, as this document describes them.
+- **Services that lease a slot for their own users.** The masseuse's
+  internal lease API gives another service a slot for its user's device to
+  publish to. The device fetches the slot's attestation and publishes to it
+  directly, sealed under a capability only that device holds ("Sealed
+  requests", below); the service and the masseuse see the capability's
+  hash, never the capability or a frame. The masseuse relays the slot's
+  readings to the service. Such a lease names no record, so the enclave
+  keeps none of the session.
+- **Anyone who boots a released image in a project of their own.** The
+  image, its signature, its release stamp and its provenance are the same
+  wherever it boots, and so is what identifies it. What the slot attests
+  about where it runs (the project, the registry it was pulled from, its
+  controller, its record bucket) is that deployment's; `VERIFY.md`, "Which
+  values to verify against", says how to check them. The weights and the
+  analysis bundle are released only to the slots `terraform/wif.tf` admits.
+
 ## Trust boundary
 
 - Cloudflare fronts `masseuse.ai` (HTML/JS, session API) but never carries
@@ -149,6 +179,10 @@ record of each release is on its GitHub Release.
   Of a live stream the user opens it learns that one is on and to which
   host, may stop it, and sends the words of the HUD card drawn into it;
   the destination itself goes from the phone to the enclave alone.
+- A service that leases a slot through the masseuse learns of its sessions
+  what the masseuse does: the capability's hash, the slot's origin and the
+  readings relayed to it. Its user's device publishes to the slot directly,
+  so the service carries no media.
 - coturn is a TURN fallback the phone may use; it relays SRTP ciphertext.
 - masseuse.ai itself, meaning any employee, contractor or administrator
   working on its behalf, including the owners of the Google Cloud project,
@@ -445,8 +479,9 @@ report a check that should hold and does not.
 
 ## How it runs
 
-A slot exists only while a session needs it. When a masseuse.ai visitor taps
-Enable camera the masseuse starts the VM (the one thing its service account
+A slot exists only while a session needs it. When a session needs one (a
+masseuse.ai visitor taps Enable camera, or a leasing service asks for a
+slot) the masseuse starts the VM (the one thing its service account
 may do here); about three minutes later the enclave holds a fresh TLS
 certificate from Google Trust Services issued to a key generated inside it,
 the model weights are in a tmpfs, and the slot attests and takes the lease.
