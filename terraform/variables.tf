@@ -277,6 +277,12 @@ variable "external_slot_projects" {
   default     = []
 }
 
+variable "hosted_slots_pool" {
+  description = "Keep the hosted-slots pool and its provider whatever external_slot_projects holds. Set it with the first approval and leave it: a deleted pool or provider keeps its name for 30 days, and the next approval would fail with a 409."
+  type        = bool
+  default     = false
+}
+
 variable "external_slot_service_accounts" {
   description = "The VM accounts those slots run as (modules/slot output vm_service_account): they pull the image and its signature, and the attestation must name one."
   type        = list(string)

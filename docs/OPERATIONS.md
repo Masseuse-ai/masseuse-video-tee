@@ -866,6 +866,7 @@ git-ignored `terraform.tfvars` and a local apply, recorded like a digest
 roll, never a pull request:
 
 ```hcl
+hosted_slots_pool              = true # from the first approval on, for good
 external_slot_projects         = ["<their project>"]
 external_slot_service_accounts = ["enclave-slot-vm@<their project>.iam.gserviceaccount.com"]
 external_controller_url        = "<the controller's readings origin>"
@@ -896,7 +897,11 @@ no weights, no certificate.
 
 To revoke, remove the project (and its accounts) and apply: its next
 exchange is refused, and a credential already exchanged lives out its
-hour. Rolling the fleet's digest rolls the hosted slots' grant with it
+hour. Removing the last project keeps the pool and its provider, which
+then admit no slot, and drops every grant; `hosted_slots_pool` is what
+keeps them, since a deleted pool or provider keeps its name for 30 days
+and the next approval would fail with a 409 (as with `attestation-debug`
+above). Rolling the fleet's digest rolls the hosted slots' grant with it
 (`container_image_digest`, `candidate_image_digests`); a hosted
 deployment changes `container_image` to the new digest on its side.
 
