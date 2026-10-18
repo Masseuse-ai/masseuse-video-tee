@@ -25,10 +25,13 @@ def capture_server():
 
         def do_POST(self):
             length = int(self.headers.get("Content-Length", 0))
+            raw = self.rfile.read(length)
             received.append({
                 "path": self.path,
                 "authorization": self.headers.get("Authorization"),
-                "body": json.loads(self.rfile.read(length)),
+                "signature": self.headers.get("X-Masseuse-Signature"),
+                "raw": raw,
+                "body": json.loads(raw),
             })
             self.send_response(200)
             self.end_headers()
@@ -78,7 +81,52 @@ def test_the_poster_sends_the_assembled_body_with_its_token():
     assert received[1]["body"]["continuityPct"] == 61.2
     assert received[1]["body"]["posture"] is None
     assert len(minted) == 1, "the token is reused inside its lifetime"
+    assert first["signature"] is None, "unsigned without a signer"
     assert telemetry.snapshot()["counters"]["postsOk"] == 2
+
+
+def test_a_slot_signs_each_post_with_its_evidence_key():
+    import tee_mode
+
+    server, received = capture_server()
+    url = f"http://127.0.0.1:{server.server_address[1]}/api/pose-signals/slot/tee-slot-3/readings"
+    key = tee_mode.EvidenceKey()
+    poster = Poster(url, Telemetry(), token_supplier=lambda: "token-abc", signer=key)
+    poster.post({"atS": 12.0})
+    poster.close(timeout_s=5)
+    server.shutdown()
+
+    assert len(received) == 1
+    post = received[0]
+    iat = tee_mode.verify_reading(key.public_bytes, post["signature"],
+                                  "/api/pose-signals/slot/tee-slot-3/readings", post["raw"])
+    assert abs(iat - time.time()) < 60
+    # The signature covers the path and the exact bytes: another route or
+    # body, or another key, does not verify.
+    for path, raw, public in (
+        ("/api/pose-signals/slot/tee-slot-4/readings", post["raw"], key.public_bytes),
+        ("/api/pose-signals/slot/tee-slot-3/readings", post["raw"] + b" ", key.public_bytes),
+        ("/api/pose-signals/slot/tee-slot-3/readings", post["raw"], tee_mode.EvidenceKey().public_bytes),
+    ):
+        try:
+            tee_mode.verify_reading(public, post["signature"], path, raw)
+        except ValueError:
+            continue
+        raise AssertionError(f"verified for {path}")
+
+
+def test_a_stale_or_malformed_reading_signature_is_refused():
+    import tee_mode
+
+    key = tee_mode.EvidenceKey()
+    header = key.sign_reading("/r", b"{}", iat=1_700_000_000)
+    assert tee_mode.verify_reading(key.public_bytes, header, "/r", b"{}", now=1_700_000_030) == 1_700_000_000
+    for bad, now in ((header, 1_700_000_500), ("v2" + header[2:], 1_700_000_000), ("v1.x.y", 1_700_000_000)):
+        try:
+            tee_mode.verify_reading(key.public_bytes, bad, "/r", b"{}", now=now)
+        except ValueError:
+            continue
+        raise AssertionError(f"accepted {bad}")
 
 
 def test_a_dead_sink_is_counted_never_raised():

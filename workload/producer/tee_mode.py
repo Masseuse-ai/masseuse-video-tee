@@ -261,6 +261,44 @@ class EvidenceKey:
         return {"alg": "Ed25519", "publicKey": self.public_b64url,
                 "nonce": self.nonce}
 
+    def sign_reading(self, path: str, body: bytes, iat: int | None = None) -> str:
+        """`X-Masseuse-Signature` for one post to the slot's controller (a
+        reading, or a face frame): `v1.<iat>.<b64url signature>` over
+        `reading.v1\\n<iat>\\n<path>\\n<sha256 hex of the body>`. The
+        controller holds it to the key the attestation binds, so a reading
+        is the enclave's whoever runs the project the slot is in: the ID
+        token beside it is the VM's account, which the project's owners
+        hold too."""
+        iat = int(iat if iat is not None else time.time())
+        return f"v1.{iat}.{b64url(self._key.sign(reading_message(path, body, iat)))}"
+
+
+def reading_message(path: str, body: bytes, iat: int) -> bytes:
+    """What `EvidenceKey.sign_reading` signs."""
+    return f"reading.v1\n{iat}\n{path}\n{hashlib.sha256(body).hexdigest()}".encode()
+
+
+def verify_reading(public_key_raw: bytes, header: str, path: str, body: bytes,
+                   *, now: float | None = None, skew_s: float = 120.0) -> int:
+    """A controller's side of `EvidenceKey.sign_reading`: raises ValueError
+    on a malformed, stale or false signature; returns its iat."""
+    from cryptography.exceptions import InvalidSignature
+    from cryptography.hazmat.primitives.asymmetric import ed25519
+
+    version, _, rest = header.partition(".")
+    iat_text, _, signature = rest.partition(".")
+    if version != "v1" or not iat_text.isdigit() or not signature:
+        raise ValueError("malformed reading signature")
+    iat = int(iat_text)
+    if abs((time.time() if now is None else now) - iat) > skew_s:
+        raise ValueError("stale reading signature")
+    key = ed25519.Ed25519PublicKey.from_public_bytes(public_key_raw)
+    try:
+        key.verify(b64url_decode(signature), reading_message(path, body, iat))
+    except InvalidSignature as error:
+        raise ValueError("reading signature does not verify") from error
+    return iat
+
 
 def verify_evidence(public_key_raw: bytes, evidence: str) -> dict:
     """The phone's side of `EvidenceKey.sign`, for tests and the verifier.

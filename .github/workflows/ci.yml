@@ -91,6 +91,12 @@ jobs:
         run: |
           terraform init -backend=false -input=false
           terraform validate -no-color
+      - name: the own-project deployment of modules/slot
+        working-directory: deploy/own-project
+        run: |
+          terraform fmt -check -diff
+          terraform init -backend=false -input=false
+          terraform validate -no-color
 
   workload:
     # The pixel path and the producer shell, CPU only: the tests stub torch

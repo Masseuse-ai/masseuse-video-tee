@@ -266,3 +266,42 @@ variable "access_policy_id" {
   type        = string
   default     = ""
 }
+
+# ---------------------------------------------------------------------------
+# Slots hosted in other projects (hosted.tf). The values are the
+# deployment's: in the git-ignored terraform.tfvars, never in this file.
+# ---------------------------------------------------------------------------
+variable "external_slot_projects" {
+  description = "Projects approved to host released slots that read the weights and the analysis bundle (hosted.tf); empty, none."
+  type        = list(string)
+  default     = []
+}
+
+variable "external_slot_service_accounts" {
+  description = "The VM accounts those slots run as (modules/slot output vm_service_account): they pull the image and its signature, and the attestation must name one."
+  type        = list(string)
+  default     = []
+}
+
+variable "external_controller_url" {
+  description = "The controller the approved projects' slots must attest as TRAINER_URL: where their readings go."
+  type        = string
+  default     = ""
+}
+
+variable "external_controller_service_account" {
+  description = "The one identity the approved projects' slots must attest as TRAINER_INVOKER_SERVICE_ACCOUNT."
+  type        = string
+  default     = ""
+}
+
+variable "external_image_digests" {
+  description = "Release digests hosted slots may run beyond the fleet's own (a release not yet rolled here)."
+  type        = list(string)
+  default     = []
+
+  validation {
+    condition     = alltrue([for d in var.external_image_digests : can(regex("^sha256:[0-9a-f]{64}$", d))])
+    error_message = "external_image_digests are sha256:<64 hex>."
+  }
+}

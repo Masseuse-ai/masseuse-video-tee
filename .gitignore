@@ -4,6 +4,12 @@ terraform/*.tfstate.*
 terraform/*.tfplan
 terraform/terraform.tfvars
 terraform/.terraform.lock.hcl
+# A deployment of modules/slot from deploy/: its values and state are its own.
+deploy/*/.terraform/
+deploy/*/.terraform.lock.hcl
+deploy/*/*.tfstate
+deploy/*/*.tfstate.*
+deploy/*/terraform.tfvars
 node_modules/
 __pycache__/
 *.pyc

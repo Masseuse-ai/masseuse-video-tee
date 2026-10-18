@@ -507,7 +507,7 @@ def test_face_frames_are_asked_for_only_with_a_post_url_and_a_face_view(monkeypa
     class QuietPoster:
         timeout_s = 0.1
 
-        def __init__(self, url, telemetry):
+        def __init__(self, url, telemetry, signer=None):
             pass
 
         def post(self, body):
