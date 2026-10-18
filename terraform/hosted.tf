@@ -13,10 +13,14 @@
 # on the STABLE image, TDX with secure boot, the H100 in CC mode, the
 # release signature; plus an approved project and VM account, that
 # controller's address and identity, and no record bucket. Nothing here
-# exists while the list is empty.
+# exists until the first approval.
 #
 # Removing a project from the list refuses its next exchange; a credential
-# already exchanged lives out its hour. The weights a hosted slot reads are
+# already exchanged lives out its hour. The pool and its provider outlive
+# the list (hosted_slots_pool): a deleted pool or provider keeps its name
+# for 30 days, so deleting them with the last project would fail the next
+# approval with a 409. With no project listed, the provider admits no slot
+# and every grant below is gone. The weights a hosted slot reads are
 # the ones models.lock and analysis.lock pin, like any slot's; what keeps a
 # session from the host project's owners is the same as here: the clients
 # hold the slot to the release's public record, pin the attested TLS key,
@@ -25,8 +29,9 @@
 # ---------------------------------------------------------------------------
 locals {
   hosted_enabled = length(var.external_slot_projects) > 0
+  hosted_pool_on = var.hosted_slots_pool || local.hosted_enabled
 
-  hosted_pool_name = local.hosted_enabled ? "projects/${var.project_number}/locations/global/workloadIdentityPools/${google_iam_workload_identity_pool.hosted[0].workload_identity_pool_id}" : ""
+  hosted_pool_name = local.hosted_pool_on ? "projects/${var.project_number}/locations/global/workloadIdentityPools/${google_iam_workload_identity_pool.hosted[0].workload_identity_pool_id}" : ""
 
   # The digests a hosted slot may run: the fleet's, and releases approved
   # for hosted slots before the fleet rolls to them.
@@ -42,7 +47,7 @@ locals {
 }
 
 resource "google_iam_workload_identity_pool" "hosted" {
-  count                     = local.hosted_enabled ? 1 : 0
+  count                     = local.hosted_pool_on ? 1 : 0
   project                   = var.project_id
   workload_identity_pool_id = "hosted-slots"
   display_name              = "Slots hosted elsewhere"
@@ -52,7 +57,7 @@ resource "google_iam_workload_identity_pool" "hosted" {
 }
 
 resource "google_iam_workload_identity_pool_provider" "hosted" {
-  count                              = local.hosted_enabled ? 1 : 0
+  count                              = local.hosted_pool_on ? 1 : 0
   project                            = var.project_id
   workload_identity_pool_id          = google_iam_workload_identity_pool.hosted[0].workload_identity_pool_id
   workload_identity_pool_provider_id = "attestation-hosted"
@@ -83,7 +88,7 @@ resource "google_iam_workload_identity_pool_provider" "hosted" {
 
   lifecycle {
     precondition {
-      condition     = var.external_controller_url != "" && var.external_controller_service_account != "" && length(var.external_slot_service_accounts) > 0
+      condition     = !local.hosted_enabled || (var.external_controller_url != "" && var.external_controller_service_account != "" && length(var.external_slot_service_accounts) > 0)
       error_message = "Approving a project needs the controller it was approved for (external_controller_url, external_controller_service_account) and its slots' VM accounts (external_slot_service_accounts)."
     }
   }
