@@ -111,28 +111,29 @@ const (
 var reportedEnv = []string{"MODELS_BUCKET", "WIF_AUDIENCE", "ACME_DIRECTORY_URL", "TEE_ALLOWED_ORIGINS"}
 
 type config struct {
-	origin          string
-	fetchBase       string
-	jwksURL         string
-	projectID       string
-	imageRefPrefix  string
-	allowedDigests  []string
-	trainerURL      string
-	captureBucket   string
-	requestSeal     string
-	trainerInvokers []string
-	signerKeyIDs    []string
-	minRelease      string
-	expectRelease   string
-	slsaVerifierBin string
-	sourceURI       string
-	imageRepo       string
-	allowDebug      bool
-	insecureTLS     bool
-	cosignBin       string
-	cosignPublicKey string
-	timeout         time.Duration
-	verbose         bool
+	origin           string
+	fetchBase        string
+	jwksURL          string
+	policyURL        string
+	projectIDs       []string
+	imageRefPrefixes []string
+	allowedDigests   []string
+	trainerURL       string
+	captureBucket    string
+	requestSeal      string
+	trainerInvokers  []string
+	signerKeyIDs     []string
+	minRelease       string
+	expectRelease    string
+	slsaVerifierBin  string
+	sourceURI        string
+	imageRepo        string
+	allowDebug       bool
+	insecureTLS      bool
+	cosignBin        string
+	cosignPublicKey  string
+	timeout          time.Duration
+	verbose          bool
 }
 
 // release is the stamp the release workflow bakes into the image and the
@@ -257,6 +258,7 @@ type check struct {
 
 type report struct {
 	Origin       string   `json:"origin"`
+	Policy       string   `json:"policy,omitempty"`
 	ImageDigest  string   `json:"imageDigest,omitempty"`
 	Release      *release `json:"release,omitempty"`
 	InstanceID   string   `json:"instanceId,omitempty"`
@@ -281,7 +283,7 @@ func main() {
 	ctx, cancel := context.WithTimeout(context.Background(), cfg.timeout)
 	defer cancel()
 
-	r := &report{Origin: cfg.origin}
+	r := &report{Origin: cfg.origin, Policy: cfg.policyURL}
 	if err := run(ctx, cfg, r); err != nil {
 		r.add("verifier", false, err.Error())
 	}
@@ -300,12 +302,13 @@ func main() {
 
 func parseFlags() (*config, error) {
 	cfg := &config{}
-	var digests, signers, invokers string
+	var digests, signers, invokers, projects, prefixes string
 	flag.StringVar(&cfg.origin, "origin", "https://slot-0.tee.masseuse.ai", "the slot's origin (also the token audience)")
 	flag.StringVar(&cfg.fetchBase, "fetch-base", "", "debug only: send the requests here instead of to -origin (an IAP tunnel to the producer's loopback port, http://127.0.0.1:18080); the audience is still -origin, and the TLS binding cannot pass because the connection is not to the slot")
 	flag.StringVar(&cfg.jwksURL, "jwks-url", defaultJWKSURL, "Confidential Space attestation signer JWKS")
-	flag.StringVar(&cfg.projectID, "project-id", "prod-masseuse-video-tee", "expected submods.gce.project_id")
-	flag.StringVar(&cfg.imageRefPrefix, "image-ref-prefix", "us-central1-docker.pkg.dev/prod-masseuse-video-tee/masseuse-video-tee/", "expected prefix of submods.container.image_reference")
+	flag.StringVar(&cfg.policyURL, "policy-url", "", "an https:// URL or a file holding the values a service holds its slots to (a JSON document of them, or one carrying them as its \"verify\" member); each replaces the default of the flag of the same meaning, and a flag given on the command line wins (VERIFY.md, \"Which values to verify against\")")
+	flag.StringVar(&projects, "project-id", "prod-masseuse-video-tee", "comma-separated projects submods.gce.project_id may be")
+	flag.StringVar(&prefixes, "image-ref-prefix", "us-central1-docker.pkg.dev/prod-masseuse-video-tee/masseuse-video-tee/", "comma-separated prefixes one of which submods.container.image_reference must start with")
 	flag.StringVar(&digests, "allowed-digests", "", "comma-separated sha256:... digests to pin the slot to; empty (the norm) reports the digest and relies on the signature and the release stamp")
 	flag.StringVar(&cfg.trainerURL, "trainer-url", "https://masseuse-trainer-125139120897.us-central1.run.app", "expected TRAINER_URL in the workload env (where readings go)")
 	flag.StringVar(&cfg.captureBucket, "capture-bucket", "masseuse-ai-prod", "expected TEE_CAPTURE_BUCKET in the workload env (the bucket a leased session's record is written to, under the prefix the trainer's lease names); \"\" requires the slot to keep no record at all")
@@ -341,6 +344,22 @@ func parseFlags() (*config, error) {
 	}
 	cfg.signerKeyIDs = splitTrim(signers)
 	cfg.trainerInvokers = invokersOf(invokers)
+	cfg.projectIDs = splitTrim(projects)
+	cfg.imageRefPrefixes = splitTrim(prefixes)
+	if cfg.policyURL != "" {
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		defer cancel()
+		policy, err := readPolicy(ctx, &http.Client{Timeout: 20 * time.Second}, cfg.policyURL)
+		if err != nil {
+			return nil, fmt.Errorf("-policy-url: %w", err)
+		}
+		set := map[string]bool{}
+		flag.Visit(func(f *flag.Flag) { set[f.Name] = true })
+		applyPolicy(cfg, policy, set)
+	}
+	if len(cfg.projectIDs) == 0 || len(cfg.imageRefPrefixes) == 0 {
+		return nil, errors.New("-project-id and -image-ref-prefix name where the slot must run from; neither may be empty")
+	}
 	if cfg.minRelease != "" && !validRelease(cfg.minRelease) {
 		return nil, fmt.Errorf("-min-release %q is not a release tag (vX.Y.Z)", cfg.minRelease)
 	}
@@ -433,7 +452,7 @@ func run(ctx context.Context, cfg *config, r *report) error {
 	r.add("cs.swname", claims.SWName == expectedSWName, claims.SWName)
 	r.add("cs.hwmodel", claims.HWModel == expectedHWModel, claims.HWModel)
 	r.add("cs.secboot", claims.SecBoot, fmt.Sprintf("%v", claims.SecBoot))
-	r.add("cs.project", nestedString(claims.Submods, "gce", "project_id") == cfg.projectID, nestedString(claims.Submods, "gce", "project_id"))
+	r.add("cs.project", contains(cfg.projectIDs, nestedString(claims.Submods, "gce", "project_id")), nestedString(claims.Submods, "gce", "project_id"))
 	stable := containsAny(nestedAny(claims.Submods, "confidential_space", "support_attributes"), "STABLE")
 	if cfg.allowDebug {
 		r.add("cs.dbgstat", claims.DbgStat == dbgstatProd || claims.DbgStat == dbgstatDebug, claims.DbgStat+" (debug allowed)")
@@ -456,7 +475,7 @@ func run(ctx context.Context, cfg *config, r *report) error {
 		r.add("image.digest", r.ImageDigest != "", r.ImageDigest+" (reported, not pinned to a list: the signature and the release stamp identify the image)")
 	}
 	ref := nestedString(claims.Submods, "container", "image_reference")
-	r.add("image.reference", strings.HasPrefix(ref, cfg.imageRefPrefix), ref)
+	r.add("image.reference", slices.ContainsFunc(cfg.imageRefPrefixes, func(p string) bool { return strings.HasPrefix(ref, p) }), ref)
 	env, _ := nestedAny(claims.Submods, "container", "env").(map[string]any)
 	trainer, _ := env["TRAINER_URL"].(string)
 	r.add("image.env.TRAINER_URL", strings.TrimRight(trainer, "/") == strings.TrimRight(cfg.trainerURL, "/"), trainer)
@@ -515,7 +534,7 @@ func run(ctx context.Context, cfg *config, r *report) error {
 
 	// Independent cosign check.
 	if cfg.cosignBin != "" && r.ImageDigest != "" {
-		imageRef := strings.TrimSuffix(cfg.imageRefPrefix, "/") + "/masseuse-video-tee@" + r.ImageDigest
+		imageRef := strings.TrimSuffix(cfg.imageRefPrefixes[0], "/") + "/masseuse-video-tee@" + r.ImageDigest
 		if i := strings.Index(ref, "@"); i > 0 {
 			imageRef = ref[:i] + "@" + r.ImageDigest
 		}

@@ -139,20 +139,20 @@ func bootEnv(extra map[string]any) map[string]any {
 func (fs *fakeSlot) config() *config {
 	u, _ := url.Parse(fs.server.URL)
 	return &config{
-		origin:          "https://" + u.Host,
-		jwksURL:         fs.jwks.URL,
-		projectID:       "prod-masseuse-video-tee",
-		imageRefPrefix:  "us-central1-docker.pkg.dev/prod-masseuse-video-tee/masseuse-video-tee/",
-		trainerURL:      "https://trainer.example",
-		captureBucket:   "records.example",
-		requestSeal:     "v1",
-		trainerInvokers: invokersOf(defaultTrainerInvoker),
-		signerKeyIDs:    []string{"cafe"},
-		slsaVerifierBin: fs.slsaBin,
-		sourceURI:       defaultSourceURI,
-		imageRepo:       defaultImageRepo,
-		insecureTLS:     true, // httptest's certificate
-		timeout:         10 * time.Second,
+		origin:           "https://" + u.Host,
+		jwksURL:          fs.jwks.URL,
+		projectIDs:       []string{"prod-masseuse-video-tee"},
+		imageRefPrefixes: []string{"us-central1-docker.pkg.dev/prod-masseuse-video-tee/masseuse-video-tee/"},
+		trainerURL:       "https://trainer.example",
+		captureBucket:    "records.example",
+		requestSeal:      "v1",
+		trainerInvokers:  invokersOf(defaultTrainerInvoker),
+		signerKeyIDs:     []string{"cafe"},
+		slsaVerifierBin:  fs.slsaBin,
+		sourceURI:        defaultSourceURI,
+		imageRepo:        defaultImageRepo,
+		insecureTLS:      true, // httptest's certificate
+		timeout:          10 * time.Second,
 	}
 }
 

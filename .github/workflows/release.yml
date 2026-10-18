@@ -34,6 +34,12 @@ name: release
 #               commits would always be one release behind the image that
 #               runs. The validation of the roll is appended to the same
 #               Release afterwards (docs/OPERATIONS.md, "Rolling an image").
+#   verifier    tee-verify, built from verifier/ at the tag for Linux, macOS
+#               and Windows, attached to the Release with their checksums
+#               and a keyless signature over the checksums (the certificate
+#               names this workflow at this tag); verifier-provenance adds
+#               SLSA provenance over the same files. Both run after the
+#               Release exists, so neither can hold up the image's record.
 #
 # The digest is the same in all three places; the promote job checks that
 # and prints the terraform.tfvars lines for the roll. Verifying a running
@@ -343,7 +349,82 @@ jobs:
             echo "  --certificate-identity https://github.com/${GITHUB_REPOSITORY}/.github/workflows/release.yml@refs/tags/${GITHUB_REF_NAME}"
             echo '```'
             echo
-            echo "A running slot: \`tee-verify -origin https://<slot> -expect-release ${GITHUB_REF_NAME} -slsa-verifier slsa-verifier\` (VERIFY.md)."
+            echo "A running slot: \`tee-verify -origin https://<slot> -expect-release ${GITHUB_REF_NAME} -slsa-verifier slsa-verifier\` (VERIFY.md). \`tee-verify\` for Linux, macOS and Windows is attached below, built from \`verifier/\` at this tag; check the one you download first:"
+            echo
+            echo '```sh'
+            echo "cosign verify-blob tee-verify_${GITHUB_REF_NAME}_checksums.txt --bundle tee-verify_${GITHUB_REF_NAME}_checksums.txt.sigstore.json \\"
+            echo "  --certificate-oidc-issuer https://token.actions.githubusercontent.com \\"
+            echo "  --certificate-identity https://github.com/${GITHUB_REPOSITORY}/.github/workflows/release.yml@refs/tags/${GITHUB_REF_NAME}"
+            echo "sha256sum --check --ignore-missing tee-verify_${GITHUB_REF_NAME}_checksums.txt"
+            echo "slsa-verifier verify-artifact tee-verify_${GITHUB_REF_NAME}_linux_amd64 --provenance-path tee-verify_${GITHUB_REF_NAME}.intoto.jsonl \\"
+            echo "  --source-uri github.com/${GITHUB_REPOSITORY} --source-tag ${GITHUB_REF_NAME}"
+            echo '```'
           } > body.md
           gh release create "${GITHUB_REF_NAME}" --verify-tag --title "${GITHUB_REF_NAME}" --notes-file body.md
           echo "release: $(gh release view "${GITHUB_REF_NAME}" --json url -q .url)" | tee -a "$GITHUB_STEP_SUMMARY"
+
+  verifier:
+    # tee-verify for this release, for anyone who checks a slot without a Go
+    # toolchain. Built with the module's toolchain, CGO off and paths
+    # trimmed, from the tagged tree.
+    needs: release
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write # the Release's assets
+      id-token: write # keyless signature over the checksums (Fulcio)
+    outputs:
+      hashes: ${{ steps.build.outputs.hashes }}
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: verifier/go.mod
+          cache: false
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+      - name: Build tee-verify for each platform
+        id: build
+        working-directory: verifier
+        env:
+          CGO_ENABLED: "0"
+        run: |
+          set -euo pipefail
+          mkdir -p ../dist
+          for target in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64; do
+            os="${target%/*}"
+            arch="${target#*/}"
+            ext=""
+            if [ "$os" = windows ]; then ext=".exe"; fi
+            GOOS="$os" GOARCH="$arch" go build -trimpath -buildvcs=false -ldflags "-s -w" -o "../dist/tee-verify_${GITHUB_REF_NAME}_${os}_${arch}${ext}" .
+          done
+          cd ../dist
+          sha256sum tee-verify_* > "tee-verify_${GITHUB_REF_NAME}_checksums.txt"
+          cat "tee-verify_${GITHUB_REF_NAME}_checksums.txt" >> "$GITHUB_STEP_SUMMARY"
+          echo "hashes=$(base64 -w0 "tee-verify_${GITHUB_REF_NAME}_checksums.txt")" >> "$GITHUB_OUTPUT"
+      - name: Keyless signature over the checksums
+        working-directory: dist
+        run: cosign sign-blob --yes --bundle "tee-verify_${GITHUB_REF_NAME}_checksums.txt.sigstore.json" "tee-verify_${GITHUB_REF_NAME}_checksums.txt"
+      - name: Attach them to the Release
+        working-directory: dist
+        run: gh release upload "${GITHUB_REF_NAME}" tee-verify_* --clobber
+
+  verifier-provenance:
+    needs: verifier
+    permissions:
+      actions: read # the generator reads this run
+      id-token: write # the provenance's signature
+      contents: write # the provenance, attached to the Release
+    uses: slsa-framework/slsa-github-generator/.github/workflows/generator_generic_slsa3.yml@v2.1.0
+    with:
+      base64-subjects: ${{ needs.verifier.outputs.hashes }}
+      provenance-name: tee-verify_${{ github.ref_name }}.intoto.jsonl
+      upload-assets: true
+      upload-tag-name: ${{ github.ref_name }}
+      # As for the image's provenance: the transparency log entry names the
+      # repository, which is not a secret.
+      private-repository: true
