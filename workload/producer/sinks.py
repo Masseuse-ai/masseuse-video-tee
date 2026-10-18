@@ -280,10 +280,14 @@ class Poster:
     """
 
     def __init__(self, url: str, telemetry=None, timeout_s: float = 2.0,
-                 token_supplier=None):
+                 token_supplier=None, signer=None):
         self.url = url
         self.telemetry = telemetry
         self.timeout_s = timeout_s
+        # On a slot, the enclave's evidence key (tee_mode.EvidenceKey): every
+        # post carries its X-Masseuse-Signature, which the controller holds
+        # to the key the attestation binds.
+        self._signer = signer
         parts = urllib.parse.urlsplit(url)
         self.audience = f"{parts.scheme}://{parts.netloc}"
         self._scheme = parts.scheme
@@ -395,6 +399,8 @@ class Poster:
     def _send(self, path: str, kind: str, body: dict) -> None:
         data = json.dumps(body, separators=(",", ":")).encode()
         headers = self._headers()
+        if self._signer is not None:
+            headers["X-Masseuse-Signature"] = self._signer.sign_reading(path, data)
         status: int | None = None
         for attempt in (1, 2):
             connection = self._connection or self._open()

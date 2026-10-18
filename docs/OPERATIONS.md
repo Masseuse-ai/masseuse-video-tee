@@ -856,6 +856,44 @@ reversed, `-replace='google_compute_instance.slot["slot-0"]'` while the VM
 reads `TERMINATED`, and a second plain apply for the IAM bindings the
 replacement re-keys.
 
+## Approving a project (`terraform/hosted.tf`)
+
+A project of someone else's runs released slots with
+`terraform/modules/slot` (`deploy/own-project`). It reads the weights and
+the analysis bundle from this project only once it is approved here, and
+only for the controller it was approved for. Approval is a value in the
+git-ignored `terraform.tfvars` and a local apply, recorded like a digest
+roll, never a pull request:
+
+```hcl
+external_slot_projects         = ["<their project>"]
+external_slot_service_accounts = ["enclave-slot-vm@<their project>.iam.gserviceaccount.com"]
+external_controller_url        = "<the controller's readings origin>"
+external_controller_service_account = "<the controller's identity>"
+# a release hosted slots may run before the fleet rolls to it:
+external_image_digests         = ["sha256:<digest>"]
+```
+
+`terraform plan` then adds the `hosted-slots` pool and its
+`attestation-hosted` provider (the first approval only), the models
+bucket's read for each approved digest, and the registry read for each
+VM account; nothing else changes. `terraform output hosted_slots` is what
+their deployment takes: the WIF audience, the bucket, the image and its
+signature repository, the digests and the principals their project grants
+the ACME account binding to.
+
+The provider's condition is the fleet's production condition, release
+signature included, plus an approved project and VM account, the approved
+controller's `TRAINER_URL` and `TRAINER_INVOKER_SERVICE_ACCOUNT`, and no
+`TEE_CAPTURE_BUCKET`. A slot that attests anything else boots and stops:
+no weights, no certificate.
+
+To revoke, remove the project (and its accounts) and apply: its next
+exchange is refused, and a credential already exchanged lives out its
+hour. Rolling the fleet's digest rolls the hosted slots' grant with it
+(`container_image_digest`, `candidate_image_digests`); a hosted
+deployment changes `container_image` to the new digest on its side.
+
 ## VPC Service Controls
 
 `terraform/vpc-sc.tf` is the perimeter (restricted services: STS, IAM

@@ -166,7 +166,20 @@ the clients check"), and through it the slots serve:
   about where it runs (the project, the registry it was pulled from, its
   controller, its record bucket) is that deployment's; `VERIFY.md`, "Which
   values to verify against", says how to check them. The weights and the
-  analysis bundle are released only to the slots `terraform/wif.tf` admits.
+  analysis bundle are released only to the slots `terraform/wif.tf` admits,
+  and, once an operator approves a project, to that project's slots
+  (`terraform/hosted.tf`): released, in production posture, on the same
+  hardware, attesting the controller the approval names and no record
+  bucket. `deploy/own-project` deploys such slots with
+  `terraform/modules/slot`; `docs/OPERATIONS.md`, "Approving a project",
+  is the operator's side.
+
+Every reading a slot posts to its controller, and every face frame, carries
+`X-Masseuse-Signature`: an Ed25519 signature by the evidence key the
+attestation binds, over the route, the time and the body
+(`tee_mode.EvidenceKey.sign_reading`; `verify_reading` is the controller's
+check). The ID token beside it is the VM account's, which a host project's
+owners hold too; the signature is the enclave's alone.
 
 ## Trust boundary
 
@@ -470,7 +483,10 @@ report a check that should hold and does not.
 | `camlink.lock` | The `masseuse-camlink-gateway` release (tag and checksum) the image carries |
 | `.github/workflows/release.yml` | The build: images to `ghcr.io` stamped with the tag and commit, SLSA provenance, keyless signature, promotion by digest into the enclave's registry, KMS signature, the GitHub Release that records the digest |
 | `terraform/` | The project: service account, Workload Identity Federation pool and providers keyed to the attestation, models bucket, Artifact Registry, a subnet per region and a static IP per slot, firewall, the slot VMs spread over `slot_zones` (even slots in us-central1-a, odd in us-east5-a), the masseuse's start/stop role, the KMS signing key, the release workflow's identity, the sweeper, VPC Service Controls (off until the project has an organization) |
-| `verifier/` | `tee-verify`, the standalone attestation checker |
+| `terraform/hosted.tf` | Slots hosted in approved projects: their own identity pool and provider, the bucket and registry grants, all empty until a project is approved |
+| `terraform/modules/slot/` | The released slot as a module, for a project of your own: the VM, its account, addresses, firewall and the account binding its certificate needs |
+| `deploy/own-project/` | A deployment of that module, with the steps (its README) |
+| `verifier/` | `tee-verify`, the standalone attestation checker (`-policy-url` takes a service's published values) |
 | `tools/` | `gts-acme-test.sh`: the rig that established Google Trust Services tolerates a fresh certificate on every boot |
 | `build.sh` | The same two image builds, locally, without a push |
 | `VERIFY.md` | How to verify a slot and the source of its image: what identifies the image (signature, release stamp, provenance), the signing key, where the release history lives |

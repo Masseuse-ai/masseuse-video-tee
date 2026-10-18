@@ -1120,7 +1120,8 @@ class Session:
         # Why run() ended early, if it did not end on its own terms: said
         # over the /produce stream as an `error` event ahead of the summary.
         self.error: str | None = None
-        self.poster = (Poster(args.post_url, telemetry)
+        self.poster = (Poster(args.post_url, telemetry,
+                              signer=getattr(args, "reading_signer", None))
                        if args.post_url else None)
         self.post_interval_s = float(
             getattr(args, "post_interval_s", 1.0) or 1.0)
@@ -3465,6 +3466,8 @@ def build_server(args, telemetry: Telemetry,
                     # The camera views the lease named (tee_mode.Lease): a
                     # lone `["face"]` is the single stream posed as the face.
                     session_args.views = tee.lease.views_for()
+                    # The readings go out signed with the evidence key.
+                    session_args.reading_signer = tee.evidence
                     tee.lease.note_run()
                 if external_view_args(session_args, external, face_source):
                     session_args.face_mirror = view_prefs["mirror"]

@@ -192,7 +192,16 @@ it or where it runs; those values do.
   unchanged, since the same digest is the same release wherever it boots;
   the signature check holds when the deployment points the launcher at the
   release's signatures (`tee-signed-image-repos`, as `terraform/vm.tf`
-  does).
+  and `terraform/modules/slot` do). A deployment of the module prints
+  these values (`terraform output -json verifier`), and the file it writes
+  is a document `-policy-url` takes: `tee-verify -policy-url values.json
+  -origin https://<slot>`.
+
+A slot's readings are its own too: each post to its controller carries
+`X-Masseuse-Signature`, the evidence key's Ed25519 signature over the
+route, the time and the body, which a controller checks against the key
+the attestation binds before it takes a reading
+(`workload/producer/tee_mode.py`, `verify_reading`).
 
 ## Do it by hand
 
