@@ -99,7 +99,11 @@ image has been verified on a slot and carried a session.
 
 ## What you need
 
-- `go` 1.22+ to build the verifier in `verifier/`.
+- `go` 1.22+ to build the verifier in `verifier/`, or, from the next
+  release on, the `tee-verify` binary attached to its Release for Linux,
+  macOS or Windows; check the one you download with the commands in the
+  Release's Verify section (its checksums' keyless signature, the
+  checksum, and its SLSA provenance) before you run it.
 - [`slsa-verifier`](https://github.com/slsa-framework/slsa-verifier) on
   your `PATH` (or `-slsa-verifier <path>`) to tie the running digest to
   this source: a run without it does not pass. Optionally `cosign` to check
@@ -168,12 +172,21 @@ it or where it runs; those values do.
   internal lease API. The defaults apply as they are: a leased session's
   slot is the same slot, posting to the same trainer, and its lease names
   no record.
-- **A slot a service names in a policy it publishes.** Take the values
-  from that policy and pass them as the flags above; a value the policy
-  does not name keeps its default.
+- **A slot a service names in a policy it publishes.** Point
+  `-policy-url` at it: `tee-verify -policy-url https://<the policy> -origin
+  https://<slot>`. The document is the values themselves or carries them
+  as its `verify` member (`sourceUri`, `imageRepo`, `signerKeyIds`,
+  `minRelease`, `readingsUrl`, `invokers`, `captureBucket`, `requestSeal`,
+  `projectIds`, `imageRefPrefixes`); each replaces the default of the
+  flag of the same meaning, a value it leaves out keeps the default, a flag
+  given on the command line wins, and the report names the policy it read.
+  What a policy cannot change: the token's issuer and keys, the hardware,
+  the production posture, and that a signature and the provenance are
+  required.
 - **A slot in your own project**, booted from a released image with your
   deployment's variables. Pass your project (`-project-id`), the registry
-  path you pull from (`-image-ref-prefix`), your controller
+  path you pull from (`-image-ref-prefix`; both take a comma-separated
+  list), your controller
   (`-trainer-url`, `-trainer-invoker`), and `-capture-bucket ""` for a slot
   that keeps no record. The release stamp and the provenance checks are
   unchanged, since the same digest is the same release wherever it boots;
