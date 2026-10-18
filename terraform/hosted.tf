@@ -31,6 +31,10 @@ locals {
   # The digests a hosted slot may run: the fleet's, and releases approved
   # for hosted slots before the fleet rolls to them.
   hosted_digests = distinct(concat([var.container_image_digest], var.candidate_image_digests, var.external_image_digests))
+
+  # The image a hosted deployment is given: the last release approved for
+  # hosted slots, else the fleet's.
+  hosted_container_image = length(var.external_image_digests) > 0 ? "${local.image_signature_repo}@${var.external_image_digests[length(var.external_image_digests) - 1]}" : var.container_image
   hosted_principals = local.hosted_enabled ? {
     for digest in local.hosted_digests :
     digest => "principalSet://iam.googleapis.com/${local.hosted_pool_name}/attribute.image_digest/${digest}"
@@ -107,7 +111,7 @@ output "hosted_slots" {
   value = local.hosted_enabled ? {
     wif_audience      = "//iam.googleapis.com/${local.hosted_pool_name}/providers/${google_iam_workload_identity_pool_provider.hosted[0].workload_identity_pool_provider_id}"
     models_bucket     = google_storage_bucket.models.name
-    container_image   = var.container_image
+    container_image   = local.hosted_container_image
     signature_repo    = local.image_signature_repo
     digests           = local.hosted_digests
     hosted_principals = values(local.hosted_principals)

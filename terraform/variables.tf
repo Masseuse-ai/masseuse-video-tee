@@ -296,7 +296,7 @@ variable "external_controller_service_account" {
 }
 
 variable "external_image_digests" {
-  description = "Release digests hosted slots may run beyond the fleet's own (a release not yet rolled here)."
+  description = "Release digests hosted slots may run beyond the fleet's own (a release not yet rolled here); the last is the image hosted deployments are given (hosted_slots.container_image)."
   type        = list(string)
   default     = []
 

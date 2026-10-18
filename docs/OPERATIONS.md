@@ -870,9 +870,15 @@ external_slot_projects         = ["<their project>"]
 external_slot_service_accounts = ["enclave-slot-vm@<their project>.iam.gserviceaccount.com"]
 external_controller_url        = "<the controller's readings origin>"
 external_controller_service_account = "<the controller's identity>"
-# a release hosted slots may run before the fleet rolls to it:
+# releases hosted slots may run before the fleet rolls to them; the last
+# is the image their deployment is given:
 external_image_digests         = ["sha256:<digest>"]
 ```
+
+A hosted slot's readings are signed with its evidence key, which releases
+from v0.20.0 do; until the fleet runs one, approve the release a hosted
+slot needs in `external_image_digests`, and clear it once the fleet has
+rolled to it or past it.
 
 `terraform plan` then adds the `hosted-slots` pool and its
 `attestation-hosted` provider (the first approval only), the models
