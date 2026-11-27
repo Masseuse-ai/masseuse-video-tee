@@ -14,14 +14,41 @@
 # if it were somehow launched with the right digest.
 # ---------------------------------------------------------------------------
 resource "google_artifact_registry_repository" "images" {
-  project       = var.project_id
-  location      = var.region
-  repository_id = "masseuse-video-tee"
-  format        = "DOCKER"
-  description   = "masseuse.ai video pipeline Confidential Space images"
+  project                = var.project_id
+  location               = var.region
+  repository_id          = "masseuse-video-tee"
+  format                 = "DOCKER"
+  description            = "masseuse.ai video pipeline Confidential Space images"
+  cleanup_policy_dry_run = true
 
   docker_config {
     immutable_tags = false
+  }
+
+  cleanup_policies {
+    id     = "keep-protected-tags"
+    action = "KEEP"
+    condition {
+      tag_state    = "TAGGED"
+      tag_prefixes = ["v", "keep-", "prod-", "sha256-"]
+    }
+  }
+
+  cleanup_policies {
+    id     = "keep-recent"
+    action = "KEEP"
+    most_recent_versions {
+      keep_count = 15
+    }
+  }
+
+  cleanup_policies {
+    id     = "drop-old-any"
+    action = "DELETE"
+    condition {
+      tag_state  = "ANY"
+      older_than = "2592000s" # 30 d
+    }
   }
 
   depends_on = [google_project_service.apis]
