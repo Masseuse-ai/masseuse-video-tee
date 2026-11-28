@@ -19,7 +19,7 @@ resource "google_artifact_registry_repository" "images" {
   repository_id          = "masseuse-video-tee"
   format                 = "DOCKER"
   description            = "masseuse.ai video pipeline Confidential Space images"
-  cleanup_policy_dry_run = true
+  cleanup_policy_dry_run = false
 
   docker_config {
     immutable_tags = false
@@ -30,7 +30,7 @@ resource "google_artifact_registry_repository" "images" {
     action = "KEEP"
     condition {
       tag_state    = "TAGGED"
-      tag_prefixes = ["v", "keep-", "prod-", "sha256-"]
+      tag_prefixes = ["keep-", "prod-", "sha256-"]
     }
   }
 
